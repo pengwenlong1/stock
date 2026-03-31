@@ -1,0 +1,141 @@
+[
+    {
+        "ticker": "159928",
+        "name": "消费ETF",
+        "judge_buy_ids": [1, 2],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "159647",
+        "name": "中药ETF",
+        "judge_buy_ids": [1,2],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "159873",
+        "name": "医疗设备ETF",
+        "judge_buy_ids": [1,2],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "510880",
+        "name": "红利ETF华泰柏瑞",
+        "judge_buy_ids": [1,2],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "300661",
+        "name": "圣邦股份",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "603501",
+        "name": "豪威集团",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "002920",
+        "name": "德赛西威",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "002594",
+        "name": "比亚迪",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "159559",
+        "name": "机器人50ETF",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "159622",
+        "name": "创新药ETF",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "159770",
+        "name": "机器人ETF",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "300573",
+        "name": "兴齐眼药",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "300760",
+        "name": "迈瑞医疗",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "300782",
+        "name": "卓胜微",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "603087",
+        "name": "甘李药业",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "688213",
+        "name": "思特威",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "688639",
+        "name": "华恒生物",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "09660",
+        "name": "地平线",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "09988",
+        "name": "阿里巴巴",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "02498",
+        "name": "速腾聚创",
+        "judge_buy_ids": [3],
+        "judge_sell_ids": [1]
+    },
+    {
+        "ticker": "601166",
+        "name": "兴业银行",
+        "judge_buy_ids": [4],
+        "judge_sell_ids": [-1]
+    },
+    {
+        "ticker": "600887",
+        "name": "伊利股份",
+        "judge_buy_ids": [4],
+        "judge_sell_ids": [-1]
+    },
+    {
+        "ticker": "000895",
+        "name": "双汇发展",
+        "judge_buy_ids": [4],
+        "judge_sell_ids": [-1]
+    }
+
+]

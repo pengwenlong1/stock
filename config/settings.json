@@ -1,0 +1,5 @@
+{
+    "gm_token": "8f675365f0d0a7ad3c7c22c187ca134d77c07475",
+    "dingtalk_webhook": "https://oapi.dingtalk.com/robot/send?access_token=f2f2dbca162d963b1619dbdbde91f2d70572836aac58b94ea4713e42167da160",
+    "dingtalk_secret": "SECbf80e6ffe5fdd6ac64c51008d0a56303fdba94f6296d75f4d7134abc5fa49395"
+}
