@@ -28,53 +28,64 @@ def calculate_indicators(data):
 
     return data
 
-def detect_divergence(data, type='top'):
+def detect_divergence(data, type='top', grace_bars=None):
     """
     检测背离 (仅根据 MACD DIF)
 
     Args:
         data: 包含 MACD 指标的数据
         type: 'top' 顶背离，'bottom' 底背离
+        grace_bars: 允许信号在最近 N 根 K 线内持续有效（含当根）。None 表示不限制
     """
     if data is None or len(data) < 30:
         return False
 
     close = data['Close'].values
+    high = data['High'].values if 'High' in data.columns else close
+    low = data['Low'].values if 'Low' in data.columns else close
     dif = data['MACD'].values  # DIF
     macd_hist = data['MACD_hist'].values  # MACD 柱
 
-    def find_last_significant_extrema(values, is_max=True, window=5):
-        """寻找最近的显著极值点"""
-        for i in range(len(values) - window - 1, window, -1):
-            if is_max:
-                if all(values[i] > values[i-j] for j in range(1, window+1)) and \
-                   all(values[i] > values[i+j] for j in range(1, window+1)):
-                    return i
-            else:
-                if all(values[i] < values[i-j] for j in range(1, window+1)) and \
-                   all(values[i] < values[i+j] for j in range(1, window+1)):
-                    return i
-        return None
-
     curr = len(close) - 1
-
+    
+    # 追踪最近 N 根 K 线中的最高价/最低价，用于捕捉趋势顶点
+    # 有时候顶背离发生时，最高价不在最后一根，而是在前 1-2 根
+    recent_lookback = 5
+    prev_lookback = 30
     if type == 'top':
-        # 顶背离：价格创新高但 DIF 未创新高
-        p1 = find_last_significant_extrema(close, is_max=True, window=5)
-        if p1 is not None and curr - p1 >= 5:
-            if close[curr] > close[p1] and dif[curr] < dif[p1]:
-                # 只要 MACD 柱开始收缩，或者 DIF 已经转头，就认为背离结构成立
-                # 这样可以更灵敏地配合后续的死叉确认
-                if macd_hist[curr] < macd_hist[curr-1] or dif[curr] < dif[curr-1]:
-                    return True
+        price = high
+        recent_start = max(curr - recent_lookback + 1, 0)
+        recent_max_idx = recent_start + price[recent_start:curr+1].argmax()
+
+        prev_end = recent_max_idx - 1
+        if prev_end <= 10:
+            return False
+        prev_start = max(prev_end - prev_lookback + 1, 0)
+        prev_idx = prev_start + price[prev_start:prev_end+1].argmax()
+        if recent_max_idx - prev_idx < 3:
+            return False
+
+        if price[recent_max_idx] > price[prev_idx] and (dif[recent_max_idx] < dif[prev_idx] or macd_hist[recent_max_idx] < macd_hist[prev_idx]):
+            if grace_bars is None:
+                return True
+            return (curr - recent_max_idx) <= (grace_bars - 1)
     else:
-        # 底背离：价格创新低但 DIF 未创新低
-        p1 = find_last_significant_extrema(close, is_max=False, window=5)
-        if p1 is not None and curr - p1 >= 5:
-            if close[curr] < close[p1] and dif[curr] > dif[p1]:
-                # 只要 MACD 柱开始收缩（负值变大/向上），或者 DIF 已经转头向上
-                if macd_hist[curr] > macd_hist[curr-1] or dif[curr] > dif[curr-1]:
-                    return True
+        price = low
+        recent_start = max(curr - recent_lookback + 1, 0)
+        recent_min_idx = recent_start + price[recent_start:curr+1].argmin()
+
+        prev_end = recent_min_idx - 1
+        if prev_end <= 10:
+            return False
+        prev_start = max(prev_end - prev_lookback + 1, 0)
+        prev_idx = prev_start + price[prev_start:prev_end+1].argmin()
+        if recent_min_idx - prev_idx < 3:
+            return False
+
+        if price[recent_min_idx] < price[prev_idx] and (dif[recent_min_idx] > dif[prev_idx] or macd_hist[recent_min_idx] > macd_hist[prev_idx]):
+            if grace_bars is None:
+                return True
+            return (curr - recent_min_idx) <= (grace_bars - 1)
     return False
 
 def is_death_cross(data, window=3):
@@ -149,13 +160,15 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
                 cross_name = "120分钟" if data_120min is not None else "日线"
                 messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [周线顶背离 + {cross_name}死叉]，建议清仓")
             # 2. 减仓信号：日线顶背离 + 120分钟(或日线)死叉
-            elif detect_divergence(data_daily, 'top') and is_death_cross(data_cross, window=3):
+            elif detect_divergence(data_daily, 'top', grace_bars=3) and is_death_cross(data_cross, window=3):
                 cross_name = "120分钟" if data_120min is not None else "日线"
                 messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): 触发 [日线顶背离 + {cross_name}死叉]，建议卖出 1/3")
             # 3. 阶梯式减仓信号：日线 SAR 跌破
             else:
-                if is_sar_breakdown(data_daily, window=3):
-                    trigger_reason = f"触发 [日线 SAR 跌破]，当前周线 RSI({max_weekly_rsi:.2f})"
+                sar_breakdown_ts = find_sar_breakdown_date(data_daily, window=3)
+                if sar_breakdown_ts is not None:
+                    sar_breakdown_day = sar_breakdown_ts.strftime('%Y-%m-%d') if hasattr(sar_breakdown_ts, 'strftime') else str(sar_breakdown_ts)
+                    trigger_reason = f"触发 [日线 SAR 跌破({sar_breakdown_day})]，当前周线 RSI({max_weekly_rsi:.2f})"
                     if max_weekly_rsi > 90:
                         messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): {trigger_reason} > 90，建议卖出全部剩余仓位")
                     elif max_weekly_rsi > 85:
@@ -168,12 +181,14 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
             if detect_divergence(data_weekly, 'top') and is_death_cross(data_daily, window=3):
                 messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [周线顶背离 + 日线死叉]，建议清仓")
             # 2. 减仓信号：日线顶背离 + 日线死叉
-            elif detect_divergence(data_daily, 'top') and is_death_cross(data_daily, window=3):
+            elif detect_divergence(data_daily, 'top', grace_bars=3) and is_death_cross(data_daily, window=3):
                 messages.append(f"【{stock_name}】卖出信号 (策略 2-减仓): 触发 [日线顶背离 + 日线死叉]，建议卖出 1/3")
             # 3. 阶梯式减仓信号：日线 SAR 跌破
             else:
-                if is_sar_breakdown(data_daily, window=3):
-                    trigger_reason = f"触发 [日线 SAR 跌破]，当前周线 RSI({max_weekly_rsi:.2f})"
+                sar_breakdown_ts = find_sar_breakdown_date(data_daily, window=3)
+                if sar_breakdown_ts is not None:
+                    sar_breakdown_day = sar_breakdown_ts.strftime('%Y-%m-%d') if hasattr(sar_breakdown_ts, 'strftime') else str(sar_breakdown_ts)
+                    trigger_reason = f"触发 [日线 SAR 跌破({sar_breakdown_day})]，当前周线 RSI({max_weekly_rsi:.2f})"
                     if max_weekly_rsi > 90:
                         messages.append(f"【{stock_name}】卖出信号 (策略 2-阶梯): {trigger_reason} > 90，建议卖出全部剩余仓位")
                     elif max_weekly_rsi > 85:
@@ -204,14 +219,20 @@ def judge_t_buy(stock_name, judge_t_ids, all_data, get_index_data_func=None):
 
 def is_sar_breakdown(data_daily, window=3):
     """检测日线 SAR 是否被跌破"""
+    return find_sar_breakdown_date(data_daily, window=window) is not None
+
+def find_sar_breakdown_date(data_daily, window=3):
     if data_daily is None or len(data_daily) < window + 1:
-        return False
+        return None
     for i in range(1, window + 1):
         if len(data_daily) >= i + 1:
             if data_daily['Close'].iloc[-i-1] > data_daily['SAR'].iloc[-i-1] and \
                data_daily['Close'].iloc[-i] < data_daily['SAR'].iloc[-i]:
-                return True
-    return False
+                try:
+                    return data_daily.index[-i]
+                except Exception:
+                    return -i
+    return None
 
 def judge_buy(stock_name, judge_buy_ids, all_data, get_index_data_func=None):
     """

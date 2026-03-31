@@ -10,8 +10,10 @@ import base64
 import urllib.parse
 import requests
 import time
+import sys
 
 # 导入原有的策略逻辑
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from strategy import strategy
 
 
@@ -75,7 +77,7 @@ def send_dingtalk_alert(message, webhook, secret):
 # --- 策略核心 ---
 def init(context):
     # 1. 加载配置文件
-    settings_path = os.path.join(os.path.dirname(__file__), 'config/settings.json')
+    settings_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config/settings.json')
     with open(settings_path, 'r', encoding='utf-8') as f:
         settings = json.load(f)
 
@@ -114,9 +116,14 @@ def fetch_and_format_data(symbol, frequency, count):
         # 周线：通过日线数据 resample 得到
         # 获取足够的日线数据以生成所需的周线数量
         actual_count = count * 5
-        data = history_n(symbol=symbol, frequency='1d', count=actual_count, end_time=None,
-                         fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+        try:
+            data = history_n(symbol=symbol, frequency='1d', count=actual_count, end_time=None,
+                             fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+        except Exception as e:
+            logger.warning(f"[{symbol}] 获取 w 数据失败：{e}")
+            return None
         if data is None or data.empty:
+            logger.warning(f"[{symbol}] 获取 w 数据为空（可能无权限/停牌/无行情）")
             return None
         data['eob'] = pd.to_datetime(data['eob'])
         data.set_index('eob', inplace=True)
@@ -142,9 +149,14 @@ def fetch_and_format_data(symbol, frequency, count):
     else:
         gm_freq = '1d'
 
-    data = history_n(symbol=symbol, frequency=gm_freq, count=count, end_time=None,
-                     fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
-    if data is None or data.empty:
+    try:
+        data = history_n(symbol=symbol, frequency=gm_freq, count=count, end_time=None,
+                         fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+        if data is None or data.empty:
+            logger.warning(f"[{symbol}] 获取 {frequency} 数据为空（可能无权限/停牌/无行情）")
+            return None
+    except Exception as e:
+        logger.warning(f"[{symbol}] 获取 {frequency} 数据失败：{e}")
         return None
     data.rename(columns={
         'eob': 'Date',
@@ -161,66 +173,104 @@ def fetch_and_format_data(symbol, frequency, count):
 def run_monitor(context):
     """每日监控主函数"""
     logger.info("====== 实盘监控：开始新一轮检查 ======")
+
+    index_data_map = {}
+    for idx_ticker in ['000001', '399006']:
+        idx_symbol = convert_to_gm_format(idx_ticker)
+        idx_daily_raw = fetch_and_format_data(idx_symbol, 'd', 260)
+        if idx_daily_raw is not None and not idx_daily_raw.empty:
+            idx_daily = strategy.calculate_indicators(idx_daily_raw.copy())
+            if idx_daily is not None:
+                index_data_map[idx_ticker] = idx_daily
+
     for stock in context.stock_configs:
         symbol = stock['gm_symbol']
         name = stock['name']
         try:
             # 获取数据（日常监控使用日线）
-            df_weekly = fetch_and_format_data(symbol, 'w', 100)
-            df_daily = fetch_and_format_data(symbol, 'd', 100)
-            df_120min = fetch_and_format_data(symbol, '7200s', 100)
+            df_daily_raw = fetch_and_format_data(symbol, 'd', 220)
+            if df_daily_raw is None or df_daily_raw.empty:
+                logger.warning(f"[{name}] 数据获取失败，跳过检查")
+                continue
+            df_weekly = fetch_and_format_data(symbol, 'w', 120)
+            df_120min = fetch_and_format_data(symbol, '7200s', 120)
 
-            all_data = {
-                'weekly': strategy.calculate_indicators(df_weekly),
-                'daily': strategy.calculate_indicators(df_daily),
+            all_data_now = {
+                'weekly': strategy.calculate_indicators(df_weekly) if df_weekly is not None else None,
+                'daily': strategy.calculate_indicators(df_daily_raw.copy()),
                 '120min': strategy.calculate_indicators(df_120min) if df_120min is not None else None
             }
 
-            if all_data['daily'] is None or all_data['weekly'] is None:
+            if all_data_now['daily'] is None or all_data_now['weekly'] is None:
                 logger.warning(f"[{name}] 数据获取失败，跳过检查")
                 continue
 
             # --- 新增：打印股票详细指标信息 ---
-            rsi_daily = all_data['daily']['RSI'].iloc[-1]
-            rsi_weekly = all_data['weekly']['RSI'].iloc[-1]
-            price = all_data['daily']['Close'].iloc[-1]
-            sar = all_data['daily']['SAR'].iloc[-1]
-            macd_dif = all_data['daily']['MACD'].iloc[-1]
-            macd_dea = all_data['daily']['MACD_signal'].iloc[-1]
-            
-            status_sar = "高于SAR" if price > sar else "跌破SAR"
-            status_macd = "金叉" if macd_dif > macd_dea else "死叉"
-            
-            logger.info(f"[{name}] 现价:{price:.2f} | 日RSI:{rsi_daily:.2f} | 周RSI:{rsi_weekly:.2f} | SAR:{sar:.2f}({status_sar}) | MACD:{status_macd}")
+            rsi_daily = all_data_now['daily']['RSI'].iloc[-1]
+            rsi_weekly = all_data_now['weekly']['RSI'].iloc[-1]
+            logger.info(f"[{name}] 日RSI:{rsi_daily:.2f} | 周RSI:{rsi_weekly:.2f}")
             # --------------------------------
 
-            # 信号判断（卖出）
-            sell_msgs = strategy.judge_sell(name, stock['judge_sell_ids'], all_data)
-            if sell_msgs:
-                send_dingtalk_alert("\n".join(sell_msgs), context.dingtalk_webhook, context.dingtalk_secret)
+            def build_weekly_from_daily(daily_raw):
+                resampled = daily_raw.resample('W-FRI').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).dropna()
+                return resampled
 
-            # 获取指数数据的辅助函数
-            def get_index_data(ticker):
-                return strategy.calculate_indicators(
-                    fetch_and_format_data(convert_to_gm_format(ticker), 'd', 100)
-                )
+            recent_days = [ts for ts in df_daily_raw.index[-7:]]
+            recent_msgs = []
+            for ts in recent_days:
+                daily_slice_raw = df_daily_raw.loc[:ts]
+                weekly_slice_raw = build_weekly_from_daily(daily_slice_raw)
+                daily_slice = strategy.calculate_indicators(daily_slice_raw.copy())
+                weekly_slice = strategy.calculate_indicators(weekly_slice_raw.copy()) if weekly_slice_raw is not None else None
+                if daily_slice is None or weekly_slice is None:
+                    continue
 
-            # 信号判断（买入）
-            buy_msgs = strategy.judge_buy(name, stock['judge_buy_ids'], all_data, get_index_data)
-            if buy_msgs:
-                send_dingtalk_alert("\n".join(buy_msgs), context.dingtalk_webhook, context.dingtalk_secret)
+                all_data_day = {
+                    'weekly': weekly_slice.tail(100),
+                    'daily': daily_slice.tail(100),
+                    '120min': None
+                }
 
-            # 信号判断（做 T 买回）
-            t_buy_msgs = strategy.judge_t_buy(name, stock.get('judge_t_ids', []), all_data, get_index_data)
-            if t_buy_msgs:
-                send_dingtalk_alert("\n".join(t_buy_msgs), context.dingtalk_webhook, context.dingtalk_secret)
+                day_str = ts.strftime('%Y-%m-%d')
+
+                if strategy.detect_divergence(all_data_day['daily'], 'top', grace_bars=3):
+                    recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-日线顶背离(3日有效，价格新高+MACD柱/或DIF背离)")
+                if strategy.detect_divergence(all_data_day['weekly'], 'top'):
+                    recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-周线顶背离(价格新高+MACD柱/或DIF背离)")
+
+                sell_msgs = strategy.judge_sell(name, stock['judge_sell_ids'], all_data_day)
+                for m in sell_msgs:
+                    recent_msgs.append(f"{day_str} | {m}")
+
+                def get_index_data(idx_ticker):
+                    idx_df = index_data_map.get(idx_ticker)
+                    if idx_df is None:
+                        return None
+                    return idx_df.loc[:ts].tail(100)
+
+                buy_msgs = strategy.judge_buy(name, stock['judge_buy_ids'], all_data_day, get_index_data)
+                for m in buy_msgs:
+                    recent_msgs.append(f"{day_str} | {m}")
+
+                t_buy_msgs = strategy.judge_t_buy(name, stock.get('judge_t_ids', []), all_data_day, get_index_data)
+                for m in t_buy_msgs:
+                    recent_msgs.append(f"{day_str} | {m}")
+
+            if recent_msgs:
+                send_dingtalk_alert("\n".join(recent_msgs), context.dingtalk_webhook, context.dingtalk_secret)
 
         except Exception as e:
             logger.error(f"处理 {name} 出错：{e}")
 
 if __name__ == '__main__':
     # 从配置文件加载 token
-    settings_path = os.path.join(os.path.dirname(__file__), 'config/settings.json')
+    settings_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config/settings.json')
     with open(settings_path, 'r', encoding='utf-8') as f:
         settings = json.load(f)
 
