@@ -12,7 +12,8 @@ import requests
 import time
 
 # 导入原有的策略逻辑
-import strategy
+from strategy import strategy
+
 
 # --- 日志配置 ---
 def setup_logger():
@@ -78,7 +79,7 @@ def init(context):
     with open(settings_path, 'r', encoding='utf-8') as f:
         settings = json.load(f)
 
-    context.stocks_file = 'config/stocks.json'
+    context.stocks_file = '../config/stocks.json'
     context.dingtalk_webhook = settings.get('dingtalk_webhook')
     context.dingtalk_secret = settings.get('dingtalk_secret')
 
@@ -93,7 +94,12 @@ def init(context):
 
     # 4. 设置定时任务 (每天 14:50 执行，接近收盘)
     schedule(schedule_func=run_monitor, date_rule='1d', time_rule='14:50:00')
+    
+    # 5. 初始化后立即执行一次检查 (方便用户确认程序正常运行)
     logger.info(f"实盘监控初始化完成，监控 {len(context.stock_configs)} 只股票")
+    logger.info("正在执行初始化后的首次检查...")
+    run_monitor(context)
+    logger.info("首次检查完成，程序将按计划在 14:50 执行后续检查。")
 
 def fetch_and_format_data(symbol, frequency, count):
     """
@@ -101,7 +107,7 @@ def fetch_and_format_data(symbol, frequency, count):
 
     Args:
         symbol: 股票代码 (掘金格式)
-        frequency: 频率 'w'(周线), 'd'(日线)
+        frequency: 频率 'w'(周线), 'd'(日线), '7200s'(120min)
         count: 获取的 K 线数量
     """
     if frequency == 'w':
@@ -109,8 +115,8 @@ def fetch_and_format_data(symbol, frequency, count):
         # 获取足够的日线数据以生成所需的周线数量
         actual_count = count * 5
         data = history_n(symbol=symbol, frequency='1d', count=actual_count, end_time=None,
-                         fields='eob,open,high,low,close,volume', df=True)
-        if data.empty:
+                         fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+        if data is None or data.empty:
             return None
         data['eob'] = pd.to_datetime(data['eob'])
         data.set_index('eob', inplace=True)
@@ -130,11 +136,15 @@ def fetch_and_format_data(symbol, frequency, count):
         }, inplace=True)
         return resampled.tail(count)
 
-    # 日线
-    gm_freq = '1d'
+    # 日线或120min
+    if frequency == '7200s':
+        gm_freq = '7200s'
+    else:
+        gm_freq = '1d'
+
     data = history_n(symbol=symbol, frequency=gm_freq, count=count, end_time=None,
-                     fields='eob,open,high,low,close,volume', df=True)
-    if data.empty:
+                     fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+    if data is None or data.empty:
         return None
     data.rename(columns={
         'eob': 'Date',
@@ -158,11 +168,31 @@ def run_monitor(context):
             # 获取数据（日常监控使用日线）
             df_weekly = fetch_and_format_data(symbol, 'w', 100)
             df_daily = fetch_and_format_data(symbol, 'd', 100)
+            df_120min = fetch_and_format_data(symbol, '7200s', 100)
 
             all_data = {
                 'weekly': strategy.calculate_indicators(df_weekly),
-                'daily': strategy.calculate_indicators(df_daily)
+                'daily': strategy.calculate_indicators(df_daily),
+                '120min': strategy.calculate_indicators(df_120min) if df_120min is not None else None
             }
+
+            if all_data['daily'] is None or all_data['weekly'] is None:
+                logger.warning(f"[{name}] 数据获取失败，跳过检查")
+                continue
+
+            # --- 新增：打印股票详细指标信息 ---
+            rsi_daily = all_data['daily']['RSI'].iloc[-1]
+            rsi_weekly = all_data['weekly']['RSI'].iloc[-1]
+            price = all_data['daily']['Close'].iloc[-1]
+            sar = all_data['daily']['SAR'].iloc[-1]
+            macd_dif = all_data['daily']['MACD'].iloc[-1]
+            macd_dea = all_data['daily']['MACD_signal'].iloc[-1]
+            
+            status_sar = "高于SAR" if price > sar else "跌破SAR"
+            status_macd = "金叉" if macd_dif > macd_dea else "死叉"
+            
+            logger.info(f"[{name}] 现价:{price:.2f} | 日RSI:{rsi_daily:.2f} | 周RSI:{rsi_weekly:.2f} | SAR:{sar:.2f}({status_sar}) | MACD:{status_macd}")
+            # --------------------------------
 
             # 信号判断（卖出）
             sell_msgs = strategy.judge_sell(name, stock['judge_sell_ids'], all_data)
@@ -179,6 +209,11 @@ def run_monitor(context):
             buy_msgs = strategy.judge_buy(name, stock['judge_buy_ids'], all_data, get_index_data)
             if buy_msgs:
                 send_dingtalk_alert("\n".join(buy_msgs), context.dingtalk_webhook, context.dingtalk_secret)
+
+            # 信号判断（做 T 买回）
+            t_buy_msgs = strategy.judge_t_buy(name, stock.get('judge_t_ids', []), all_data, get_index_data)
+            if t_buy_msgs:
+                send_dingtalk_alert("\n".join(t_buy_msgs), context.dingtalk_webhook, context.dingtalk_secret)
 
         except Exception as e:
             logger.error(f"处理 {name} 出错：{e}")

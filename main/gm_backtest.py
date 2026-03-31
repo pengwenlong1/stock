@@ -7,7 +7,8 @@ import logging
 from datetime import datetime, timedelta
 
 # 导入策略逻辑
-import strategy
+from strategy import strategy
+
 
 # --- 日志配置 ---
 def setup_logger():
@@ -102,8 +103,8 @@ def fetch_and_format_data(symbol, frequency, count, end_time=None):
     if frequency == 'w':
         actual_count = count * 5
         data = history_n(symbol=symbol, frequency='1d', count=actual_count, end_time=end_time,
-                         fields='eob,open,high,low,close,volume', df=True)
-        if data.empty:
+                         fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+        if data is None or data.empty:
             return None
         data['eob'] = pd.to_datetime(data['eob'])
         data.set_index('eob', inplace=True)
@@ -116,10 +117,14 @@ def fetch_and_format_data(symbol, frequency, count, end_time=None):
         }, inplace=True)
         return resampled.tail(count)
 
-    gm_freq = '1d'
+    if frequency == '7200s':
+        gm_freq = '7200s'
+    else:
+        gm_freq = '1d'
+
     data = history_n(symbol=symbol, frequency=gm_freq, count=count, end_time=end_time,
-                     fields='eob,open,high,low,close,volume', df=True)
-    if data.empty:
+                     fields='eob,open,high,low,close,volume', df=True, adjust=ADJUST_PREV)
+    if data is None or data.empty:
         return None
     data.rename(columns={
         'eob': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low',
@@ -262,6 +267,7 @@ def check_signals_for_stock(context, stock, check_time):
     name = stock['name']
     ticker = stock['ticker']
     judge_buy_ids = stock['judge_buy_ids']
+    judge_t_ids = stock.get('judge_t_ids', [])
     judge_sell_ids = stock['judge_sell_ids']
 
     try:
@@ -301,6 +307,14 @@ def check_signals_for_stock(context, stock, check_time):
         if buy_msgs:
             for msg in buy_msgs:
                 logger.info(f"[{check_time[:10]}] {msg}")
+            context.trade_records[ticker].append({'date': check_time[:10], 'action': 'buy'})
+
+        # 做 T 买回信号
+        t_buy_msgs = strategy.judge_t_buy(name, judge_t_ids, all_data, get_index_data)
+        if t_buy_msgs:
+            for msg in t_buy_msgs:
+                logger.info(f"[{check_time[:10]}] {msg}")
+            # 在回测中，做 T 买回也视为买入行为
             context.trade_records[ticker].append({'date': check_time[:10], 'action': 'buy'})
 
     except Exception as e:
