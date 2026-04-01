@@ -74,6 +74,13 @@ def resample_to_weekly(df_daily):
     }).dropna()
     return resampled
 
+def resample_to_monthly(df_daily):
+    if df_daily is None or df_daily.empty: return None
+    resampled = df_daily.resample('ME').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+    }).dropna()
+    return resampled
+
 def run_test_history(config):
     target_tickers = config.get('target_tickers')
     start_date = config.get('start_date')
@@ -140,6 +147,9 @@ def run_test_history(config):
             data_weekly_raw = resample_to_weekly(data_daily_slice)
             data_weekly = strategy.calculate_indicators(data_weekly_raw)
 
+            data_monthly_raw = resample_to_monthly(data_daily_slice)
+            data_monthly = strategy.calculate_indicators(data_monthly_raw)
+
             # 3. 准备 120min
             data_120min = None
             if df_120min_raw is not None:
@@ -150,6 +160,7 @@ def run_test_history(config):
             all_data = {
                 'daily': data_daily.tail(100),
                 'weekly': data_weekly.tail(100),
+                'monthly': data_monthly.tail(100) if data_monthly is not None else None,
                 '120min': data_120min.tail(100) if data_120min is not None else None
             }
 

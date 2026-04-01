@@ -100,6 +100,25 @@ def init(context):
     # 3. 转换代码格式
     for stock in context.stock_configs:
         stock['gm_symbol'] = convert_to_gm_format(stock['ticker'])
+        stock['skip'] = False
+        stock['skip_reason'] = None
+
+    context._skip_logged_symbols = set()
+
+    hk_stocks = [s for s in context.stock_configs if str(s.get('gm_symbol', '')).startswith('HKEX.')]
+    if hk_stocks:
+        probe_symbol = hk_stocks[0]['gm_symbol']
+        try:
+            probe = history_n(symbol=probe_symbol, frequency='1d', count=1, end_time=None,
+                              fields='eob,open,high,low,close,volume', df=True)
+        except Exception:
+            probe = None
+
+        if probe is None or probe.empty:
+            for s in hk_stocks:
+                s['skip'] = True
+                s['skip_reason'] = '港股日线Bar数据未返回（history_n 返回空）'
+            logger.warning(f"检测到港股日线Bar数据未返回，将跳过港股标的（示例 {probe_symbol} 无日线数据返回）。")
 
     # 4. 设置定时任务 (每天 14:50 执行，接近收盘)
     schedule(schedule_func=run_monitor, date_rule='1d', time_rule='14:50:00')
@@ -194,6 +213,11 @@ def run_monitor(context):
         symbol = stock['gm_symbol']
         name = stock['name']
         judge_t_ids_stock = stock.get('judge_t_ids', [])
+        if stock.get('skip'):
+            if symbol not in context._skip_logged_symbols:
+                logger.warning(f"[{name}] {stock.get('skip_reason')}，已跳过（{symbol}）")
+                context._skip_logged_symbols.add(symbol)
+            continue
         try:
             # 获取数据（日常监控使用日线）
             df_daily_raw = fetch_and_format_data(symbol, 'd', 220)
@@ -229,18 +253,31 @@ def run_monitor(context):
                 }).dropna()
                 return resampled
 
+            def build_monthly_from_daily(daily_raw):
+                resampled = daily_raw.resample('ME').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).dropna()
+                return resampled
+
             recent_days = [ts for ts in df_daily_raw.index[-7:]]
             recent_msgs = []
             for ts in recent_days:
                 daily_slice_raw = df_daily_raw.loc[:ts]
                 weekly_slice_raw = build_weekly_from_daily(daily_slice_raw)
+                monthly_slice_raw = build_monthly_from_daily(daily_slice_raw)
                 daily_slice = strategy.calculate_indicators(daily_slice_raw.copy())
                 weekly_slice = strategy.calculate_indicators(weekly_slice_raw.copy()) if weekly_slice_raw is not None else None
+                monthly_slice = strategy.calculate_indicators(monthly_slice_raw.copy()) if monthly_slice_raw is not None else None
                 if daily_slice is None or weekly_slice is None:
                     continue
 
                 all_data_day = {
                     'weekly': weekly_slice.tail(100),
+                    'monthly': monthly_slice.tail(100) if monthly_slice is not None else None,
                     'daily': daily_slice.tail(100),
                     '120min': None
                 }

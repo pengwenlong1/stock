@@ -144,20 +144,20 @@
         "name": "兴业银行",
         "judge_buy_ids": [4],
         "judge_t_ids": [],
-        "judge_sell_ids": [-1]
+        "judge_sell_ids": []
     },
     {
         "ticker": "600887",
         "name": "伊利股份",
         "judge_buy_ids": [4],
         "judge_t_ids": [],
-        "judge_sell_ids": [-1]
+        "judge_sell_ids": []
     },
     {
         "ticker": "000895",
         "name": "双汇发展",
         "judge_buy_ids": [4],
         "judge_t_ids": [],
-        "judge_sell_ids": [-1]
+        "judge_sell_ids": []
     }
 ]

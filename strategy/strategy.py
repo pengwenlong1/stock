@@ -144,6 +144,7 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
     messages = []
     for sell_id in judge_sell_ids:
         data_weekly = all_data.get('weekly')
+        data_monthly = all_data.get('monthly')
         data_daily = all_data.get('daily')
         data_120min = all_data.get('120min')
 
@@ -161,6 +162,9 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
             if detect_divergence(data_weekly, 'top') and is_death_cross(data_cross, window=3):
                 cross_name = "120分钟" if data_120min is not None else "日线"
                 messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [周线顶背离 + {cross_name}死叉]，建议清仓")
+            # 2. 清仓信号：月线顶背离 + 日线死叉
+            elif data_monthly is not None and detect_divergence(data_monthly, 'top') and is_death_cross(data_daily, window=3):
+                messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [月线顶背离 + 日线死叉]，建议清仓")
             # 2. 减仓信号：日线顶背离 + 120分钟(或日线)死叉
             elif detect_divergence(data_daily, 'top', grace_bars=3) and is_death_cross(data_cross, window=3):
                 cross_name = "120分钟" if data_120min is not None else "日线"
@@ -182,6 +186,9 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
             # 1. 清仓信号：周线顶背离 + 日线死叉
             if detect_divergence(data_weekly, 'top') and is_death_cross(data_daily, window=3):
                 messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [周线顶背离 + 日线死叉]，建议清仓")
+            # 2. 清仓信号：月线顶背离 + 日线死叉
+            elif data_monthly is not None and detect_divergence(data_monthly, 'top') and is_death_cross(data_daily, window=3):
+                messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [月线顶背离 + 日线死叉]，建议清仓")
             # 2. 减仓信号：日线顶背离 + 日线死叉
             elif detect_divergence(data_daily, 'top', grace_bars=3) and is_death_cross(data_daily, window=3):
                 messages.append(f"【{stock_name}】卖出信号 (策略 2-减仓): 触发 [日线顶背离 + 日线死叉]，建议卖出 1/3")
