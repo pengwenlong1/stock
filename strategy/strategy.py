@@ -30,7 +30,7 @@ def calculate_indicators(data):
 
 def detect_divergence(data, type='top', grace_bars=None):
     """
-    检测背离 (仅根据 MACD DIF)
+    检测背离
 
     Args:
         data: 包含 MACD 指标的数据
@@ -62,10 +62,12 @@ def detect_divergence(data, type='top', grace_bars=None):
             return False
         prev_start = max(prev_end - prev_lookback + 1, 0)
         prev_idx = prev_start + price[prev_start:prev_end+1].argmax()
-        if recent_max_idx - prev_idx < 3:
+        if recent_max_idx - prev_idx < 5:
             return False
 
-        if price[recent_max_idx] > price[prev_idx] and (dif[recent_max_idx] < dif[prev_idx] or macd_hist[recent_max_idx] < macd_hist[prev_idx]):
+        if price[recent_max_idx] > price[prev_idx] and \
+           macd_hist[prev_idx] > 0 and macd_hist[recent_max_idx] > 0 and \
+           macd_hist[recent_max_idx] < macd_hist[prev_idx]:
             if grace_bars is None:
                 return True
             return (curr - recent_max_idx) <= (grace_bars - 1)
@@ -213,6 +215,7 @@ def judge_t_buy(stock_name, judge_t_ids, all_data, get_index_data_func=None):
     # 修改提示信息，标注为“做 T 买回”
     for msg in base_messages:
         t_msg = msg.replace("新资金买入信号", "做 T 买回信号")
+        t_msg = t_msg.replace("买入信号", "做 T 买回信号")
         messages.append(t_msg)
         
     return messages

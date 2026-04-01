@@ -130,6 +130,7 @@ def run_test_history(config):
             judge_buy_ids = config.get('judge_buy_ids', stock['judge_buy_ids'])
             judge_t_ids = config.get('judge_t_ids', stock.get('judge_t_ids', []))
             judge_sell_ids = config.get('judge_sell_ids', stock['judge_sell_ids'])
+            judge_buy_ids = [i for i in judge_buy_ids if i not in judge_t_ids]
 
             # 1. 准备日线：取到当前时间点
             data_daily_slice = df_daily_raw.loc[:current_time]

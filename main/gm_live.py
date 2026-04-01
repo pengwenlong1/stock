@@ -59,6 +59,10 @@ def send_dingtalk_alert(message, webhook, secret):
     if not webhook:
         return
     try:
+        lines = [line for line in str(message).splitlines() if line.strip()]
+        preview = "\n".join(lines[:20])
+        logger.info(f"钉钉告警原因（共 {len(lines)} 条）：\n{preview}")
+
         timestamp = str(round(time.time() * 1000))
         secret_enc = secret.encode('utf-8')
         string_to_sign = '{}\n{}'.format(timestamp, secret)
@@ -69,8 +73,11 @@ def send_dingtalk_alert(message, webhook, secret):
         webhook_url = f"{webhook}&timestamp={timestamp}&sign={sign}"
         data = {"msgtype": "text", "text": {"content": message}}
         headers = {'Content-Type': 'application/json'}
-        requests.post(webhook_url, json=data, headers=headers)
-        logger.info("钉钉告警发送成功")
+        resp = requests.post(webhook_url, json=data, headers=headers, timeout=10)
+        if resp.ok:
+            logger.info("钉钉告警发送成功")
+        else:
+            logger.error(f"钉钉告警发送失败：HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         logger.error(f"发送钉钉告警出错：{e}")
 
@@ -186,6 +193,7 @@ def run_monitor(context):
     for stock in context.stock_configs:
         symbol = stock['gm_symbol']
         name = stock['name']
+        judge_t_ids_stock = stock.get('judge_t_ids', [])
         try:
             # 获取数据（日常监控使用日线）
             df_daily_raw = fetch_and_format_data(symbol, 'd', 220)
@@ -254,16 +262,29 @@ def run_monitor(context):
                         return None
                     return idx_df.loc[:ts].tail(100)
 
-                buy_msgs = strategy.judge_buy(name, stock['judge_buy_ids'], all_data_day, get_index_data)
+                judge_buy_ids = [i for i in stock['judge_buy_ids'] if i not in judge_t_ids_stock]
+
+                buy_msgs = strategy.judge_buy(name, judge_buy_ids, all_data_day, get_index_data)
                 for m in buy_msgs:
                     recent_msgs.append(f"{day_str} | {m}")
 
-                t_buy_msgs = strategy.judge_t_buy(name, stock.get('judge_t_ids', []), all_data_day, get_index_data)
+                t_buy_msgs = strategy.judge_t_buy(name, judge_t_ids_stock, all_data_day, get_index_data)
                 for m in t_buy_msgs:
+                    m = m.replace("新资金买入信号", "做 T 买回信号")
+                    m = m.replace("买入信号", "做 T 买回信号")
                     recent_msgs.append(f"{day_str} | {m}")
 
             if recent_msgs:
-                send_dingtalk_alert("\n".join(recent_msgs), context.dingtalk_webhook, context.dingtalk_secret)
+                normalized_msgs = []
+                for line in recent_msgs:
+                    updated = line
+                    for tid in judge_t_ids_stock:
+                        if f"(策略 {tid}-" in updated and "买入信号" in updated and "做 T 买回信号" not in updated:
+                            updated = updated.replace("新资金买入信号", "做 T 买回信号")
+                            updated = updated.replace("买入信号", "做 T 买回信号")
+                            break
+                    normalized_msgs.append(updated)
+                send_dingtalk_alert("\n".join(normalized_msgs), context.dingtalk_webhook, context.dingtalk_secret)
 
         except Exception as e:
             logger.error(f"处理 {name} 出错：{e}")
