@@ -5,8 +5,10 @@ import json
 import os
 import logging
 from datetime import datetime, timedelta
+import sys
 
 # 导入策略逻辑
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from strategy import strategy
 
 
@@ -37,7 +39,7 @@ logger = setup_logger()
 
 # --- 加载配置 ---
 def load_gm_config():
-    config_path = os.path.join(os.path.dirname(__file__), 'config', 'settings.json')
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'settings.json')
     with open(config_path, 'r', encoding='utf-8') as f:
         settings = json.load(f)
     return settings
@@ -134,6 +136,290 @@ def fetch_and_format_data(symbol, frequency, count, end_time=None):
     data.set_index('Date', inplace=True)
     return data
 
+def format_price(price):
+    p = float(price)
+    return f"{p:.4f}" if p < 10 else f"{p:.2f}"
+
+def resample_to_weekly(df_daily):
+    if df_daily is None or df_daily.empty:
+        return None
+    resampled = df_daily.resample('W-FRI').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+    }).dropna()
+    return resampled
+
+def resample_to_monthly(df_daily):
+    if df_daily is None or df_daily.empty:
+        return None
+    resampled = df_daily.resample('ME').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+    }).dropna()
+    return resampled
+
+def parse_sell_fraction(messages):
+    if not messages:
+        return 0.0, None
+    picked = None
+    fraction = 0.0
+    for msg in messages:
+        if '建议清仓' in msg or '建议卖出全部' in msg:
+            return 1.0, msg
+        if '卖出剩余 1/2' in msg or '卖出 1/2' in msg:
+            if fraction < 0.5:
+                fraction = 0.5
+                picked = msg
+        if '卖出剩余 1/3' in msg or '卖出 1/3' in msg:
+            if fraction < (1.0 / 3.0):
+                fraction = 1.0 / 3.0
+                picked = msg
+    return fraction, picked
+
+def run_backtest_history(
+    start_date,
+    end_date,
+    initial_cash=1000000,
+    lot_size=100,
+    warmup_days=400,
+    stock_configs=None,
+    target_tickers=None,
+    judge_buy_ids=None,
+    judge_sell_ids=None,
+    target_names=None,
+    judge_t_ids=None,
+):
+    set_token(gm_config.get('gm_token'))
+    judge_t_ids = judge_t_ids or []
+
+    if stock_configs is None:
+        target_tickers = target_tickers or []
+        judge_buy_ids = judge_buy_ids or []
+        judge_sell_ids = judge_sell_ids or []
+        stock_configs = []
+        for t in target_tickers:
+            stock_configs.append(
+                {
+                    'ticker': t,
+                    'name': target_names.get(t, t) if isinstance(target_names, dict) else t,
+                    'judge_buy_ids': list(judge_buy_ids),
+                    'judge_sell_ids': list(judge_sell_ids),
+                    'judge_t_ids': list(judge_t_ids),
+                }
+            )
+
+    summary_rows = []
+    for stock in stock_configs:
+        ticker = stock.get('ticker')
+        if not ticker:
+            continue
+        name = stock.get('name') or (target_names.get(ticker, ticker) if isinstance(target_names, dict) else ticker)
+        symbol = convert_to_gm_format(ticker)
+        if symbol.startswith('HKEX.'):
+            logger.warning(f"[{name}] 掘金不支持港股Bar数据，跳过（{symbol}）")
+            continue
+        stock_judge_buy_ids = stock.get('judge_buy_ids', judge_buy_ids) or []
+        stock_judge_sell_ids = stock.get('judge_sell_ids', judge_sell_ids) or []
+        stock_judge_t_ids = stock.get('judge_t_ids', judge_t_ids) or []
+
+        warmup_start = (pd.to_datetime(start_date) - pd.Timedelta(days=warmup_days)).strftime('%Y-%m-%d')
+        df_daily_raw = history(
+            symbol=symbol,
+            frequency='1d',
+            start_time=f'{warmup_start} 09:00:00',
+            end_time=f'{end_date} 15:30:00',
+            fields='eob,open,high,low,close,volume',
+            df=True,
+            adjust=ADJUST_PREV,
+        )
+        if df_daily_raw is None or df_daily_raw.empty:
+            logger.warning(f"[{name}] 无数据，跳过")
+            continue
+
+        df_daily_raw = df_daily_raw.rename(
+            columns={'eob': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
+        )
+        df_daily_raw['Date'] = pd.to_datetime(df_daily_raw['Date'])
+        df_daily_raw = df_daily_raw.set_index('Date').sort_index()
+
+        tz = df_daily_raw.index.tz
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+        if tz is not None:
+            start_ts = start_ts.tz_localize(tz)
+            end_ts = end_ts.tz_localize(tz)
+
+        trade_days = df_daily_raw.loc[start_ts:end_ts].index
+        if len(trade_days) == 0:
+            logger.warning(f"[{name}] 回测区间无交易日，跳过")
+            continue
+
+        cash = float(initial_cash)
+        shares = 0
+        has_sold_before = False
+        trades = []
+        equity_curve = []
+
+        first_close = float(df_daily_raw.loc[trade_days[0]]['Close'])
+        hold_shares = int((initial_cash / first_close) // lot_size) * lot_size
+        hold_cash = initial_cash - hold_shares * first_close
+
+        index_cache = {}
+
+        def get_index_data(idx_ticker, ts):
+            cache_key = (idx_ticker, ts)
+            if cache_key in index_cache:
+                return index_cache[cache_key]
+            idx_sym = convert_to_gm_format(idx_ticker)
+            idx_df = history(
+                symbol=idx_sym,
+                frequency='1d',
+                start_time=f'{warmup_start} 09:00:00',
+                end_time=f'{end_date} 15:30:00',
+                fields='eob,open,high,low,close,volume',
+                df=True,
+                adjust=ADJUST_PREV,
+            )
+            if idx_df is None or idx_df.empty:
+                index_cache[cache_key] = None
+                return None
+            idx_df = idx_df.rename(
+                columns={'eob': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
+            )
+            idx_df['Date'] = pd.to_datetime(idx_df['Date'])
+            idx_df = idx_df.set_index('Date').sort_index()
+            idx_slice = idx_df.loc[:ts].tail(100)
+            idx_ind = strategy.calculate_indicators(idx_slice.copy())
+            index_cache[cache_key] = idx_ind
+            return idx_ind
+
+        for ts in trade_days:
+            daily_slice_raw = df_daily_raw.loc[:ts].tail(600)
+            weekly_raw = resample_to_weekly(daily_slice_raw)
+            monthly_raw = resample_to_monthly(daily_slice_raw)
+
+            daily = strategy.calculate_indicators(daily_slice_raw.copy())
+            weekly = strategy.calculate_indicators(weekly_raw.copy()) if weekly_raw is not None else None
+            monthly = strategy.calculate_indicators(monthly_raw.copy()) if monthly_raw is not None else None
+
+            if daily is None or weekly is None:
+                continue
+
+            daily = daily.tail(100)
+            weekly = weekly.tail(100)
+            monthly = monthly.tail(100) if monthly is not None else None
+
+            all_data = {'daily': daily, 'weekly': weekly, 'monthly': monthly, '120min': None}
+            close = float(daily['Close'].iloc[-1])
+            day_str = ts.strftime('%Y-%m-%d') if hasattr(ts, 'strftime') else str(ts)[:10]
+
+            equity_curve.append({'Date': ts, 'Equity': cash + shares * close})
+
+            sell_msgs = strategy.judge_sell(name, stock_judge_sell_ids, all_data)
+            sell_fraction, sell_reason = parse_sell_fraction(sell_msgs)
+            if sell_fraction > 0 and shares > 0:
+                if sell_fraction >= 0.999:
+                    sell_qty = shares
+                else:
+                    sell_qty = int((shares * sell_fraction) // lot_size) * lot_size
+                    sell_qty = min(sell_qty, shares)
+                if sell_qty > 0:
+                    cash += sell_qty * close
+                    shares -= sell_qty
+                    trades.append(
+                        {
+                            'date': day_str,
+                            'action': 'SELL',
+                            'shares': int(sell_qty),
+                            'price': close,
+                            'reason': sell_reason or 'SELL',
+                        }
+                    )
+                    has_sold_before = True
+
+            def idx_getter(idx_ticker):
+                return get_index_data(idx_ticker, ts)
+
+            judge_buy_ids_clean = [i for i in stock_judge_buy_ids if i not in stock_judge_t_ids]
+            buy_msgs = strategy.judge_buy(name, judge_buy_ids_clean, all_data, idx_getter)
+            t_buy_msgs = strategy.judge_t_buy(name, stock_judge_t_ids, all_data, idx_getter, has_sold_before)
+
+            buy_reason = buy_msgs[0] if buy_msgs else None
+            t_buy_reason = t_buy_msgs[0] if t_buy_msgs else None
+
+            executed_buy = False
+            
+            if buy_reason and shares == 0 and cash > close * lot_size:
+                buy_qty = int((cash / close) // lot_size) * lot_size
+                if buy_qty > 0:
+                    cash -= buy_qty * close
+                    shares += buy_qty
+                    trades.append(
+                        {
+                            'date': day_str,
+                            'action': 'BUY',
+                            'shares': int(buy_qty),
+                            'price': close,
+                            'reason': buy_reason,
+                        }
+                    )
+                    executed_buy = True
+
+            if not executed_buy and t_buy_reason and has_sold_before and cash > close * lot_size:
+                t_buy_qty = int((cash / close) // lot_size) * lot_size
+                if t_buy_qty > 0:
+                    cash -= t_buy_qty * close
+                    shares += t_buy_qty
+                    trades.append(
+                        {
+                            'date': day_str,
+                            'action': 'BUY',
+                            'shares': int(t_buy_qty),
+                            'price': close,
+                            'reason': t_buy_reason,
+                        }
+                    )
+
+        end_close = float(df_daily_raw.loc[trade_days[-1]]['Close'])
+        final_value = cash + shares * end_close
+        hold_value = hold_cash + hold_shares * end_close
+
+        eq = pd.DataFrame(equity_curve).set_index('Date')['Equity']
+        peak = eq.cummax()
+        max_dd = (eq / peak - 1.0).min() * 100.0 if len(eq) else 0.0
+
+        strategy_return = (final_value / initial_cash - 1.0) * 100.0
+        hold_return = (hold_value / initial_cash - 1.0) * 100.0
+
+        logger.info("=" * 60)
+        logger.info(f"{name} ({symbol}) | {start_date} ~ {end_date}")
+        logger.info(f"策略收益率: {strategy_return:.2f}%")
+        logger.info(f"买入持有收益率: {hold_return:.2f}%")
+        logger.info(f"策略超额收益: {strategy_return - hold_return:.2f}%")
+        logger.info(f"最大回撤: {max_dd:.2f}%")
+        logger.info("-" * 60)
+        if not trades:
+            logger.info("无交易记录")
+        else:
+            for t in trades:
+                logger.info(f"{t['date']} | {t['action']} {t['shares']} @ {format_price(t['price'])} | {t['reason']}")
+
+        summary_rows.append(
+            {
+                'ticker': ticker,
+                'symbol': symbol,
+                '策略收益率(%)': round(strategy_return, 2),
+                '买入持有(%)': round(hold_return, 2),
+                '超额收益(%)': round(strategy_return - hold_return, 2),
+                '最大回撤(%)': round(max_dd, 2),
+                '交易次数': len(trades),
+            }
+        )
+
+    if summary_rows:
+        df_sum = pd.DataFrame(summary_rows)
+        logger.info("=" * 60)
+        logger.info("汇总")
+        logger.info(df_sum.to_string(index=False))
+
 def calculate_performance_metrics(symbol, df_price, trade_records):
     """计算回测绩效指标"""
     if df_price is None or len(df_price) < 2:
@@ -215,18 +501,7 @@ def calculate_performance_metrics(symbol, df_price, trade_records):
         '买入持有夏普比率': round(calc_sharpe(hold_values), 2),
     }
 
-# --- 全局变量 ---
-GLOBAL_CONTEXT = None
 
-# ==================== 回测配置 ====================
-# 在这里修改要回测的股票/基金代码
-TARGET_TICKERS = ['159928']
-TARGET_NAMES = {'159928': '消费 ETF'}
-JUDGE_BUY_IDS = [1, 2]   # 买入策略 ID
-JUDGE_SELL_IDS = [1]     # 卖出策略 ID
-# 回测结束时间（用于判断何时输出最终结果）
-BACKTEST_END_DATE = '2026-03-20'
-# ================================================
 
 # --- 策略核心 ---
 def init(context):
@@ -392,19 +667,31 @@ def output_final_result(context):
         logger.info(f"平均买入持有收益率：{avg_hold:.2f}%")
         logger.info(f"平均超额收益：{avg_excess:.2f}%")
 
+# --- 全局变量 ---
+GLOBAL_CONTEXT = None
+
+# ==================== 回测配置 ====================
+# 在这里修改要回测的股票/基金代码
+TARGET_TICKERS = ['159928', '512480']
+TARGET_NAMES = {'512480': '半导体 ETF'}
+JUDGE_BUY_IDS = [1, 2]   # 买入策略 ID
+JUDGE_SELL_IDS = [1]     # 卖出策略 ID
+# 回测结束时间（用于判断何时输出最终结果）
+BACKTEST_END_DATE = '2026-03-20'
+# ================================================
+
+STOCK_CONFIGS = [
+    {'ticker': '000895', 'name': '双汇', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    {'ticker': '600941', 'name': '中国移动', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    {'ticker': '512480', 'name': '半导体 ETF', 'judge_buy_ids': [3], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    {'ticker': '159622', 'name': '创新药', 'judge_buy_ids': [3], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+]
+
 if __name__ == '__main__':
-    from gm.api import MODE_BACKTEST
-
-    backtest_config = {
-        'strategy_id': gm_config.get('gm_strategy_id', 'strategy_test'),
-        'filename': 'gm_backtest.py',
-        'mode': MODE_BACKTEST,
-        'token': gm_config.get('gm_token'),
-        'backtest_start_time': '2021-03-21 09:00:00',
-        'backtest_end_time': '2026-03-21 15:30:00',
-        'backtest_initial_cash': 1000000,
-        'backtest_commission_ratio': 0.0003,
-        'backtest_slippage_ratio': 0.0001,
-    }
-
-    run(**backtest_config)
+    run_backtest_history(
+        start_date='2024-02-01',
+        end_date='2026-03-31',
+        initial_cash=1000000,
+        lot_size=100,
+        stock_configs=STOCK_CONFIGS,
+    )

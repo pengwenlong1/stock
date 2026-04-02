@@ -207,19 +207,29 @@ def judge_sell(stock_name, judge_sell_ids, all_data):
 
     return messages
 
-def judge_t_buy(stock_name, judge_t_ids, all_data, get_index_data_func=None):
+def judge_t_buy(stock_name, judge_t_ids, all_data, get_index_data_func=None, has_sold_before=False):
     """
     判断做 T 买回信号 (买回之前卖出的资金)
-    逻辑与 judge_buy 一致，但提示信息不同
+    
+    Args:
+        stock_name: 股票名称
+        judge_t_ids: 做 T 策略 ID 列表
+        all_data: 包含 weekly, daily, 120min 数据的字典
+        get_index_data_func: 获取指数数据的函数
+        has_sold_before: 是否之前有过卖出操作（关键参数）
+    
+    Returns:
+        messages: 做 T 买回信号列表（如果没有卖出过则返回空列表）
     """
     messages = []
     if not judge_t_ids:
         return messages
+    
+    if not has_sold_before:
+        return messages
         
-    # 直接调用 judge_buy 获取基础信号
     base_messages = judge_buy(stock_name, judge_t_ids, all_data, get_index_data_func)
     
-    # 修改提示信息，标注为“做 T 买回”
     for msg in base_messages:
         t_msg = msg.replace("新资金买入信号", "做 T 买回信号")
         t_msg = t_msg.replace("买入信号", "做 T 买回信号")
