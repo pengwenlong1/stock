@@ -19,17 +19,17 @@ def setup_logger():
         os.makedirs(log_dir)
 
     logger = logging.getLogger("GM_Backtest")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
         ch.setFormatter(formatter)
         logger.addHandler(ch)
 
         fh = logging.FileHandler(os.path.join(log_dir, 'backtest.log'), mode='w', encoding='utf-8')
-        fh.setLevel(logging.INFO)
+        fh.setLevel(logging.DEBUG)
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
@@ -162,13 +162,13 @@ def parse_sell_fraction(messages):
     picked = None
     fraction = 0.0
     for msg in messages:
-        if '建议清仓' in msg or '建议卖出全部' in msg:
+        if '建议清仓' in msg or '建议卖出全部剩余仓位' in msg:
             return 1.0, msg
-        if '卖出剩余 1/2' in msg or '卖出 1/2' in msg:
+        if '建议卖出剩余 1/2' in msg:
             if fraction < 0.5:
                 fraction = 0.5
                 picked = msg
-        if '卖出剩余 1/3' in msg or '卖出 1/3' in msg:
+        if '建议卖出 1/3' in msg:
             if fraction < (1.0 / 3.0):
                 fraction = 1.0 / 3.0
                 picked = msg
@@ -257,6 +257,14 @@ def run_backtest_history(
         has_sold_before = False
         trades = []
         equity_curve = []
+        last_sell_date = None  # 记录上次卖出的日期
+        rsi_flag = 0  # RSI flag 状态：0=初始，1=RSI>80, 2=RSI>85, 3=RSI>90
+        last_sar_breakdown_week = None  # 记录上次 SAR 跌破的周
+        rsi_flag_value = 0  # 记录触发 flag 时的实际 RSI 峰值
+        div_pending_flag = 0  # 顶背离潜在标志：0=无潜在顶背离，1=检测到潜在顶背离（等待 SAR 确认）
+        div_flag = 0  # 顶背离有效标志：0=顶背离未确认，1=顶背离已确认（SAR 已跌破）
+        div_date = None  # 顶背离发生的日期（潜在顶背离检测到的日期）
+        div_high_price = 0  # 顶背离时的最高价（用于确认 SAR 跌破后该高点是否仍然有效）
 
         first_close = float(df_daily_raw.loc[trade_days[0]]['Close'])
         hold_shares = int((initial_cash / first_close) // lot_size) * lot_size
@@ -313,9 +321,104 @@ def run_backtest_history(
 
             equity_curve.append({'Date': ts, 'Equity': cash + shares * close})
 
-            sell_msgs = strategy.judge_sell(name, stock_judge_sell_ids, all_data)
+            # 计算当前的 rsi_flag
+            max_rsi_current = 0
+            if weekly is not None and 'RSI' in weekly.columns:
+                if last_sar_breakdown_week is not None:
+                    # 如果上次 SAR 跌破已发生，需要从该周之后计算 RSI 峰值
+                    weekly_filtered = weekly[weekly.index > last_sar_breakdown_week]
+                    if weekly_filtered is not None and not weekly_filtered.empty:
+                        max_rsi_current = weekly_filtered['RSI'].max()
+                    else:
+                        max_rsi_current = 0
+                else:
+                    # 第一次 SAR 跌破之前，根据所有历史周线数据计算 RSI 峰值
+                    max_rsi_current = weekly['RSI'].max()
+
+            # 更新 rsi_flag_value（保存从上次 SAR 跌破后的 RSI 峰值）
+            if max_rsi_current > rsi_flag_value:
+                rsi_flag_value = max_rsi_current
+
+            # 根据 rsi_flag_value 计算 rsi_flag
+            rsi_flag = strategy.get_rsi_flag_level(rsi_flag_value)
+
+            # 调用 judge_sell，传入当前的 rsi_flag
+            # judge_sell 会在 SAR 跌破时根据 rsi_flag 生成卖出信号（RSI 阶梯减仓），并返回更新后的 flag（跌破后为 0）
+            # 注意：回测脚本不使用 judge_sell 中的顶背离死叉逻辑，而是使用单独的 div_flag 逻辑
+            sell_msgs, updated_rsi_flag, sar_breakdown = strategy.judge_sell(name, stock_judge_sell_ids, all_data, rsi_flag=rsi_flag)
+
+            # 保存卖出时的 RSI 峰值（用于日志）
+            sell_rsi_value = rsi_flag_value
+
+            # 如果 SAR 跌破发生，更新 last_sar_breakdown_week 并重置 rsi_flag
+            # 注意：div_flag 不在这里重置，只在 SAR 跌破触发卖出后重置
+            if sar_breakdown:
+                last_sar_breakdown_week = weekly.index[-1] if weekly is not None else None
+                rsi_flag = 0  # 重置为 0
+                rsi_flag_value = 0  # 重置 RSI 值
+            else:
+                rsi_flag = updated_rsi_flag
+
+            # 处理 judge_sell 返回的卖出信号（RSI 阶梯减仓）
             sell_fraction, sell_reason = parse_sell_fraction(sell_msgs)
-            if sell_fraction > 0 and shares > 0:
+
+            # 检查顶背离状态
+            data_daily_for_div = all_data.get('daily')
+            current_high = data_daily_for_div['High'].iloc[-1] if data_daily_for_div is not None else 0
+
+            # 1. 检测潜在顶背离（只在没有潜在顶背离时检测）
+            if div_pending_flag == 0:
+                # 检测顶背离条件：股价创新高 + MACD 红柱缩短 + 间隔>=5 根 K 线
+                # 注意：此时不要求 SAR 跌破，只记录潜在顶背离
+                if strategy.detect_divergence(data_daily_for_div, 'top'):
+                    div_pending_flag = 1
+                    div_date = day_str
+                    # 记录两个高点中的较高者（用于后续确认 SAR 跌破后该高点是否仍然有效）
+                    # detect_divergence 内部比较的是最近高点和前一个高点
+                    div_high_price = current_high
+                    logger.info(f"[{day_str}] *** 检测到潜在顶背离，等待 SAR 确认，div_high_price={div_high_price:.3f} ***")
+            else:
+                # 2. 已有潜在顶背离，需要确认：
+                # - 如果价格又创新高，说明之前的顶背离形态被破坏，需要重新检测
+                # - 如果 SAR 跌破，确认顶背离有效，触发卖出
+                if current_high > div_high_price:
+                    # 价格创新高，之前的顶背离形态失效，重置并重新检测
+                    logger.info(f"[{day_str}] 价格创新高 {current_high:.3f} > {div_high_price:.3f}，之前潜在顶背离失效，重新检测 ***")
+                    div_pending_flag = 0
+                    div_date = None
+                    div_high_price = 0
+                elif 'SAR' in data_daily_for_div.columns:
+                    # 检查是否 SAR 跌破（当前价 < SAR）
+                    sar_curr = data_daily_for_div['SAR'].iloc[-1]
+                    if close < sar_curr:
+                        # SAR 跌破，确认顶背离有效，触发卖出
+                        div_flag = 1
+                        logger.info(f"[{day_str}] *** SAR 跌破确认顶背离有效，div_date={div_date}, div_high_price={div_high_price:.3f} ***")
+
+            # 3. 如果顶背离已确认（SAR 已跌破），触发卖出
+            div_sell_triggered = False
+            if div_flag == 1:
+                div_sell_triggered = True
+                sell_fraction = 1.0 / 3.0
+                sell_reason = f"【{name}】卖出信号 (策略 1-顶背离 SAR): 日线顶背离 ({div_date}) + SAR 跌破确认，高={div_high_price:.3f}, 建议卖出 1/3"
+                div_flag = 0  # 卖出后重置
+                div_pending_flag = 0  # 重置潜在标志
+                div_date = None
+                div_high_price = 0
+                logger.info(f"[{day_str}] *** 顶背离 SAR 触发卖出 ***")
+
+            # 检查是否在 5 个交易日内重复触发
+            should_skip = False
+            if last_sell_date is not None and shares > 0:
+                # 统一转换为不带时区的日期进行比较
+                current_date = ts.tz_localize(None) if hasattr(ts, 'tz') and ts.tz is not None else pd.to_datetime(ts)
+                last_date = pd.to_datetime(last_sell_date).tz_localize(None)
+                days_since_last_sell = (current_date - last_date).days
+                if days_since_last_sell < 5:
+                    should_skip = True
+
+            if sell_fraction > 0 and shares > 0 and not should_skip:
+                # 执行卖出
                 if sell_fraction >= 0.999:
                     sell_qty = shares
                 else:
@@ -334,6 +437,16 @@ def run_backtest_history(
                         }
                     )
                     has_sold_before = True
+                    last_sell_date = day_str
+                    # 使用保存的触发 flag 时的 RSI 值
+                    if div_sell_triggered:
+                        logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | {sell_reason}")
+                    else:
+                        logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | 周线 RSI 峰值={sell_rsi_value:.2f} | {sell_reason}")
+            elif sell_fraction > 0 and shares == 0:
+                pass  # 有卖出信号但已空仓，跳过
+            elif sell_fraction == 0 and shares > 0:
+                pass  # 无卖出信号，继续持有
 
             def idx_getter(idx_ticker):
                 return get_index_data(idx_ticker, ts)
@@ -346,8 +459,9 @@ def run_backtest_history(
             t_buy_reason = t_buy_msgs[0] if t_buy_msgs else None
 
             executed_buy = False
-            
-            if buy_reason and shares == 0 and cash > close * lot_size:
+
+            if buy_reason and cash > close * lot_size:
+                # 新资金买入
                 buy_qty = int((cash / close) // lot_size) * lot_size
                 if buy_qty > 0:
                     cash -= buy_qty * close
@@ -362,8 +476,13 @@ def run_backtest_history(
                         }
                     )
                     executed_buy = True
+                    has_sold_before = False
+                    logger.info(f"[{day_str}] 买入：{buy_qty} 股 @ {close:.3f} | {buy_reason}")
+            elif buy_reason:
+                pass  # 有买入信号但没执行（现金不足）
 
             if not executed_buy and t_buy_reason and has_sold_before and cash > close * lot_size:
+                # 做 T 买回
                 t_buy_qty = int((cash / close) // lot_size) * lot_size
                 if t_buy_qty > 0:
                     cash -= t_buy_qty * close
@@ -377,6 +496,7 @@ def run_backtest_history(
                             'reason': t_buy_reason,
                         }
                     )
+                    logger.info(f"[{day_str}] 做 T 买回：{t_buy_qty} 股 @ {close:.3f} | {t_buy_reason}")
 
         end_close = float(df_daily_raw.loc[trade_days[-1]]['Close'])
         final_value = cash + shares * end_close
@@ -564,7 +684,7 @@ def check_signals_for_stock(context, stock, check_time):
         }
 
         # 卖出信号
-        sell_msgs = strategy.judge_sell(name, judge_sell_ids, all_data)
+        sell_msgs, _, _ = strategy.judge_sell(name, judge_sell_ids, all_data)
         if sell_msgs:
             for msg in sell_msgs:
                 logger.info(f"[{check_time[:10]}] {msg}")
@@ -681,16 +801,37 @@ BACKTEST_END_DATE = '2026-03-20'
 # ================================================
 
 STOCK_CONFIGS = [
-    {'ticker': '000895', 'name': '双汇', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
-    {'ticker': '600941', 'name': '中国移动', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
-    {'ticker': '512480', 'name': '半导体 ETF', 'judge_buy_ids': [3], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
-    {'ticker': '159622', 'name': '创新药', 'judge_buy_ids': [3], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    # {'ticker': '000895', 'name': '双汇', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    # {'ticker': '600941', 'name': '中国移动', 'judge_buy_ids': [4], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    {'ticker': '512480', 'name': '半导体 ETF', 'judge_buy_ids': [5], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    # {'ticker': '159622', 'name': '创新药', 'judge_buy_ids': [3], 'judge_t_ids': [2], 'judge_sell_ids': [1]},
+    # {
+    #     "ticker": "159928",
+    #     "name": "消费ETF",
+    #     "judge_buy_ids": [1],
+    #     "judge_t_ids": [2],
+    #     "judge_sell_ids": [1]
+    # },
+    # {
+    #     "ticker": "159647",
+    #     "name": "中药ETF",
+    #     "judge_buy_ids": [1],
+    #     "judge_t_ids": [2],
+    #     "judge_sell_ids": [1]
+    # },
+    # {
+    #     "ticker": "159873",
+    #     "name": "医疗设备ETF",
+    #     "judge_buy_ids": [1],
+    #     "judge_t_ids": [2],
+    #     "judge_sell_ids": [1]
+    # },
 ]
 
 if __name__ == '__main__':
     run_backtest_history(
-        start_date='2024-02-01',
-        end_date='2026-03-31',
+        start_date='2025-01-01',
+        end_date='2026-04-03',
         initial_cash=1000000,
         lot_size=100,
         stock_configs=STOCK_CONFIGS,

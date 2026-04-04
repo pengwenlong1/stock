@@ -289,7 +289,7 @@ def run_monitor(context):
                 if strategy.detect_divergence(all_data_day['weekly'], 'top'):
                     recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-周线顶背离(价格新高+MACD柱/或DIF背离)")
 
-                sell_msgs = strategy.judge_sell(name, stock['judge_sell_ids'], all_data_day)
+                sell_msgs, _, _ = strategy.judge_sell(name, stock['judge_sell_ids'], all_data_day)
                 for m in sell_msgs:
                     recent_msgs.append(f"{day_str} | {m}")
 

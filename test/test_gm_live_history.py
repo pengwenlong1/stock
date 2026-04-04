@@ -196,7 +196,7 @@ def run_test_history(config):
                 idx_slice = idx_raw.loc[:current_time]
                 return strategy.calculate_indicators(idx_slice.copy()).tail(100)
 
-            sell_msgs = strategy.judge_sell(name, judge_sell_ids, all_data)
+            sell_msgs, _, _ = strategy.judge_sell(name, judge_sell_ids, all_data)
             buy_msgs = strategy.judge_buy(name, judge_buy_ids, all_data, get_index_data)
             t_buy_msgs = strategy.judge_t_buy(name, judge_t_ids, all_data, get_index_data)
 
