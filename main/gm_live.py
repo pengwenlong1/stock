@@ -102,6 +102,26 @@ def init(context):
         stock['gm_symbol'] = convert_to_gm_format(stock['ticker'])
         stock['skip'] = False
         stock['skip_reason'] = None
+        # 初始化 RSI flag 状态跟踪
+        stock['rsi_flag'] = 0  # 初始化 rsi_flag=0
+        stock['rsi_peak_after_breakdown'] = 0  # 上次均线跌破后的周线 RSI 峰值
+        stock['last_sar_breakdown_week'] = None  # 记录上次均线跌破的周
+        stock['last_ma5_breakdown_date'] = None  # 记录上次均线跌破的日期
+        # 初始化 RSI 状态字典（用于周线顶背离判断）
+        stock['rsi_state'] = {
+            'current_position': 0,
+            'rsi_peak': 0,
+            'rsi_trough': 0,
+            'price_at_peak': 0,
+            'position_1_price': 0,
+            'position_2_price': 0,
+            'position_4_price': 0,
+            'position_5_price': 0,
+            'prev_high_price': 0,
+            'prev_high_macd': 0,
+            'prev_high_idx': None,
+            'diverse_week_flag': 0
+        }
 
     context._skip_logged_symbols = set()
 
@@ -238,6 +258,7 @@ def run_monitor(context):
                 continue
 
             # --- 新增：打印股票详细指标信息 ---
+            # ===== RSI flag 状态更新 =====
             rsi_daily = all_data_now['daily']['RSI'].iloc[-1]
             rsi_weekly = all_data_now['weekly']['RSI'].iloc[-1]
             logger.info(f"[{name}] 日RSI:{rsi_daily:.2f} | 周RSI:{rsi_weekly:.2f}")
@@ -265,6 +286,12 @@ def run_monitor(context):
 
             recent_days = [ts for ts in df_daily_raw.index[-7:]]
             recent_msgs = []
+
+            # 保存当前的状态（用于在检查历史信号时不修改实际状态）
+            saved_rsi_flag = stock.get('rsi_flag', 0)
+            saved_rsi_state = stock.get('rsi_state', {}).copy()
+
+            # 循环检查过去 7 天的数据，查找是否有未告警的信号
             for ts in recent_days:
                 daily_slice_raw = df_daily_raw.loc[:ts]
                 weekly_slice_raw = build_weekly_from_daily(daily_slice_raw)
@@ -284,14 +311,24 @@ def run_monitor(context):
 
                 day_str = ts.strftime('%Y-%m-%d')
 
+                # 获取当前周线 RSI 值，用于日志输出
+                current_weekly_rsi = weekly_slice['RSI'].iloc[-1] if 'RSI' in weekly_slice.columns else 0
+
                 if strategy.detect_divergence(all_data_day['daily'], 'top', grace_bars=3):
                     recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-日线顶背离(3日有效，价格新高+MACD柱/或DIF背离)")
                 if strategy.detect_divergence(all_data_day['weekly'], 'top'):
                     recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-周线顶背离(价格新高+MACD柱/或DIF背离)")
 
-                sell_msgs, _, _ = strategy.judge_sell(name, stock['judge_sell_ids'], all_data_day)
+                # 检查卖出信号（使用保存的状态副本，不修改实际状态）
+                temp_rsi_flag = saved_rsi_flag
+                temp_rsi_state = saved_rsi_state.copy()
+                sell_msgs, _, _, _ = strategy.judge_sell(
+                    name, stock['judge_sell_ids'], all_data_day,
+                    rsi_flag=temp_rsi_flag,
+                    rsi_state=temp_rsi_state
+                )
                 for m in sell_msgs:
-                    recent_msgs.append(f"{day_str} | {m}")
+                    recent_msgs.append(f"{day_str} | 周 RSI:{current_weekly_rsi:.2f} | {m}")
 
                 def get_index_data(idx_ticker):
                     idx_df = index_data_map.get(idx_ticker)
@@ -310,6 +347,17 @@ def run_monitor(context):
                     m = m.replace("新资金买入信号", "做 T 买回信号")
                     m = m.replace("买入信号", "做 T 买回信号")
                     recent_msgs.append(f"{day_str} | {m}")
+
+            # 使用最新的数据更新实际状态（只更新一次）
+            sell_msgs_updated, updated_rsi_flag, sar_breakdown, updated_rsi_state = strategy.judge_sell(
+                name, stock['judge_sell_ids'], all_data_now,
+                rsi_flag=saved_rsi_flag,
+                rsi_state=saved_rsi_state
+            )
+            # 更新 stock 配置中的状态
+            stock['rsi_flag'] = updated_rsi_flag
+            if updated_rsi_state is not None:
+                stock['rsi_state'] = updated_rsi_state
 
             if recent_msgs:
                 normalized_msgs = []

@@ -258,13 +258,45 @@ def run_backtest_history(
         trades = []
         equity_curve = []
         last_sell_date = None  # 记录上次卖出的日期
-        rsi_flag = 0  # RSI flag 状态：0=初始，1=RSI>80, 2=RSI>85, 3=RSI>90
-        last_sar_breakdown_week = None  # 记录上次 SAR 跌破的周
-        rsi_flag_value = 0  # 记录触发 flag 时的实际 RSI 峰值
-        div_pending_flag = 0  # 顶背离潜在标志：0=无潜在顶背离，1=检测到潜在顶背离（等待 SAR 确认）
-        div_flag = 0  # 顶背离有效标志：0=顶背离未确认，1=顶背离已确认（SAR 已跌破）
+        last_sar_breakdown_week = None  # 记录上次均线跌破的周
+        last_ma5_breakdown_date = None  # 记录上次触发阶梯减仓的日期（避免重复触发）
+
+        # RSI flag 状态跟踪
+        # 初始化 rsi_flag=0，根据周线 RSI 峰值更新，均线跌破后重置为 0
+        rsi_flag = 0  # 当前 RSI flag 状态
+        rsi_peak_after_breakdown = 0  # 上次均线跌破后的周线 RSI 峰值
+
+        # 日线顶背离状态
+        div_pending_flag = 0  # 顶背离潜在标志：0=无潜在顶背离，1=检测到潜在顶背离（等待均线确认）
+        div_flag = 0  # 顶背离有效标志：0=顶背离未确认，1=顶背离已确认（均线已跌破）
         div_date = None  # 顶背离发生的日期（潜在顶背离检测到的日期）
-        div_high_price = 0  # 顶背离时的最高价（用于确认 SAR 跌破后该高点是否仍然有效）
+        div_high_price = 0  # 顶背离时的最高价（用于确认均线跌破后该高点是否仍然有效）
+
+        # 周线顶背离状态（使用 rsi_state 统一管理）
+        # rsi_state 包含：
+        # - diverse_week_flag: 周线顶背离标志 (0=无背离，1=背离形成)
+        # - prev_high_price: 前一个局部高点的价格
+        # - prev_high_macd: 前一个局部高点的 MACD 柱值
+        # - prev_high_idx: 前一个局部高点的索引
+        # - position_1_price: 位置 1 的价格（局部高点，RSI>90 时）
+        # - position_4_price: 位置 4 的价格（RSI>90 后下跌 2%）
+        # - position_5_price: 位置 5 的价格（从位置 4 上涨 10%）
+        # - rsi_peak: RSI 峰值
+        # - rsi_trough: RSI 谷值
+        rsi_state = {
+            'current_position': 0,
+            'rsi_peak': 0,
+            'rsi_trough': 0,
+            'price_at_peak': 0,
+            'position_1_price': 0,
+            'position_2_price': 0,
+            'position_4_price': 0,
+            'position_5_price': 0,
+            'prev_high_price': 0,
+            'prev_high_macd': 0,
+            'prev_high_idx': None,
+            'diverse_week_flag': 0
+        }
 
         first_close = float(df_daily_raw.loc[trade_days[0]]['Close'])
         hold_shares = int((initial_cash / first_close) // lot_size) * lot_size
@@ -319,45 +351,72 @@ def run_backtest_history(
             close = float(daily['Close'].iloc[-1])
             day_str = ts.strftime('%Y-%m-%d') if hasattr(ts, 'strftime') else str(ts)[:10]
 
+            # 打印当前周线 RSI 值
+            rsi_weekly = weekly['RSI'].iloc[-1] if 'RSI' in weekly.columns and len(weekly) > 0 else 0
+            logger.info(f"[{name}] 周 RSI:{rsi_weekly:.2f}")
+
             equity_curve.append({'Date': ts, 'Equity': cash + shares * close})
 
-            # 计算当前的 rsi_flag
-            max_rsi_current = 0
-            if weekly is not None and 'RSI' in weekly.columns:
-                if last_sar_breakdown_week is not None:
-                    # 如果上次 SAR 跌破已发生，需要从该周之后计算 RSI 峰值
-                    weekly_filtered = weekly[weekly.index > last_sar_breakdown_week]
-                    if weekly_filtered is not None and not weekly_filtered.empty:
-                        max_rsi_current = weekly_filtered['RSI'].max()
-                    else:
-                        max_rsi_current = 0
-                else:
-                    # 第一次 SAR 跌破之前，根据所有历史周线数据计算 RSI 峰值
-                    max_rsi_current = weekly['RSI'].max()
+            # ===== RSI flag 状态更新 =====
+            # 规则：
+            # 1. 初始化 rsi_flag=0
+            # 2. 周线 RSI>80, rsi_flag=1
+            # 3. 周线 RSI>85, rsi_flag=2
+            # 4. 周线 RSI>90, rsi_flag=3
+            # 5. 当 5 日均线跌破 10 日均线时，rsi_flag=0
 
-            # 更新 rsi_flag_value（保存从上次 SAR 跌破后的 RSI 峰值）
-            if max_rsi_current > rsi_flag_value:
-                rsi_flag_value = max_rsi_current
+            current_ma5_breakdown = False
 
-            # 根据 rsi_flag_value 计算 rsi_flag
-            rsi_flag = strategy.get_rsi_flag_level(rsi_flag_value)
+            # 检查当前是否有均线跌破（5 日均线下穿 10 日均线）
+            if 'MA5' in daily.columns and 'MA10' in daily.columns:
+                ma5_curr = daily['MA5'].iloc[-1]
+                ma10_curr = daily['MA10'].iloc[-1]
+                ma5_prev = daily['MA5'].iloc[-2] if len(daily) >= 2 else ma5_curr
+                ma10_prev = daily['MA10'].iloc[-2] if len(daily) >= 2 else ma10_curr
+                # 检测下穿动作：昨天 MA5>=MA10，今天 MA5<MA10
+                if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
+                    current_ma5_breakdown = True
+                    last_ma5_breakdown_date = day_str
+                    last_sar_breakdown_week = weekly.index[-1] if weekly is not None else None
 
-            # 调用 judge_sell，传入当前的 rsi_flag
-            # judge_sell 会在 SAR 跌破时根据 rsi_flag 生成卖出信号（RSI 阶梯减仓），并返回更新后的 flag（跌破后为 0）
-            # 注意：回测脚本不使用 judge_sell 中的顶背离死叉逻辑，而是使用单独的 div_flag 逻辑
-            sell_msgs, updated_rsi_flag, sar_breakdown = strategy.judge_sell(name, stock_judge_sell_ids, all_data, rsi_flag=rsi_flag)
-
-            # 保存卖出时的 RSI 峰值（用于日志）
-            sell_rsi_value = rsi_flag_value
-
-            # 如果 SAR 跌破发生，更新 last_sar_breakdown_week 并重置 rsi_flag
-            # 注意：div_flag 不在这里重置，只在 SAR 跌破触发卖出后重置
-            if sar_breakdown:
-                last_sar_breakdown_week = weekly.index[-1] if weekly is not None else None
-                rsi_flag = 0  # 重置为 0
-                rsi_flag_value = 0  # 重置 RSI 值
+            # 如果发生均线跌破，重置 RSI flag
+            if current_ma5_breakdown:
+                rsi_flag = 0
+                rsi_peak_after_breakdown = 0
+                logger.info(f"[{day_str}] [{name}] 5 日均线下穿 10 日均线，rsi_flag 重置为 0")
             else:
-                rsi_flag = updated_rsi_flag
+                # 检查均线状态是否已经恢复（MA5 >= MA10）
+                # 如果已恢复，重置 last_ma5_breakdown_date，允许下次跌破重新触发
+                if last_ma5_breakdown_date is not None:
+                    ma5_curr = daily['MA5'].iloc[-1]
+                    ma10_curr = daily['MA10'].iloc[-1]
+                    if ma5_curr >= ma10_curr:
+                        last_ma5_breakdown_date = None
+
+                # 根据从上次均线跌破后到当前的周线 RSI 峰值更新 flag
+                if weekly is not None and 'RSI' in weekly.columns:
+                    if last_sar_breakdown_week is not None:
+                        # 从上次均线跌破周之后计算 RSI 峰值
+                        weekly_filtered = weekly[weekly.index > last_sar_breakdown_week]
+                        if weekly_filtered is not None and not weekly_filtered.empty:
+                            rsi_peak_after_breakdown = weekly_filtered['RSI'].max()
+                    else:
+                        # 第一次均线跌破之前，根据所有历史周线数据计算 RSI 峰值
+                        rsi_peak_after_breakdown = weekly['RSI'].max()
+
+                    # 根据 RSI 峰值更新 flag
+                    rsi_flag = strategy.get_rsi_flag_level(rsi_peak_after_breakdown)
+
+            # 打印当前 RSI 状态
+            logger.info(f"[{name}] 周 RSI 峰值:{rsi_peak_after_breakdown:.2f}, rsi_flag={rsi_flag}")
+            # ================================
+
+            # 调用 judge_sell，传入当前的 rsi_flag 和 rsi_state
+            # judge_sell 会在均线跌破时根据 rsi_flag 生成卖出信号（RSI 阶梯减仓），并返回更新后的 flag（跌破后为 0）
+            # judge_sell 还会检测周线顶背离状态，并在背离生效时生成卖出信号
+            sell_msgs, rsi_flag, sar_breakdown, rsi_state = strategy.judge_sell(
+                name, stock_judge_sell_ids, all_data, rsi_flag=rsi_flag, rsi_state=rsi_state
+            )
 
             # 处理 judge_sell 返回的卖出信号（RSI 阶梯减仓）
             sell_fraction, sell_reason = parse_sell_fraction(sell_msgs)
@@ -367,45 +426,106 @@ def run_backtest_history(
             current_high = data_daily_for_div['High'].iloc[-1] if data_daily_for_div is not None else 0
 
             # 1. 检测潜在顶背离（只在没有潜在顶背离时检测）
+            # 顶背离检测条件：股价创新高 + MACD 柱缩短 + 两个高点之间有回调
+            # 注意：此时只记录潜在顶背离，不立即触发卖出
             if div_pending_flag == 0:
-                # 检测顶背离条件：股价创新高 + MACD 红柱缩短 + 间隔>=5 根 K 线
-                # 注意：此时不要求 SAR 跌破，只记录潜在顶背离
-                if strategy.detect_divergence(data_daily_for_div, 'top'):
+                div_details = strategy.get_divergence_details(data_daily_for_div, 'top')
+                if div_details and div_details.get('detected'):
                     div_pending_flag = 1
                     div_date = day_str
-                    # 记录两个高点中的较高者（用于后续确认 SAR 跌破后该高点是否仍然有效）
-                    # detect_divergence 内部比较的是最近高点和前一个高点
-                    div_high_price = current_high
-                    logger.info(f"[{day_str}] *** 检测到潜在顶背离，等待 SAR 确认，div_high_price={div_high_price:.3f} ***")
+                    # 记录两个高点中的较高者
+                    div_high_price = max(div_details['recent_high'], div_details['prev_high'])
+                    logger.info(f"[{day_str}] *** 检测到潜在顶背离，等待 5 日均线下穿 10 日均线确认，div_high_price={div_high_price:.3f} ***")
             else:
-                # 2. 已有潜在顶背离，需要确认：
-                # - 如果价格又创新高，说明之前的顶背离形态被破坏，需要重新检测
-                # - 如果 SAR 跌破，确认顶背离有效，触发卖出
-                if current_high > div_high_price:
-                    # 价格创新高，之前的顶背离形态失效，重置并重新检测
-                    logger.info(f"[{day_str}] 价格创新高 {current_high:.3f} > {div_high_price:.3f}，之前潜在顶背离失效，重新检测 ***")
-                    div_pending_flag = 0
-                    div_date = None
-                    div_high_price = 0
-                elif 'SAR' in data_daily_for_div.columns:
-                    # 检查是否 SAR 跌破（当前价 < SAR）
-                    sar_curr = data_daily_for_div['SAR'].iloc[-1]
-                    if close < sar_curr:
-                        # SAR 跌破，确认顶背离有效，触发卖出
-                        div_flag = 1
-                        logger.info(f"[{day_str}] *** SAR 跌破确认顶背离有效，div_date={div_date}, div_high_price={div_high_price:.3f} ***")
+                # 2. 已有潜在顶背离，等待 5 日均线下穿 10 日均线确认
+                # 注意：需要检测的是"下穿"动作，而不是均线状态
+                if 'MA5' in data_daily_for_div.columns and 'MA10' in data_daily_for_div.columns:
+                    ma5_curr = data_daily_for_div['MA5'].iloc[-1]
+                    ma10_curr = data_daily_for_div['MA10'].iloc[-1]
+                    ma5_prev = data_daily_for_div['MA5'].iloc[-2] if len(data_daily_for_div) >= 2 else ma5_curr
+                    ma10_prev = data_daily_for_div['MA10'].iloc[-2] if len(data_daily_for_div) >= 2 else ma10_curr
 
-            # 3. 如果顶背离已确认（SAR 已跌破），触发卖出
+                    # 检测下穿动作：昨天 MA5>=MA10，今天 MA5<MA10
+                    if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
+                        # 5 日均线下穿 10 日均线，确认顶背离有效，触发卖出
+                        div_flag = 1
+                        logger.info(f"[{day_str}] *** 5 日均线下穿 10 日均线确认顶背离有效，div_date={div_date}, div_high_price={div_high_price:.3f} ***")
+                    else:
+                        # 均线未下穿，检查是否需要重置（假背离）
+                        # 逻辑：如果股价突破前高且 MACD 柱也突破前高的 MACD 值，说明是假背离
+                        current_hist = data_daily_for_div['MACD_hist'].iloc[-1] if 'MACD_hist' in data_daily_for_div.columns else 0
+                        high_arr = data_daily_for_div['High'].values
+                        macd_hist_arr = data_daily_for_div['MACD_hist'].values
+                        curr = len(data_daily_for_div) - 1
+
+                        # 找最近 5 天内的最高价
+                        recent_lookback = 5
+                        recent_start = max(curr - recent_lookback + 1, 0)
+                        recent_max_idx = recent_start + high_arr[recent_start:curr+1].argmax()
+                        recent_high = high_arr[recent_max_idx]
+                        recent_hist = macd_hist_arr[recent_max_idx]
+
+                        # 找前一个高点（背离时的 prev_high）之前 30 天内的最高价作为对比基准
+                        prev_lookback = 30
+                        prev_end = recent_max_idx - 1
+                        if prev_end > 10:
+                            prev_start = max(prev_end - prev_lookback + 1, 0)
+                            prev_idx = prev_start + high_arr[prev_start:prev_end+1].argmax()
+                            prev_high = high_arr[prev_idx]
+                            prev_hist = macd_hist_arr[prev_idx]
+
+                            interval = recent_max_idx - prev_idx
+
+                            # 假背离判断：
+                            # 1. 价格创新高：recent_high > prev_high
+                            # 2. MACD 柱也创新高：recent_hist > prev_hist
+                            # 3. 间隔足够：interval >= 5
+                            # 4. MACD 柱为正：recent_hist > 0
+                            if interval >= 5 and recent_high > prev_high and recent_hist > prev_hist and recent_hist > 0:
+                                logger.info(f"[{day_str}] 价格创新高 ({recent_high:.3f} > {prev_high:.3f}) 且 MACD 红柱创新高 ({recent_hist:.6f} > {prev_hist:.6f})，判定为假背离，重置 div_pending_flag")
+                                div_pending_flag = 0
+                                div_date = None
+                                div_high_price = 0
+
+            # 3. 如果顶背离已确认（5 日均线下穿 10 日均线），触发卖出
             div_sell_triggered = False
             if div_flag == 1:
                 div_sell_triggered = True
                 sell_fraction = 1.0 / 3.0
-                sell_reason = f"【{name}】卖出信号 (策略 1-顶背离 SAR): 日线顶背离 ({div_date}) + SAR 跌破确认，高={div_high_price:.3f}, 建议卖出 1/3"
+                sell_reason = f"【{name}】卖出信号 (策略 1-顶背离均线): 日线顶背离 ({div_date}) + 5 日均线下穿 10 日均线确认，高={div_high_price:.3f}, 建议卖出 1/3"
                 div_flag = 0  # 卖出后重置
                 div_pending_flag = 0  # 重置潜在标志
                 div_date = None
                 div_high_price = 0
-                logger.info(f"[{day_str}] *** 顶背离 SAR 触发卖出 ***")
+                logger.info(f"[{day_str}] *** 顶背离均线触发卖出 ***")
+
+            # ===== 周线顶背离逻辑（使用新的 diverse_week_flag） =====
+            # 注意：周线顶背离的判断现在在 strategy.judge_sell 中处理
+            # 这里只处理卖出信号的触发
+            data_weekly_for_div = all_data.get('weekly')
+            if data_weekly_for_div is not None and not data_weekly_for_div.empty:
+                # 从 rsi_state 中获取周线顶背离状态
+                diverse_week_flag = rsi_state.get('diverse_week_flag', 0) if rsi_state else 0
+                prev_high_price = rsi_state.get('prev_high_price', 0) if rsi_state else 0
+                prev_high_macd = rsi_state.get('prev_high_macd', 0) if rsi_state else 0
+
+                # 如果周线顶背离已确认（在 judge_sell 中已经检测），触发卖出
+                if diverse_week_flag == 1:
+                    # 检查是否发生 5 周均线下穿 10 周均线
+                    if 'MA5' in data_weekly_for_div.columns and 'MA10' in data_weekly_for_div.columns:
+                        ma5_weekly_curr = data_weekly_for_div['MA5'].iloc[-1]
+                        ma10_weekly_curr = data_weekly_for_div['MA10'].iloc[-1]
+                        if len(data_weekly_for_div) >= 2:
+                            ma5_weekly_prev = data_weekly_for_div['MA5'].iloc[-2]
+                            ma10_weekly_prev = data_weekly_for_div['MA10'].iloc[-2]
+
+                            if ma5_weekly_prev >= ma10_weekly_prev and ma5_weekly_curr < ma10_weekly_curr:
+                                # 顶背离生效，触发卖出
+                                div_sell_triggered = True
+                                sell_fraction = 0.5  # 卖出 50%
+                                sell_reason = f"【{name}】卖出信号 (策略 1-周线顶背离): 周线顶背离 +5 周均线下穿 10 周均线确认，前高={prev_high_price:.3f}, 建议卖出 50%"
+                                rsi_state['diverse_week_flag'] = 0  # 重置标志
+                                logger.info(f"[{day_str}] *** 周线顶背离生效触发卖出 ***")
 
             # 检查是否在 5 个交易日内重复触发
             should_skip = False
@@ -438,11 +558,8 @@ def run_backtest_history(
                     )
                     has_sold_before = True
                     last_sell_date = day_str
-                    # 使用保存的触发 flag 时的 RSI 值
-                    if div_sell_triggered:
-                        logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | {sell_reason}")
-                    else:
-                        logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | 周线 RSI 峰值={sell_rsi_value:.2f} | {sell_reason}")
+                    # 打印卖出日志，包含周线 RSI 值
+                    logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | 周 RSI:{rsi_weekly:.2f} | {sell_reason}")
             elif sell_fraction > 0 and shares == 0:
                 pass  # 有卖出信号但已空仓，跳过
             elif sell_fraction == 0 and shares > 0:
