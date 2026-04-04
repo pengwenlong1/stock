@@ -120,7 +120,8 @@ def init(context):
             'prev_high_price': 0,
             'prev_high_macd': 0,
             'prev_high_idx': None,
-            'diverse_week_flag': 0
+            'diverse_week_flag': 0,
+            'div_weekly_date': None
         }
 
     context._skip_logged_symbols = set()
@@ -311,8 +312,9 @@ def run_monitor(context):
 
                 day_str = ts.strftime('%Y-%m-%d')
 
-                # 获取当前周线 RSI 值，用于日志输出
+                # 获取当前 RSI 值，用于日志输出
                 current_weekly_rsi = weekly_slice['RSI'].iloc[-1] if 'RSI' in weekly_slice.columns else 0
+                current_daily_rsi = daily_slice['RSI'].iloc[-1] if 'RSI' in daily_slice.columns else 0
 
                 if strategy.detect_divergence(all_data_day['daily'], 'top', grace_bars=3):
                     recent_msgs.append(f"{day_str} | 【{name}】告警触发: 结构-日线顶背离(3日有效，价格新高+MACD柱/或DIF背离)")
@@ -328,7 +330,7 @@ def run_monitor(context):
                     rsi_state=temp_rsi_state
                 )
                 for m in sell_msgs:
-                    recent_msgs.append(f"{day_str} | 周 RSI:{current_weekly_rsi:.2f} | {m}")
+                    recent_msgs.append(f"{day_str} | 日 RSI:{current_daily_rsi:.2f} | 周 RSI:{current_weekly_rsi:.2f} | {m}")
 
                 def get_index_data(idx_ticker):
                     idx_df = index_data_map.get(idx_ticker)

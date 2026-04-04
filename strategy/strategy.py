@@ -80,7 +80,17 @@ def _detect_divergence_impl(data, type='top', grace_bars=None, confirm_sar=False
     4. 5 日均线跌破 10 日均线：确认信号（在 gm_backtest.py 中检查）
 
     Returns:
-        bool 或 dict: 如果检测到背离返回 True（或详细信息字典），否则返回 False
+        bool 或 dict: 如果检测到背离返回详细信息字典，否则返回 False
+        字典包含：
+        - detected: 是否检测到背离
+        - recent_high: 最近高点价格
+        - prev_high: 前一个高点价格
+        - recent_hist: 最近高点的 MACD 柱值
+        - prev_hist: 前一个高点的 MACD 柱值
+        - interval: 两个高点之间的间隔
+        - trough_low: 波谷的低点价格
+        - recent_high_idx: 最近高点的索引（用于获取日期）
+        - prev_high_idx: 前一个高点的索引（用于获取日期）
     """
     if data is None or len(data) < 30:
         return False
@@ -146,42 +156,29 @@ def _detect_divergence_impl(data, type='top', grace_bars=None, confirm_sar=False
 
         if price_innovates and macd_declines:
             # 检测到顶背离
+            result = {
+                'detected': True,
+                'recent_high': recent_high,
+                'prev_high': prev_high,
+                'recent_hist': macd_hist[recent_max_idx],
+                'prev_hist': macd_hist[prev_idx],
+                'interval': interval,
+                'trough_low': trough_low,
+                'recent_high_idx': recent_max_idx,
+                'prev_high_idx': prev_idx
+            }
             if confirm_sar:
                 sar = data['SAR'].values if 'SAR' in data.columns else None
                 if sar is not None:
                     if close[curr] < sar[curr]:
-                        return {
-                            'detected': True,
-                            'recent_high': recent_high,
-                            'prev_high': prev_high,
-                            'recent_hist': macd_hist[recent_max_idx],
-                            'prev_hist': macd_hist[prev_idx],
-                            'interval': interval,
-                            'trough_low': trough_low
-                        }
+                        return result
                 return False
 
             if grace_bars is None:
-                return {
-                    'detected': True,
-                    'recent_high': recent_high,
-                    'prev_high': prev_high,
-                    'recent_hist': macd_hist[recent_max_idx],
-                    'prev_hist': macd_hist[prev_idx],
-                    'interval': interval,
-                    'trough_low': trough_low
-                }
+                return result
 
             if (curr - recent_max_idx) <= (grace_bars - 1):
-                return {
-                    'detected': True,
-                    'recent_high': recent_high,
-                    'prev_high': prev_high,
-                    'recent_hist': macd_hist[recent_max_idx],
-                    'prev_hist': macd_hist[prev_idx],
-                    'interval': interval,
-                    'trough_low': trough_low
-                }
+                return result
             return False
     else:
         price = low
@@ -525,7 +522,8 @@ def update_rsi_position_state(rsi_state, current_rsi, current_price, ma5_breakdo
             'prev_high_price': 0,
             'prev_high_macd': 0,
             'prev_high_idx': None,
-            'diverse_week_flag': 0
+            'diverse_week_flag': 0,
+            'div_weekly_date': None
         }
 
     # 状态机转换
@@ -762,7 +760,14 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                         # 顶背离形成
                         diverse_week_flag = 1
                         return_rsi_state['diverse_week_flag'] = diverse_week_flag
-                        messages.append(f"【{stock_name}】周线顶背离形成：股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} < {prev_high_macd:.4f}")
+                        # 记录顶背离形成日期
+                        curr_date = data_weekly.index[-1]
+                        if hasattr(curr_date, 'strftime'):
+                            div_date_str = curr_date.strftime('%Y-%m-%d')
+                        else:
+                            div_date_str = str(curr_date)[:10]
+                        return_rsi_state['div_weekly_date'] = div_date_str
+                        messages.append(f"【{stock_name}】周线顶背离形成 ({div_date_str}): 股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} < {prev_high_macd:.4f}")
 
             elif diverse_week_flag == 1:
                 # 检查是否假背离（顶背离失效）
@@ -785,72 +790,230 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
 
                         if ma5_weekly_prev >= ma10_weekly_prev and ma5_weekly_curr < ma10_weekly_curr:
                             # 顶背离生效，触发卖出
+                            # 获取周线顶背离的详细信息（形成日期和前高价格）
+                            div_weekly_date = return_rsi_state.get('div_weekly_date', '未知')
+                            prev_high_price = return_rsi_state.get('prev_high_price', 0)
+
                             diverse_week_flag = 0
                             return_rsi_state['diverse_week_flag'] = 0
                             sell_fraction = 0.5  # 卖出 50%
-                            messages.append(f"【{stock_name}】周线顶背离生效：5 周均线下穿 10 周均线，建议卖出{sell_fraction*100:.0f}%")
+                            messages.append(f"【{stock_name}】周线顶背离生效 (策略 1-周线顶背离): 顶背离形成于{div_weekly_date}, 前高={prev_high_price:.3f}, 5 周均线下穿 10 周均线确认，建议卖出{sell_fraction*100:.0f}%")
                             # 注意：这里不立即添加卖出信号，而是通过后续的均线跌破逻辑处理
 
         if sell_id == 1:
             # 策略 1: 优先使用 120 分钟均线跌破 (用于实时监控)，如果没有则回退到日线 (用于回测)
             data_cross = data_120min if data_120min is not None else data_daily
 
-            # 1. 清仓信号：周线顶背离 + 120 分钟 (或日线) 5 日均线下穿 10 日均线
-            if detect_divergence(data_weekly, 'top') and is_ma5_breakdown(data_cross, window=3):
+            # ===== 优先级1: 清仓信号 - 周线顶背离 =====
+            # 使用 grace_bars=5，允许周线顶背离在最近 5 周内持续有效
+            if detect_divergence(data_weekly, 'top', grace_bars=5) and is_ma5_breakdown(data_cross, window=3):
                 cross_name = "120 分钟" if data_120min is not None else "日线"
-                messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [周线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议清仓")
-            # 2. 清仓信号：月线顶背离 + 日线 5 日均线下穿 10 日均线
+                weekly_div_details = get_divergence_details(data_weekly, 'top')
+                if weekly_div_details and weekly_div_details.get('detected'):
+                    weekly_high_idx = weekly_div_details.get('recent_high_idx', 0)
+                    if weekly_high_idx > 0 and len(data_weekly.index) > weekly_high_idx:
+                        div_date = data_weekly.index[weekly_high_idx]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = weekly_div_details.get('prev_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 周线顶背离 ({div_date_str}) + {cross_name}5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [周线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议清仓")
+
+            # ===== 优先级2: 清仓信号 - 月线顶背离 =====
             elif data_monthly is not None and detect_divergence(data_monthly, 'top') and is_ma5_breakdown(data_daily, window=3):
-                messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [月线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
-            # 2. 减仓信号：日线顶背离 + 120 分钟 (或日线) 5 日均线下穿 10 日均线
+                monthly_div_details = get_divergence_details(data_monthly, 'top')
+                if monthly_div_details and monthly_div_details.get('detected'):
+                    monthly_high_idx = monthly_div_details.get('recent_high_idx', 0)
+                    if monthly_high_idx > 0 and len(data_monthly.index) > monthly_high_idx:
+                        div_date = data_monthly.index[monthly_high_idx]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = monthly_div_details.get('prev_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 月线顶背离 ({div_date_str}) + 日线 5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [月线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
+
+            # ===== 优先级3: 清仓信号 - RSI flag=3（周线RSI>90）=====
+            elif rsi_flag == 3 and is_ma5_breakdown(data_daily, window=3):
+                sar_breakdown = True
+                ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
+                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+
+                rsi_detail_msg = ""
+                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    weekly_rsi_values = data_weekly['RSI'].values
+                    weekly_dates = data_weekly.index
+                    curr_idx = len(weekly_rsi_values) - 1
+                    lookback = min(20, len(weekly_rsi_values))
+                    recent_start = max(curr_idx - lookback + 1, 0)
+                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
+                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
+                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
+                        peak_date = weekly_dates[peak_idx_in_slice]
+                        if hasattr(peak_date, 'strftime'):
+                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            peak_date_str = str(peak_date)[:10]
+                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+
+                messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): 触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag=3{rsi_detail_msg}，建议清仓")
+                rsi_flag = 0
+
+            # ===== 优先级4: 减仓信号 - 日线顶背离 =====
             elif detect_divergence(data_daily, 'top', grace_bars=3) and is_ma5_breakdown(data_cross, window=3):
                 cross_name = "120 分钟" if data_120min is not None else "日线"
-                messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): 触发 [日线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议卖出 1/3")
-            # 3. 阶梯式减仓信号：5 日均线下穿 10 日均线
-            else:
+                daily_div_details = get_divergence_details(data_daily, 'top')
+                if daily_div_details and daily_div_details.get('detected'):
+                    daily_high_idx = daily_div_details.get('recent_high_idx', 0)
+                    if daily_high_idx > 0 and len(data_daily.index) > daily_high_idx:
+                        div_date = data_daily.index[daily_high_idx]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = daily_div_details.get('prev_high', 0)
+                    recent_high = daily_div_details.get('recent_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-顶背离均线): 日线顶背离 ({div_date_str}) + {cross_name}5 日均线下穿 10 日均线确认，前高={prev_high:.3f}, 高={recent_high:.3f}, 建议卖出 1/3")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): 触发 [日线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议卖出 1/3")
+
+            # ===== 优先级5: 阶梯式减仓 - RSI flag=1或2 =====
+            elif rsi_flag > 0 and is_ma5_breakdown(data_daily, window=3):
+                sar_breakdown = True
                 ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
-                if ma5_breakdown_ts is not None:
-                    sar_breakdown = True
-                    # 5 日均线下穿 10 日均线，根据 rsi_flag 决定卖出比例
-                    ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if hasattr(ma5_breakdown_ts, 'strftime') else str(ma5_breakdown_ts)
-                    sell_fraction, sell_msg = get_sell_fraction_by_flag(rsi_flag)
-                    if sell_fraction > 0:
-                        trigger_reason = f"触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag={rsi_flag}"
-                        messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): {trigger_reason}，{sell_msg}")
-                    # 均线跌破后，flag 重置为 0
-                    rsi_flag = 0
-                elif ma5_breakdown_now:
-                    # 当前发生了均线跌破，同样重置 flag
-                    sar_breakdown = True
+                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+
+                rsi_detail_msg = ""
+                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    weekly_rsi_values = data_weekly['RSI'].values
+                    weekly_dates = data_weekly.index
+                    curr_idx = len(weekly_rsi_values) - 1
+                    lookback = min(20, len(weekly_rsi_values))
+                    recent_start = max(curr_idx - lookback + 1, 0)
+                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
+                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
+                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
+                        peak_date = weekly_dates[peak_idx_in_slice]
+                        if hasattr(peak_date, 'strftime'):
+                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            peak_date_str = str(peak_date)[:10]
+                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+
+                sell_fraction, sell_msg = get_sell_fraction_by_flag(rsi_flag)
+                trigger_reason = f"触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag={rsi_flag}{rsi_detail_msg}"
+                messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): {trigger_reason}，{sell_msg}")
+                rsi_flag = 0
+
+            # 均线跌破但没有任何信号时，重置 flag
+            if ma5_breakdown_now:
+                sar_breakdown = True
+                if rsi_flag > 0 and not messages:
                     rsi_flag = 0
 
         elif sell_id == 2:
-            # 1. 清仓信号：周线顶背离 + 日线 5 日均线下穿 10 日均线
-            if detect_divergence(data_weekly, 'top') and is_ma5_breakdown(data_daily, window=3):
-                messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [周线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
-            # 2. 清仓信号：月线顶背离 + 日线 5 日均线下穿 10 日均线
+            # ===== 优先级1: 清仓信号 - 周线顶背离 =====
+            # 使用 grace_bars=5，允许周线顶背离在最近 5 周内持续有效
+            if detect_divergence(data_weekly, 'top', grace_bars=5) and is_ma5_breakdown(data_daily, window=3):
+                weekly_div_details_2 = get_divergence_details(data_weekly, 'top')
+                if weekly_div_details_2 and weekly_div_details_2.get('detected'):
+                    weekly_high_idx_2 = weekly_div_details_2.get('recent_high_idx', 0)
+                    if weekly_high_idx_2 > 0 and len(data_weekly.index) > weekly_high_idx_2:
+                        div_date = data_weekly.index[weekly_high_idx_2]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = weekly_div_details_2.get('prev_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 周线顶背离 ({div_date_str}) + 日线 5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [周线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
+
+            # ===== 优先级2: 清仓信号 - 月线顶背离 =====
             elif data_monthly is not None and detect_divergence(data_monthly, 'top') and is_ma5_breakdown(data_daily, window=3):
-                messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [月线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
-            # 2. 减仓信号：日线顶背离 + 日线 5 日均线下穿 10 日均线
-            elif detect_divergence(data_daily, 'top', grace_bars=3) and is_ma5_breakdown(data_daily, window=3):
-                messages.append(f"【{stock_name}】卖出信号 (策略 2-减仓): 触发 [日线顶背离 + 日线 5 日均线下穿 10 日均线]，建议卖出 1/3")
-            # 3. 阶梯式减仓信号：5 日均线下穿 10 日均线
-            else:
+                monthly_div_details_2 = get_divergence_details(data_monthly, 'top')
+                if monthly_div_details_2 and monthly_div_details_2.get('detected'):
+                    monthly_high_idx_2 = monthly_div_details_2.get('recent_high_idx', 0)
+                    if monthly_high_idx_2 > 0 and len(data_monthly.index) > monthly_high_idx_2:
+                        div_date = data_monthly.index[monthly_high_idx_2]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = monthly_div_details_2.get('prev_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 月线顶背离 ({div_date_str}) + 日线 5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-清仓): 触发 [月线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
+
+            # ===== 优先级3: 清仓信号 - RSI flag=3（周线RSI>90）=====
+            elif rsi_flag == 3 and is_ma5_breakdown(data_daily, window=3):
+                sar_breakdown = True
                 ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
-                if ma5_breakdown_ts is not None:
-                    sar_breakdown = True
-                    # 5 日均线下穿 10 日均线，根据 rsi_flag 决定卖出比例
-                    ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if hasattr(ma5_breakdown_ts, 'strftime') else str(ma5_breakdown_ts)
-                    sell_fraction, sell_msg = get_sell_fraction_by_flag(rsi_flag)
-                    if sell_fraction > 0:
-                        trigger_reason = f"触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag={rsi_flag}"
-                        messages.append(f"【{stock_name}】卖出信号 (策略 2-阶梯): {trigger_reason}，{sell_msg}")
-                    # 均线跌破后，flag 重置为 0
-                    rsi_flag = 0
-                elif ma5_breakdown_now:
-                    # 当前发生了均线跌破，同样重置 flag
-                    sar_breakdown = True
-                    rsi_flag = 0
+                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+
+                rsi_detail_msg = ""
+                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    weekly_rsi_values = data_weekly['RSI'].values
+                    weekly_dates = data_weekly.index
+                    curr_idx = len(weekly_rsi_values) - 1
+                    lookback = min(20, len(weekly_rsi_values))
+                    recent_start = max(curr_idx - lookback + 1, 0)
+                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
+                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
+                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
+                        peak_date = weekly_dates[peak_idx_in_slice]
+                        if hasattr(peak_date, 'strftime'):
+                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            peak_date_str = str(peak_date)[:10]
+                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+
+                messages.append(f"【{stock_name}】卖出信号 (策略 2-阶梯): 触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag=3{rsi_detail_msg}，建议清仓")
+                rsi_flag = 0
+
+            # ===== 优先级4: 减仓信号 - 日线顶背离 =====
+            elif detect_divergence(data_daily, 'top', grace_bars=3) and is_ma5_breakdown(data_daily, window=3):
+                daily_div_details_2 = get_divergence_details(data_daily, 'top')
+                if daily_div_details_2 and daily_div_details_2.get('detected'):
+                    daily_high_idx_2 = daily_div_details_2.get('recent_high_idx', 0)
+                    if daily_high_idx_2 > 0 and len(data_daily.index) > daily_high_idx_2:
+                        div_date = data_daily.index[daily_high_idx_2]
+                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                    else:
+                        div_date_str = "未知"
+                    prev_high = daily_div_details_2.get('prev_high', 0)
+                    recent_high = daily_div_details_2.get('recent_high', 0)
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-顶背离均线): 日线顶背离 ({div_date_str}) + 5 日均线下穿 10 日均线确认，前高={prev_high:.3f}, 高={recent_high:.3f}, 建议卖出 1/3")
+                else:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 2-减仓): 触发 [日线顶背离 + 日线 5 日均线下穿 10 日均线]，建议卖出 1/3")
+
+            # ===== 优先级5: 阶梯式减仓 - RSI flag=1或2 =====
+            elif rsi_flag > 0 and is_ma5_breakdown(data_daily, window=3):
+                sar_breakdown = True
+                ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
+                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+
+                rsi_detail_msg = ""
+                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    weekly_rsi_values = data_weekly['RSI'].values
+                    weekly_dates = data_weekly.index
+                    curr_idx = len(weekly_rsi_values) - 1
+                    lookback = min(20, len(weekly_rsi_values))
+                    recent_start = max(curr_idx - lookback + 1, 0)
+                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
+                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
+                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
+                        peak_date = weekly_dates[peak_idx_in_slice]
+                        if hasattr(peak_date, 'strftime'):
+                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            peak_date_str = str(peak_date)[:10]
+                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+
+                sell_fraction, sell_msg = get_sell_fraction_by_flag(rsi_flag)
+                trigger_reason = f"触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag={rsi_flag}{rsi_detail_msg}"
+                messages.append(f"【{stock_name}】卖出信号 (策略 2-阶梯): {trigger_reason}，{sell_msg}")
+                rsi_flag = 0
 
     return messages, rsi_flag, sar_breakdown, return_rsi_state
 
