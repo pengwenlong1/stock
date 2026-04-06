@@ -1,5 +1,250 @@
 import pandas as pd
 import talib
+import logging
+import os
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+
+# 使用 backtest 的 logger，确保日志输出到同一位置
+logger = logging.getLogger('backtest')
+
+
+# ===== 局部高点日志记录器 =====
+class LocalHighLogger:
+    """
+    局部高点日志记录器
+
+    用于收集和存储日线、周线的局部高点信息，
+    并在回测结束时生成独立的日志文件。
+    """
+
+    def __init__(self, ticker: str, name: str, log_dir: str):
+        """
+        初始化局部高点日志记录器
+
+        Args:
+            ticker: 股票代码
+            name: 股票名称
+            log_dir: 日志目录路径
+        """
+        self.ticker = ticker
+        self.name = name
+        self.log_dir = log_dir
+
+        # 存储局部高点信息
+        self.daily_highs: List[Dict] = []      # 日线局部高点列表
+        self.weekly_highs: List[Dict] = []     # 周线局部高点列表
+
+        # 存储顶背离事件记录
+        self.daily_divergence_events: List[Dict] = []  # 日线顶背离事件
+        self.weekly_divergence_events: List[Dict] = [] # 周线顶背离事件
+
+        # 回测时间范围
+        self.start_date: Optional[str] = None
+        self.end_date: Optional[str] = None
+
+        # 确保日志目录存在
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+    def set_backtest_period(self, start_date: str, end_date: str):
+        """设置回测时间范围"""
+        self.start_date = start_date
+        self.end_date = end_date
+
+    def update_daily_highs(self, local_highs: List[Dict], current_date: str):
+        """
+        更新日线局部高点列表
+
+        Args:
+            local_highs: detect_local_highs 返回的局部高点列表
+            current_date: 当前日期
+        """
+        # 通过日期去重，只记录新高点
+        existing_dates = {h['date'] for h in self.daily_highs}
+        for high in local_highs:
+            high_date = str(high.get('date', 'N/A'))[:10]
+            if high_date not in existing_dates:
+                self.daily_highs.append({
+                    'index': high.get('index', 0),
+                    'price': high.get('price', 0),
+                    'macd_hist': high.get('macd_hist', 0),
+                    'date': high_date,
+                    'confirm_date': current_date  # 确认日期
+                })
+                existing_dates.add(high_date)
+
+    def update_weekly_highs(self, local_highs: List[Dict], current_date: str):
+        """
+        更新周线局部高点列表
+
+        Args:
+            local_highs: detect_local_highs 返回的局部高点列表
+            current_date: 当前日期
+        """
+        # 通过日期去重，只记录新高点
+        existing_dates = {h['date'] for h in self.weekly_highs}
+        for high in local_highs:
+            high_date = str(high.get('date', 'N/A'))[:10]
+            if high_date not in existing_dates:
+                self.weekly_highs.append({
+                    'index': high.get('index', 0),
+                    'price': high.get('price', 0),
+                    'macd_hist': high.get('macd_hist', 0),
+                    'date': high_date,
+                    'confirm_date': current_date  # 确认日期
+                })
+                existing_dates.add(high_date)
+
+    def record_daily_divergence(self, event_type: str, date: str, details: Dict):
+        """
+        记录日线顶背离事件
+
+        Args:
+            event_type: 事件类型 ('形成', '生效', '失效')
+            date: 事件日期
+            details: 事件详情
+        """
+        self.daily_divergence_events.append({
+            'type': event_type,
+            'date': date,
+            'details': details
+        })
+
+    def record_weekly_divergence(self, event_type: str, date: str, details: Dict):
+        """
+        记录周线顶背离事件
+
+        Args:
+            event_type: 事件类型 ('形成', '生效', '失效')
+            date: 事件日期
+            details: 事件详情
+        """
+        self.weekly_divergence_events.append({
+            'type': event_type,
+            'date': date,
+            'details': details
+        })
+
+    def save_log_file(self):
+        """
+        生成并保存日志文件
+
+        日志文件名格式：股票编号.log
+        """
+        log_file_path = os.path.join(self.log_dir, f"{self.ticker}.log")
+
+        with open(log_file_path, 'w', encoding='utf-8') as f:
+            # 写入头部信息
+            f.write(f"=== {self.name}（{self.ticker}）局部高点记录 ===\n")
+            f.write(f"回测时间：{self.start_date or 'N/A'} ~ {self.end_date or 'N/A'}\n")
+            f.write(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n")
+
+            # 写入日线局部高点列表
+            f.write("=" * 60 + "\n")
+            f.write("=== 日线局部高点列表 ===\n")
+            f.write("=" * 60 + "\n")
+            if self.daily_highs:
+                f.write(f"序号    日期        价格        MACD柱值      索引    确认日期\n")
+                f.write("-" * 70 + "\n")
+                for i, high in enumerate(self.daily_highs):
+                    f.write(f"{i+1:4d}    {high['date']:12s}  {high['price']:10.3f}  {high['macd_hist']:12.4f}  {high['index']:5d}  {high['confirm_date']}\n")
+            else:
+                f.write("无日线局部高点记录\n")
+            f.write("\n")
+
+            # 写入周线局部高点列表
+            f.write("=" * 60 + "\n")
+            f.write("=== 周线局部高点列表 ===\n")
+            f.write("=" * 60 + "\n")
+            if self.weekly_highs:
+                f.write(f"序号    日期        价格        MACD柱值      索引    确认日期\n")
+                f.write("-" * 70 + "\n")
+                for i, high in enumerate(self.weekly_highs):
+                    f.write(f"{i+1:4d}    {high['date']:12s}  {high['price']:10.3f}  {high['macd_hist']:12.4f}  {high['index']:5d}  {high['confirm_date']}\n")
+            else:
+                f.write("无周线局部高点记录\n")
+            f.write("\n")
+
+            # 写入日线顶背离事件记录
+            f.write("=" * 60 + "\n")
+            f.write("=== 日线顶背离事件记录 ===\n")
+            f.write("=" * 60 + "\n")
+            if self.daily_divergence_events:
+                f.write(f"日期          事件类型    详情\n")
+                f.write("-" * 70 + "\n")
+                for event in self.daily_divergence_events:
+                    detail_str = self._format_divergence_details(event['details'])
+                    f.write(f"{event['date']:12s}  {event['type']:8s}    {detail_str}\n")
+            else:
+                f.write("无日线顶背离事件记录\n")
+            f.write("\n")
+
+            # 写入周线顶背离事件记录
+            f.write("=" * 60 + "\n")
+            f.write("=== 周线顶背离事件记录 ===\n")
+            f.write("=" * 60 + "\n")
+            if self.weekly_divergence_events:
+                f.write(f"日期          事件类型    详情\n")
+                f.write("-" * 70 + "\n")
+                for event in self.weekly_divergence_events:
+                    detail_str = self._format_divergence_details(event['details'])
+                    f.write(f"{event['date']:12s}  {event['type']:8s}    {detail_str}\n")
+            else:
+                f.write("无周线顶背离事件记录\n")
+            f.write("\n")
+
+            # 写入统计信息
+            f.write("=" * 60 + "\n")
+            f.write("=== 统计信息 ===\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"日线局部高点总数：{len(self.daily_highs)}\n")
+            f.write(f"周线局部高点总数：{len(self.weekly_highs)}\n")
+            f.write(f"日线顶背离事件数：{len(self.daily_divergence_events)}\n")
+            f.write(f"周线顶背离事件数：{len(self.weekly_divergence_events)}\n")
+
+        logger.info(f"[{self.ticker}] 局部高点日志已保存至：{log_file_path}")
+
+    def _format_divergence_details(self, details: Dict) -> str:
+        """格式化顶背离详情信息"""
+        if not details:
+            return "无详情"
+
+        parts = []
+        if 'prev_high' in details:
+            parts.append(f"A价格={details['prev_high']:.3f}")
+        if 'recent_high' in details:
+            parts.append(f"B价格={details['recent_high']:.3f}")
+        if 'prev_macd' in details:
+            parts.append(f"A_MACD={details['prev_macd']:.4f}")
+        if 'recent_macd' in details:
+            parts.append(f"B_MACD={details['recent_macd']:.4f}")
+        if 'prev_high_date' in details:
+            parts.append(f"A日期={str(details['prev_high_date'])[:10]}")
+        if 'recent_high_date' in details:
+            parts.append(f"B日期={str(details['recent_high_date'])[:10]}")
+        if 'reason' in details:
+            parts.append(f"原因={details['reason']}")
+
+        return ", ".join(parts) if parts else "无详情"
+
+
+# ===== 顶背离计算参数配置（根据 conditions.md） =====
+DIVERGENCE_CONFIG = {
+    'daily': {
+        'drop_threshold': 0.05,      # 局部高点确认跌幅：5%
+        'min_interval': 5,           # 最小间隔K线数：5根
+        'invalidation_bars': 10,     # 背离失效时间：10天
+        'trend_reversal_pct': 0.10,  # 反向趋势失效：价格下跌10%
+    },
+    'weekly': {
+        'drop_threshold': 0.08,      # 局部高点确认跌幅：8%（且需要均线跌破确认）
+        'min_interval': 5,           # 最小间隔K线数：5周
+        'invalidation_bars': 10,     # 背离失效时间：10周
+        'trend_reversal_pct': 0.10,  # 反向趋势失效：价格下跌10%
+    }
+}
 
 def calculate_indicators(data):
     """计算技术指标 (对齐国内行情软件算法)"""
@@ -32,188 +277,508 @@ def calculate_indicators(data):
 
     return data
 
-def detect_divergence(data, type='top', grace_bars=None, confirm_sar=False):
+
+def detect_local_highs(data, drop_threshold=0.05):
     """
-    检测背离
+    检测局部高点（无未来函数实现）
+
+    核心原则：不提前预判，只在价格下跌5%后才确认之前的高点是局部高点。
+
+    检测流程：
+    1. 维护一个"候选高点"变量（价格、位置、MACD柱值）
+    2. 当价格创新高时，更新候选高点
+    3. 当价格从候选高点下跌达到5%时：
+       - 确认该候选高点是有效的局部高点
+       - 将高点存入局部高点列表
+       - 将当前价格设为新的候选高点
+
+    Args:
+        data: 包含 High, MACD_hist 的数据
+        drop_threshold: 下跌阈值，默认5%
+
+    Returns:
+        list: 局部高点列表，每个元素是字典：
+              {
+                  'index': 高点索引,
+                  'price': 高点价格,
+                  'macd_hist': 高点MACD柱值,
+                  'date': 高点日期（如果有索引）
+              }
+    """
+    if data is None or len(data) < 10:
+        return []
+
+    high = data['High'].values if 'High' in data.columns else data['Close'].values
+    macd_hist = data['MACD_hist'].values if 'MACD_hist' in data.columns else None
+    close = data['Close'].values
+
+    local_highs = []
+
+    # 候选高点初始化
+    candidate_high_price = high[0]
+    candidate_high_index = 0
+    candidate_high_macd = macd_hist[0] if macd_hist is not None else 0
+
+    for i in range(1, len(high)):
+        current_high = high[i]
+
+        # 检查是否从候选高点下跌了5%
+        drop_pct = (candidate_high_price - close[i]) / candidate_high_price
+
+        if drop_pct >= drop_threshold:
+            # 确认候选高点是有效的局部高点
+            local_high = {
+                'index': candidate_high_index,
+                'price': candidate_high_price,
+                'macd_hist': candidate_high_macd,
+            }
+            # 添加日期（如果有）
+            if hasattr(data, 'index'):
+                try:
+                    local_high['date'] = data.index[candidate_high_index]
+                except:
+                    pass
+
+            local_highs.append(local_high)
+
+            # 重置候选高点为当前K线
+            candidate_high_price = high[i]
+            candidate_high_index = i
+            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
+
+        elif current_high > candidate_high_price:
+            # 价格创新高，更新候选高点
+            candidate_high_price = current_high
+            candidate_high_index = i
+            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
+
+    # 注意：最后一个候选高点没有被确认（因为还没有下跌5%），不加入列表
+
+    return local_highs
+
+
+def detect_weekly_local_highs(data_weekly, data_daily, drop_threshold=0.08):
+    """
+    检测周线局部高点（无未来函数实现）
+
+    根据 conditions.md 文档最新规则：
+    - 当价格从候选高点下跌达到 **8%** 且 **5日均线跌破10日均线** 时：
+      - 确认该候选高点是有效的周线级别局部高点
+      - 将高点存入局部高点列表
+      - 将当前价格设为新的周线级别候选高点
+
+    Args:
+        data_weekly: 周线数据，包含 High, MACD_hist
+        data_daily: 日线数据，包含 MA5, MA10（用于均线跌破判断）
+        drop_threshold: 下跌阈值，默认8%
+
+    Returns:
+        list: 周线局部高点列表，每个元素是字典：
+              {
+                  'index': 高点在周线数据中的索引,
+                  'price': 高点价格,
+                  'macd_hist': 高点MACD柱值,
+                  'date': 高点日期,
+                  'confirm_date': 确认日期
+              }
+    """
+    if data_weekly is None or len(data_weekly) < 10:
+        return []
+
+    if data_daily is None or 'MA5' not in data_daily.columns or 'MA10' not in data_daily.columns:
+        # 如果没有日线均线数据，回退到普通的局部高点检测
+        return detect_local_highs(data_weekly, drop_threshold)
+
+    high = data_weekly['High'].values if 'High' in data_weekly.columns else data_weekly['Close'].values
+    macd_hist = data_weekly['MACD_hist'].values if 'MACD_hist' in data_weekly.columns else None
+    close = data_weekly['Close'].values
+
+    local_highs = []
+
+    # 候选高点初始化
+    candidate_high_price = high[0]
+    candidate_high_index = 0
+    candidate_high_macd = macd_hist[0] if macd_hist is not None else 0
+
+    for i in range(1, len(high)):
+        current_high = high[i]
+
+        # 检查是否从候选高点下跌了8%
+        drop_pct = (candidate_high_price - close[i]) / candidate_high_price
+
+        if drop_pct >= drop_threshold:
+            # 价格已下跌8%，现在检查是否有均线跌破确认
+            # 获取当前周线对应的日期
+            current_weekly_date = None
+            try:
+                current_weekly_date = data_weekly.index[i]
+            except:
+                pass
+
+            # 检查日线数据中是否有均线跌破
+            ma_breakdown_found = False
+            confirm_date = None
+
+            if current_weekly_date is not None:
+                # 在日线数据中查找对应时间段内的均线跌破
+                # 遍历日线数据，找到该周线日期对应的日线
+                for j in range(len(data_daily) - 1, -1, -1):
+                    daily_date = data_daily.index[j]
+                    # 检查日线日期是否在当前周线日期附近（同一天或之后一周内）
+                    if daily_date >= current_weekly_date or j == len(data_daily) - 1:
+                        # 检查是否有均线跌破
+                        if j >= 1:
+                            ma5_prev = data_daily['MA5'].iloc[j-1]
+                            ma10_prev = data_daily['MA10'].iloc[j-1]
+                            ma5_curr = data_daily['MA5'].iloc[j]
+                            ma10_curr = data_daily['MA10'].iloc[j]
+
+                            if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
+                                ma_breakdown_found = True
+                                confirm_date = daily_date
+                                break
+
+                        # 向前搜索更多日线（最多5天）
+                        for k in range(1, 6):
+                            if j + k < len(data_daily):
+                                ma5_prev = data_daily['MA5'].iloc[j+k-1]
+                                ma10_prev = data_daily['MA10'].iloc[j+k-1]
+                                ma5_curr = data_daily['MA5'].iloc[j+k]
+                                ma10_curr = data_daily['MA10'].iloc[j+k]
+
+                                if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
+                                    ma_breakdown_found = True
+                                    confirm_date = data_daily.index[j+k]
+                                    break
+
+                        if ma_breakdown_found:
+                            break
+
+            if ma_breakdown_found:
+                # 确认候选高点是有效的周线局部高点
+                local_high = {
+                    'index': candidate_high_index,
+                    'price': candidate_high_price,
+                    'macd_hist': candidate_high_macd,
+                    'confirm_date': confirm_date
+                }
+
+                # 添加日期
+                if hasattr(data_weekly, 'index'):
+                    try:
+                        local_high['date'] = data_weekly.index[candidate_high_index]
+                    except:
+                        pass
+
+                local_highs.append(local_high)
+
+                # 重置候选高点为当前K线
+                candidate_high_price = high[i]
+                candidate_high_index = i
+                candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
+
+        elif current_high > candidate_high_price:
+            # 价格创新高，更新候选高点
+            candidate_high_price = current_high
+            candidate_high_index = i
+            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
+
+    return local_highs
+
+
+def detect_divergence_v2(data, timeframe='daily', min_interval=None, drop_threshold=None):
+    """
+    检测顶背离（新版本，基于局部高点列表）
+
+    根据 conditions.md 文档的顶背离判断逻辑：
+
+    一、局部高点检测：
+    - 维护"候选高点"变量
+    - 当价格创新高时，更新候选高点
+    - 当价格从候选高点下跌≥5%时，确认候选高点是有效的局部高点
+
+    二、顶背离形成条件（需同时满足）：
+    1. 存在上一个已确认的局部高点A
+    2. 高点B与高点A的K线间隔：日线≥5根，周线≥5周
+    3. 高点B的最高价 > 高点A的最高价
+    4. 高点B的MACD柱值 < 高点A的MACD柱值
+
+    三、连续背离处理：
+    - 如果已有背离标志为1，又形成新的背离C且C比B更背离：更新背离记录为C，覆盖旧背离
+
+    Args:
+        data: 包含 High, MACD_hist 的数据
+        timeframe: 时间周期，'daily' 或 'weekly'
+        min_interval: 两个高点之间的最小间隔，None则使用配置值
+        drop_threshold: 局部高点检测的下跌阈值，None则使用配置值
+
+    Returns:
+        dict or False: 如果检测到顶背离返回详细信息字典，否则返回 False
+    """
+    # 使用配置参数
+    config = DIVERGENCE_CONFIG.get(timeframe, DIVERGENCE_CONFIG['daily'])
+    if min_interval is None:
+        min_interval = config['min_interval']
+    if drop_threshold is None:
+        drop_threshold = config['drop_threshold']
+
+    local_highs = detect_local_highs(data, drop_threshold)
+
+    if len(local_highs) < 2:
+        return False
+
+    # 根据 conditions.md 文档要求：
+    # 从已确认的局部高点列表中，从最近向更早遍历，寻找第一个满足以下条件的高点 A：
+    # - A 的日期比 B 早
+    # - B 与 A 的K线间隔：日线 ≥ 5根，周线 ≥ 5周
+    # - B 的最高价 > A 的最高价
+    # - B 的MACD柱值 < A 的MACD柱值
+
+    # 取最新的局部高点 B
+    recent_high = local_highs[-1]  # B点（较晚，最新确认）
+
+    # 从最近向更早遍历，找到第一个满足背离条件的 A
+    for i in range(len(local_highs) - 2, -1, -1):
+        prev_high = local_highs[i]  # A点（更早）
+
+        # 检查间隔：B的索引 - A的索引 >= min_interval
+        interval = recent_high['index'] - prev_high['index']
+        if interval < min_interval:
+            # 间隔不足，继续向更早遍历
+            continue
+
+        # 检查价格创新高：B的价格 > A的价格
+        if recent_high['price'] <= prev_high['price']:
+            # 价格未创新高，继续向更早遍历
+            continue
+
+        # 检查MACD柱缩短：B的MACD < A的MACD
+        if pd.isna(recent_high['macd_hist']) or pd.isna(prev_high['macd_hist']):
+            continue
+
+        if recent_high['macd_hist'] >= prev_high['macd_hist']:
+            # MACD未缩短，继续向更早遍历
+            continue
+
+        # 找到满足条件的 A，顶背离形成
+        result = {
+            'detected': True,
+            'prev_high': prev_high['price'],
+            'recent_high': recent_high['price'],
+            'prev_macd': prev_high['macd_hist'],
+            'recent_macd': recent_high['macd_hist'],
+            'interval': interval,
+            'prev_high_idx': prev_high['index'],
+            'recent_high_idx': recent_high['index'],
+            'timeframe': timeframe,
+            'local_highs': local_highs,  # 返回局部高点列表用于后续判断
+        }
+
+        # 添加日期信息
+        if 'date' in prev_high:
+            result['prev_high_date'] = prev_high['date']
+        if 'date' in recent_high:
+            result['recent_high_date'] = recent_high['date']
+
+        return result
+
+    # 遍历完所有历史高点，没有找到满足条件的 A
+    return False
+
+
+def check_all_invalidation_conditions(data, divergence_info, timeframe='daily'):
+    """
+    检查顶背离是否失效（三种失效条件）
+
+    根据 conditions.md 文档，满足以下任一条件，背离标志清零：
+
+    1. 强信号失效：出现新的局部高点C，且C的价格 > B的价格 且 C的MACD柱值 > B的MACD柱值
+    2. 时间衰减失效：背离形成后，超过10个交易日（日线）或10周（周线）仍未触发均线跌破确认
+    3. 反向趋势失效：价格从高点B下跌超过10%且未反弹（视为趋势逆转）
+
+    Args:
+        data: 数据
+        divergence_info: 背离信息字典（包含 recent_high_idx, recent_high 等）
+        timeframe: 时间周期，'daily' 或 'weekly'
+
+    Returns:
+        tuple: (is_invalidated, invalidation_reason, updated_info)
+               - is_invalidated: 是否失效
+               - invalidation_reason: 失效原因（字符串），如果未失效则为 None
+               - updated_info: 更新后的背离信息（如果需要更新）
+    """
+    if divergence_info is None or not divergence_info.get('detected'):
+        return False, None, divergence_info
+
+    config = DIVERGENCE_CONFIG.get(timeframe, DIVERGENCE_CONFIG['daily'])
+    local_highs = divergence_info.get('local_highs', [])
+    recent_high_idx = divergence_info.get('recent_high_idx', 0)
+    recent_high_price = divergence_info.get('recent_high', 0)
+
+    curr_idx = len(data) - 1
+    close = data['Close'].values
+
+    # ===== 失效条件1：时间衰减失效 =====
+    bars_since_divergence = curr_idx - recent_high_idx
+    if bars_since_divergence > config['invalidation_bars']:
+        return True, f"时间衰减失效：背离形成后超过{config['invalidation_bars']}根K线仍未确认", None
+
+    # ===== 失效条件2：反向趋势失效 =====
+    # 价格从高点B下跌超过10%且未反弹
+    current_price = close[curr_idx]
+    drop_from_high = (recent_high_price - current_price) / recent_high_price
+    if drop_from_high > config['trend_reversal_pct']:
+        return True, f"反向趋势失效：价格从高点{recent_high_price:.3f}下跌{drop_from_high*100:.1f}%超过{config['trend_reversal_pct']*100}%", None
+
+    # ===== 失效条件3：强信号失效 =====
+    # 检查是否有新的局部高点C使顶背离失效
+    if len(local_highs) >= 3:
+        high_b = local_highs[-2]  # 之前的最近高点B
+        high_c = local_highs[-1]  # 新确认的高点C
+
+        # 失效条件：C价格 > B价格 且 C的MACD > B的MACD
+        if high_c['price'] > high_b['price'] and high_c['macd_hist'] > high_b['macd_hist']:
+            return True, f"强信号失效：新高点价格{high_c['price']:.3f} > {high_b['price']:.3f}, MACD柱{high_c['macd_hist']:.4f} > {high_b['macd_hist']:.4f}", None
+
+    # ===== 检查连续背离（更新背离记录） =====
+    # 如果有新的局部高点，检查是否形成新的更强背离
+    if len(local_highs) >= 3:
+        high_a = local_highs[-3]  # A点（更早）
+        high_c = local_highs[-1]  # C点（最新）
+
+        # 检查是否形成新的背离（C相对于A）
+        interval_ac = high_c['index'] - high_a['index']
+        if interval_ac >= config['min_interval']:
+            if high_c['price'] > high_a['price'] and high_c['macd_hist'] < high_a['macd_hist']:
+                # 新的背离形成，检查是否比原背离更强
+                # "更强"的定义：MACD差距更大
+                original_divergence_strength = divergence_info.get('prev_macd', 0) - divergence_info.get('recent_macd', 0)
+                new_divergence_strength = high_a['macd_hist'] - high_c['macd_hist']
+
+                if new_divergence_strength > original_divergence_strength:
+                    # 更新背离记录为C，覆盖旧背离
+                    updated_info = {
+                        'detected': True,
+                        'prev_high': high_a['price'],
+                        'recent_high': high_c['price'],
+                        'prev_macd': high_a['macd_hist'],
+                        'recent_macd': high_c['macd_hist'],
+                        'interval': interval_ac,
+                        'prev_high_idx': high_a['index'],
+                        'recent_high_idx': high_c['index'],
+                        'timeframe': timeframe,
+                        'local_highs': local_highs,
+                    }
+                    if 'date' in high_a:
+                        updated_info['prev_high_date'] = high_a['date']
+                    if 'date' in high_c:
+                        updated_info['recent_high_date'] = high_c['date']
+
+                    return False, "连续背离更新：新的背离比原背离更强，更新背离记录", updated_info
+
+    return False, None, divergence_info
+
+
+def detect_divergence(data, type='top', grace_bars=None, confirm_sar=False, timeframe='daily'):
+    """
+    检测背离（兼容旧接口，内部调用新版本）
 
     Args:
         data: 包含 MACD 指标的数据
         type: 'top' 顶背离，'bottom' 底背离
         grace_bars: 允许信号在最近 N 根 K 线内持续有效（含当根）。None 表示不限制
         confirm_sar: 是否需要 SAR 跌破来确认顶背离有效（仅用于顶背离）
+        timeframe: 时间周期，'daily' 或 'weekly'
 
     Returns:
         bool: 如果检测到背离返回 True，否则返回 False
     """
-    result = _detect_divergence_impl(data, type, grace_bars, confirm_sar)
-    return result if result is False else True
+    if type == 'top':
+        result = detect_divergence_v2(data, timeframe=timeframe)
+        if result is False:
+            return False
 
-def get_divergence_details(data, type='top'):
+        # 检查 grace_bars
+        if grace_bars is not None:
+            curr_idx = len(data) - 1
+            if curr_idx - result['recent_high_idx'] > grace_bars - 1:
+                return False
+
+        # 检查 SAR 确认
+        if confirm_sar:
+            sar = data['SAR'].values if 'SAR' in data.columns else None
+            close = data['Close'].values
+            if sar is not None:
+                if close[-1] >= sar[-1]:
+                    return False
+
+        return True
+    else:
+        # 底背离暂不修改，保持原有逻辑
+        return _detect_bottom_divergence_legacy(data, grace_bars)
+
+
+def _detect_bottom_divergence_legacy(data, grace_bars=None):
+    """底背离检测（保留原有逻辑）"""
+    if data is None or len(data) < 30:
+        return False
+
+    low = data['Low'].values if 'Low' in data.columns else data['Close'].values
+    dif = data['MACD'].values
+    macd_hist = data['MACD_hist'].values
+    curr = len(low) - 1
+
+    recent_lookback = 5
+    prev_lookback = 30
+    recent_start = max(curr - recent_lookback + 1, 0)
+    recent_min_idx = recent_start + low[recent_start:curr+1].argmin()
+
+    prev_end = recent_min_idx - 1
+    if prev_end <= 10:
+        return False
+    prev_start = max(prev_end - prev_lookback + 1, 0)
+    prev_idx = prev_start + low[prev_start:prev_end+1].argmin()
+    if recent_min_idx - prev_idx < 3:
+        return False
+
+    if low[recent_min_idx] < low[prev_idx] and (dif[recent_min_idx] > dif[prev_idx] or macd_hist[recent_min_idx] > macd_hist[prev_idx]):
+        if grace_bars is None:
+            return True
+        if (curr - recent_min_idx) <= (grace_bars - 1):
+            return True
+    return False
+
+def get_divergence_details(data, type='top', timeframe='daily'):
     """
-    获取背离的详细信息
+    获取背离的详细信息（使用新的局部高点检测逻辑）
 
     Args:
         data: 包含 MACD 指标的数据
         type: 'top' 顶背离，'bottom' 底背离
+        timeframe: 时间周期，'daily' 或 'weekly'
 
     Returns:
         dict: 包含背离详细信息的字典，包括：
               - detected: 是否检测到背离
-              - recent_high/low: 最近高点/低点的价格
-              - prev_high/low: 前一个高点/低点的价格
+              - recent_high: 最近高点价格
+              - prev_high: 前一个高点价格
               - recent_hist: 最近高点的 MACD 柱值
               - prev_hist: 前一个高点的 MACD 柱值
               - interval: 两个高点之间的间隔
-              - trough_low: 波谷的低点价格（用于确认前高是局部高点）
+              - recent_high_idx: 最近高点的索引
+              - prev_high_idx: 前一个高点的索引
+              - timeframe: 时间周期
+              - local_highs: 局部高点列表
         如果没有检测到背离，返回 None
     """
-    return _detect_divergence_impl(data, type, None, False)
-
-def _detect_divergence_impl(data, type='top', grace_bars=None, confirm_sar=False):
-    """
-    检测背离的内部实现
-
-    顶背离判断标准：
-    1. 股价创新高（High 创新高，不是 Close）
-    2. MACD 柱缩短：红柱缩短 或 绿柱变长（hist 下降）
-    3. 两个高点之间有明顯回调（确保是两个独立波段）
-    4. 5 日均线跌破 10 日均线：确认信号（在 gm_backtest.py 中检查）
-
-    Returns:
-        bool 或 dict: 如果检测到背离返回详细信息字典，否则返回 False
-        字典包含：
-        - detected: 是否检测到背离
-        - recent_high: 最近高点价格
-        - prev_high: 前一个高点价格
-        - recent_hist: 最近高点的 MACD 柱值
-        - prev_hist: 前一个高点的 MACD 柱值
-        - interval: 两个高点之间的间隔
-        - trough_low: 波谷的低点价格
-        - recent_high_idx: 最近高点的索引（用于获取日期）
-        - prev_high_idx: 前一个高点的索引（用于获取日期）
-    """
-    if data is None or len(data) < 30:
-        return False
-
-    close = data['Close'].values
-    high = data['High'].values if 'High' in data.columns else close
-    low = data['Low'].values if 'Low' in data.columns else close
-    dif = data['MACD'].values  # DIF
-    macd_hist = data['MACD_hist'].values  # MACD 柱
-
-    curr = len(close) - 1
-
     if type == 'top':
-        # ===== 顶背离检测 =====
-        # 步骤 1：找到最近 5 天内的最高点（最近高点）
-        recent_lookback = 5
-        recent_start = max(curr - recent_lookback + 1, 0)
-        recent_max_idx = recent_start + high[recent_start:curr+1].argmax()
-        recent_high = high[recent_max_idx]
-
-        # 步骤 2：在 recent_max_idx 之前找前一个高点
-        # 要求：两个高点之间有明显回调（至少有一个波谷）
-        prev_lookback = 30
-        prev_end = recent_max_idx - 1
-
-        if prev_end < 10:
-            return False
-
-        # 在 prev_end 之前 10-30 天范围内找最高价作为前一个高点
-        prev_start = max(prev_end - prev_lookback + 1, 0)
-        prev_idx = prev_start + high[prev_start:prev_end+1].argmax()
-        prev_high = high[prev_idx]
-
-        # 检查两个高点之间是否有回调（波谷）
-        # 在 prev_idx 和 recent_max_idx 之间找最低点
-        trough_search_start = prev_idx + 1
-        trough_search_end = recent_max_idx - 1
-        if trough_search_end <= trough_search_start:
-            # 没有足够的空间找波谷
-            return False
-
-        trough_idx = trough_search_start + low[trough_search_start:trough_search_end+1].argmin()
-        trough_low = low[trough_idx]
-
-        # 确保波谷比两个高点都低（形成真正的回调）
-        if trough_low >= prev_high or trough_low >= recent_high:
-            return False
-
-        # 确保 prev_idx 处的 MACD 柱不是 nan
-        if pd.isna(macd_hist[prev_idx]) or pd.isna(macd_hist[recent_max_idx]):
-            return False
-
-        # 确保两个高点之间有足够的间隔（至少 5 根 K 线）
-        interval = recent_max_idx - prev_idx
-        if interval < 5:
-            return False
-
-        # 步骤 3：检查顶背离条件
-        # 1. 股价创新高
-        # 2. MACD 柱缩短（hist 下降）
-        price_innovates = recent_high > prev_high
-        macd_declines = macd_hist[recent_max_idx] < macd_hist[prev_idx]
-
-        if price_innovates and macd_declines:
-            # 检测到顶背离
-            result = {
-                'detected': True,
-                'recent_high': recent_high,
-                'prev_high': prev_high,
-                'recent_hist': macd_hist[recent_max_idx],
-                'prev_hist': macd_hist[prev_idx],
-                'interval': interval,
-                'trough_low': trough_low,
-                'recent_high_idx': recent_max_idx,
-                'prev_high_idx': prev_idx
-            }
-            if confirm_sar:
-                sar = data['SAR'].values if 'SAR' in data.columns else None
-                if sar is not None:
-                    if close[curr] < sar[curr]:
-                        return result
-                return False
-
-            if grace_bars is None:
-                return result
-
-            if (curr - recent_max_idx) <= (grace_bars - 1):
-                return result
-            return False
+        result = detect_divergence_v2(data, timeframe=timeframe)
+        if result is False:
+            return None
+        return result
     else:
-        price = low
-        recent_start = max(curr - recent_lookback + 1, 0)
-        recent_min_idx = recent_start + price[recent_start:curr+1].argmin()
-
-        prev_end = recent_min_idx - 1
-        if prev_end <= 10:
-            return False
-        prev_start = max(prev_end - prev_lookback + 1, 0)
-        prev_idx = prev_start + price[prev_start:prev_end+1].argmin()
-        if recent_min_idx - prev_idx < 3:
-            return False
-
-        if price[recent_min_idx] < price[prev_idx] and (dif[recent_min_idx] > dif[prev_idx] or macd_hist[recent_min_idx] > macd_hist[prev_idx]):
-            if grace_bars is None:
-                return {
-                    'detected': True,
-                    'recent_low': price[recent_min_idx],
-                    'prev_low': price[prev_idx],
-                    'recent_hist': macd_hist[recent_min_idx],
-                    'prev_hist': macd_hist[prev_idx],
-                    'interval': recent_min_idx - prev_idx
-                }
-            if (curr - recent_min_idx) <= (grace_bars - 1):
-                return {
-                    'detected': True,
-                    'recent_low': price[recent_min_idx],
-                    'prev_low': price[prev_idx],
-                    'recent_hist': macd_hist[recent_min_idx],
-                    'prev_hist': macd_hist[prev_idx],
-                    'interval': recent_min_idx - prev_idx
-                }
-            return False
-    return False
+        # 底背离暂不修改
+        return None
 
 def is_ma5_breakdown(data, window=3):
     """
@@ -357,130 +922,208 @@ def update_rsi_flag_v2(current_rsi_flag, current_weekly_rsi, rsi_peak_after_brea
     return get_rsi_flag_level(current_weekly_rsi)
 
 
-def detect_weekly_top_divergence(data_weekly, rsi_state):
+def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
     """
-    检测周线顶背离形成
+    检测周线顶背离形成（使用新的局部高点检测逻辑）
 
-    顶背离判断逻辑：
-    1. 当前最高点股价比之前局部最高点股价高
-    2. 且 MACD 红柱子比之前局部最高点 MACD 柱子短
-    3. 此时认为顶背离形成，diverse_week_flag = 1
+    根据 conditions.md 文档最新规则：
 
-    假背离判断（顶背离失效）：
-    1. 后续股价继续新高
-    2. 且 MACD 柱子比之前局部最高点的 MACD 高
-    3. 此时认为之前顶背离失效（假背离），diverse_week_flag = 0
+    一、周线局部高点检测：
+    - 维护"候选高点"变量
+    - 当价格创新高时，更新候选高点
+    - 当价格从候选高点下跌≥8%且5日均线跌破10日均线时，确认候选高点是有效的周线局部高点
 
-    顶背离生效：
-    1. 5 日均线跌破 10 日均线
-    2. 此时认为顶背离生效，diverse_week_flag = 0，同时卖出规定比例的金额
+    二、顶背离形成条件：
+    1. 局部高点列表中至少有2个高点
+    2. 取最近确认的两个高点A（较早）和B（较晚）
+    3. 高点B与高点A的K线间隔≥5周
+    4. 高点B的最高价 > 高点A的最高价
+    5. 高点B的MACD柱值 < 高点A的MACD柱值
+
+    三、背离失效条件（满足任一条件，背离标志清零）：
+    1. 强信号失效：出现新的局部高点C，且C的价格 > B的价格 且 C的MACD柱值 > B的MACD柱值
+    2. 时间衰减失效：背离形成后，超过10周仍未触发均线跌破确认
+    3. 反向趋势失效：价格从高点B下跌超过10%且未反弹
+
+    四、连续背离处理：
+    - 如果已有背离标志为1，又形成新的背离C且C比B更背离：更新背离记录为C，覆盖旧背离
+
+    五、顶背离生效：
+    - diverse_week_flag = 1
+    - 5日均线跌破10日均线
+    - 清仓
 
     Args:
         data_weekly: 周线数据（包含 High, MACD_hist 等）
-        rsi_state: RSI 状态字典，包含：
-                   - diverse_week_flag: 周线顶背离标志 (0=无背离，1=背离形成)
-                   - prev_high_price: 前一个局部高点的价格
-                   - prev_high_macd: 前一个局部高点的 MACD 柱值
-                   - prev_high_idx: 前一个局部高点的索引
-                   - position_1_price: 位置 1 的价格（局部高点）
-                   - position_2_price: 位置 2 的价格（局部低点）
-                   - position_4_price: 位置 4 的价格（RSI>90 后下跌 2%）
-                   - position_5_price: 位置 5 的价格（从位置 4 上涨 10%）
-                   - rsi_peak: RSI 峰值（用于判断下跌 2%）
-                   - rsi_trough: RSI 谷值（用于判断上涨 10% 的起点）
+        rsi_state: RSI 状态字典
+        data_daily: 日线数据（用于均线跌破判断，周线局部高点确认必需）
 
     Returns:
-        tuple: (diverse_week_flag, is_valid_divergence, sell_signal, sell_fraction, messages)
-               - diverse_week_flag: 更新后的顶背离标志
-               - is_valid_divergence: 是否为有效背离
-               - sell_signal: 是否触发卖出
-               - sell_fraction: 卖出比例
-               - messages: 卖出信号消息
+        tuple: (diverse_week_flag, is_valid_divergence, sell_signal, sell_fraction, messages, updated_rsi_state)
     """
     messages = []
     sell_signal = False
     sell_fraction = 0.0
     diverse_week_flag = rsi_state.get('diverse_week_flag', 0)
-    prev_high_price = rsi_state.get('prev_high_price', 0)
-    prev_high_macd = rsi_state.get('prev_high_macd', 0)
-    prev_high_idx = rsi_state.get('prev_high_idx', None)
-    position_1_price = rsi_state.get('position_1_price', 0)
-    position_4_price = rsi_state.get('position_4_price', 0)
-    rsi_peak = rsi_state.get('rsi_peak', 0)
+    div_weekly_date = rsi_state.get('div_weekly_date', None)
 
-    if data_weekly is None or len(data_weekly) < 30:
-        return diverse_week_flag, False, sell_signal, sell_fraction, messages
+    # 复制 rsi_state 用于返回更新后的状态
+    updated_rsi_state = rsi_state.copy()
 
-    high = data_weekly['High'].values if 'High' in data_weekly.columns else data_weekly['Close'].values
-    macd_hist = data_weekly['MACD_hist'].values if 'MACD_hist' in data_weekly.columns else None
+    if data_weekly is None or len(data_weekly) < 10:
+        return diverse_week_flag, False, sell_signal, sell_fraction, messages, updated_rsi_state
+
+    # 使用配置参数
+    config = DIVERGENCE_CONFIG['weekly']
+
+    # 使用专门的周线局部高点检测函数（需要日线均线数据确认）
+    local_highs = detect_weekly_local_highs(data_weekly, data_daily, drop_threshold=config['drop_threshold'])
+
+    # 当前K线索引
+    curr_idx = len(data_weekly) - 1
     close = data_weekly['Close'].values
 
-    curr = len(close) - 1
+    # ===== 如果已有顶背离，先检查失效条件 =====
+    if diverse_week_flag == 1:
+        # 构建背离信息用于失效检测
+        divergence_info = {
+            'detected': True,
+            'recent_high_idx': updated_rsi_state.get('div_recent_idx', 0),
+            'recent_high': updated_rsi_state.get('div_recent_high', 0),
+            'prev_high': updated_rsi_state.get('div_prev_high', 0),
+            'prev_macd': updated_rsi_state.get('div_prev_macd', 0),
+            'recent_macd': updated_rsi_state.get('div_recent_macd', 0),
+            'local_highs': local_highs,
+        }
+
+        # 检查所有失效条件
+        is_invalidated, invalidation_reason, updated_info = check_all_invalidation_conditions(
+            data_weekly, divergence_info, timeframe='weekly'
+        )
+
+        if is_invalidated:
+            # 顶背离失效
+            diverse_week_flag = 0
+            # 清除顶背离相关状态
+            updated_rsi_state['div_prev_high'] = None
+            updated_rsi_state['div_prev_macd'] = None
+            updated_rsi_state['div_recent_high'] = None
+            updated_rsi_state['div_recent_macd'] = None
+            updated_rsi_state['div_recent_idx'] = None
+            updated_rsi_state['div_weekly_date'] = None
+            messages.append(f"周线顶背离失效：{invalidation_reason}")
+
+        elif updated_info is not None and updated_info != divergence_info:
+            # 连续背离更新
+            updated_rsi_state['div_prev_high'] = updated_info.get('prev_high')
+            updated_rsi_state['div_prev_macd'] = updated_info.get('prev_macd')
+            updated_rsi_state['div_recent_high'] = updated_info.get('recent_high')
+            updated_rsi_state['div_recent_macd'] = updated_info.get('recent_macd')
+            updated_rsi_state['div_recent_idx'] = updated_info.get('recent_high_idx')
+            if 'recent_high_date' in updated_info:
+                updated_rsi_state['div_weekly_date'] = updated_info['recent_high_date']
+            messages.append(f"周线顶背离更新：{invalidation_reason}")
 
     # ===== 顶背离形成判断 =====
-    if diverse_week_flag == 0:
-        # 寻找最近 5 周内的最高点
-        recent_lookback = 5
-        recent_start = max(curr - recent_lookback + 1, 0)
-        recent_max_idx = recent_start + high[recent_start:curr+1].argmax()
-        current_high = high[recent_max_idx]
+    # 根据 conditions.md 文档要求：
+    # 从已确认的局部高点列表中，从最近向更早遍历，寻找第一个满足背离条件的高点 A
+    # 调试日志：显示函数被调用
+    logger.info(f"[周线顶背离检测] 函数被调用: diverse_week_flag={diverse_week_flag}, local_highs数量={len(local_highs)}")
 
-        # 如果已有前一个高点记录，检查是否形成顶背离
-        if prev_high_price > 0 and prev_high_idx is not None:
-            # 确保两个高点之间有足够的间隔（至少 5 周）
-            interval = recent_max_idx - prev_high_idx
+    if diverse_week_flag == 0 and len(local_highs) >= 2:
+        # 取最新的局部高点 B
+        recent_high = local_highs[-1]  # B点（较晚，最新确认）
 
-            if interval >= 5:
-                # 顶背离条件：
-                # 1. 当前最高点股价 > 之前局部最高点股价
-                # 2. 当前 MACD 红柱 < 之前局部最高点 MACD 红柱
-                price_higher = current_high > prev_high_price
+        # 从最近向更早遍历，找到第一个满足背离条件的 A
+        for i in range(len(local_highs) - 2, -1, -1):
+            prev_high = local_highs[i]  # A点（更早）
 
-                if macd_hist is not None:
-                    current_macd = macd_hist[recent_max_idx]
-                    macd_lower = current_macd < prev_high_macd
+            # 检查间隔：B的索引 - A的索引 >= min_interval
+            interval = recent_high['index'] - prev_high['index']
+            if interval < config['min_interval']:
+                # 间隔不足，继续向更早遍历
+                continue
 
-                    if price_higher and macd_lower:
-                        # 顶背离形成
-                        diverse_week_flag = 1
-                        messages.append(f"周线顶背离形成：股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} < {prev_high_macd:.4f}")
+            # 检查价格创新高：B的价格 > A的价格
+            if recent_high['price'] <= prev_high['price']:
+                # 价格未创新高，继续向更早遍历
+                continue
 
-    # ===== 假背离判断（顶背离失效） =====
-    elif diverse_week_flag == 1:
-        # 寻找最近 5 周内的最高点
-        recent_lookback = 5
-        recent_start = max(curr - recent_lookback + 1, 0)
-        recent_max_idx = recent_start + high[recent_start:curr+1].argmax()
-        current_high = high[recent_max_idx]
-        current_macd = macd_hist[recent_max_idx] if macd_hist is not None else 0
+            # 检查MACD柱缩短：B的MACD < A的MACD
+            if pd.isna(recent_high['macd_hist']) or pd.isna(prev_high['macd_hist']):
+                continue
 
-        # 假背离条件：
-        # 1. 股价继续创新高
-        # 2. MACD 柱子比之前局部最高点高
-        if macd_hist is not None and current_high > prev_high_price and current_macd > prev_high_macd:
-            # 顶背离失效（假背离）
-            diverse_week_flag = 0
-            messages.append(f"周线顶背离失效（假背离）：股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} > {prev_high_macd:.4f}")
+            if recent_high['macd_hist'] >= prev_high['macd_hist']:
+                # MACD未缩短，继续向更早遍历
+                continue
 
-    # ===== 顶背离生效判断（5 日均线跌破 10 日均线） =====
-    if diverse_week_flag == 1:
-        # 检查是否发生 5 日均线跌破 10 日均线
-        if 'MA5' in data_weekly.columns and 'MA10' in data_weekly.columns:
-            ma5_curr = data_weekly['MA5'].iloc[-1]
-            ma10_curr = data_weekly['MA10'].iloc[-1]
-            if len(data_weekly) >= 2:
-                ma5_prev = data_weekly['MA5'].iloc[-2]
-                ma10_prev = data_weekly['MA10'].iloc[-2]
+            # 找到满足条件的 A，顶背离形成
+            diverse_week_flag = 1
+            # 记录顶背离信息
+            updated_rsi_state['div_prev_high'] = prev_high['price']
+            updated_rsi_state['div_prev_macd'] = prev_high['macd_hist']
+            updated_rsi_state['div_recent_high'] = recent_high['price']
+            updated_rsi_state['div_recent_macd'] = recent_high['macd_hist']
+            updated_rsi_state['div_recent_idx'] = recent_high['index']
+
+            # 获取日期
+            if 'date' in recent_high:
+                div_weekly_date = recent_high['date']
+            elif hasattr(data_weekly, 'index'):
+                try:
+                    div_weekly_date = data_weekly.index[recent_high['index']]
+                except:
+                    div_weekly_date = None
+            updated_rsi_state['div_weekly_date'] = div_weekly_date
+
+            # 添加日期信息到 prev_high
+            prev_high_date = prev_high.get('date', None)
+
+            div_date_str = str(div_weekly_date)[:10] if div_weekly_date else "未知"
+            prev_date_str = str(prev_high_date)[:10] if prev_high_date else "未知"
+            messages.append(f"周线顶背离形成 ({div_date_str}): 股价{recent_high['price']:.3f} > {prev_high['price']:.3f} ({prev_date_str}), MACD柱{recent_high['macd_hist']:.4f} < {prev_high['macd_hist']:.4f}")
+            logger.info(f"[周线顶背离检测] 检测到背离: A({prev_date_str}, 价{prev_high['price']:.3f}, MACD{prev_high['macd_hist']:.4f}) vs B({div_date_str}, 价{recent_high['price']:.3f}, MACD{recent_high['macd_hist']:.4f})")
+
+            # 找到第一个满足条件的 A 后退出循环
+            break
+
+        if diverse_week_flag == 0:
+            # 没有找到满足条件的 A，记录调试日志
+            logger.info(f"[周线顶背离检测] 遍历所有历史高点后未找到满足背离条件的配对")
+
+    # ===== 顶背离生效判断（5日均线跌破10日均线） =====
+    if diverse_week_flag == 1 and data_daily is not None:
+        if 'MA5' in data_daily.columns and 'MA10' in data_daily.columns:
+            ma5_curr = data_daily['MA5'].iloc[-1]
+            ma10_curr = data_daily['MA10'].iloc[-1]
+            if len(data_daily) >= 2:
+                ma5_prev = data_daily['MA5'].iloc[-2]
+                ma10_prev = data_daily['MA10'].iloc[-2]
 
                 # 检测下穿动作
                 if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
-                    # 顶背离生效，触发卖出
+                    # 顶背离生效，清仓
                     sell_signal = True
-                    sell_fraction = 0.5  # 卖出 50%（可根据配置调整）
+                    sell_fraction = 1.0  # 清仓
                     diverse_week_flag = 0  # 重置标志
-                    messages.append(f"周线顶背离生效：5 周均线下穿 10 周均线，建议卖出{sell_fraction*100:.0f}%")
 
-    return diverse_week_flag, (diverse_week_flag == 1), sell_signal, sell_fraction, messages
+                    # 获取顶背离详细信息
+                    div_prev_high = updated_rsi_state.get('div_prev_high', 0)
+                    div_weekly_date = updated_rsi_state.get('div_weekly_date', None)
+                    div_date_str = str(div_weekly_date)[:10] if div_weekly_date else "未知"
+
+                    # 清除顶背离相关状态
+                    updated_rsi_state['div_prev_high'] = None
+                    updated_rsi_state['div_prev_macd'] = None
+                    updated_rsi_state['div_recent_high'] = None
+                    updated_rsi_state['div_recent_macd'] = None
+                    updated_rsi_state['div_recent_idx'] = None
+                    updated_rsi_state['div_weekly_date'] = None
+
+                    messages.append(f"周线顶背离生效：顶背离形成于{div_date_str}, 前高={div_prev_high:.3f}, 5日均线下穿10日均线确认，建议清仓")
+
+    updated_rsi_state['diverse_week_flag'] = diverse_week_flag
+    return diverse_week_flag, (diverse_week_flag == 1), sell_signal, sell_fraction, messages, updated_rsi_state
 
 
 def update_rsi_position_state(rsi_state, current_rsi, current_price, ma5_breakdown=False):
@@ -493,6 +1136,9 @@ def update_rsi_position_state(rsi_state, current_rsi, current_price, ma5_breakdo
     - 位置 3: 不是局部高点（只下跌了 2%，不满足显著回调）
     - 位置 4: RSI>90 后下跌 2% 的位置
     - 位置 5: 从位置 4 上涨 10% 的位置
+
+    注意：周线顶背离状态（prev_high_price, diverse_week_flag等）独立管理，
+          不会被均线跌破重置，只有在周线顶背离触发卖出后才重置。
 
     Args:
         rsi_state: RSI 状态字典
@@ -508,8 +1154,15 @@ def update_rsi_position_state(rsi_state, current_rsi, current_price, ma5_breakdo
     rsi_trough = rsi_state.get('rsi_trough', 0)
     price_at_peak = rsi_state.get('price_at_peak', 0)
 
-    # 如果发生均线跌破，重置所有状态
+    # 如果发生均线跌破，只重置 RSI 位置状态，保留周线顶背离状态
     if ma5_breakdown:
+        # 保留周线顶背离状态，不重置
+        prev_high_price = rsi_state.get('prev_high_price', 0)
+        prev_high_macd = rsi_state.get('prev_high_macd', 0)
+        prev_high_idx = rsi_state.get('prev_high_idx', None)
+        diverse_week_flag = rsi_state.get('diverse_week_flag', 0)
+        div_weekly_date = rsi_state.get('div_weekly_date', None)
+
         return {
             'current_position': 0,
             'rsi_peak': 0,
@@ -519,11 +1172,12 @@ def update_rsi_position_state(rsi_state, current_rsi, current_price, ma5_breakdo
             'position_2_price': 0,
             'position_4_price': 0,
             'position_5_price': 0,
-            'prev_high_price': 0,
-            'prev_high_macd': 0,
-            'prev_high_idx': None,
-            'diverse_week_flag': 0,
-            'div_weekly_date': None
+            # 保留周线顶背离状态
+            'prev_high_price': prev_high_price,
+            'prev_high_macd': prev_high_macd,
+            'prev_high_idx': prev_high_idx,
+            'diverse_week_flag': diverse_week_flag,
+            'div_weekly_date': div_weekly_date
         }
 
     # 状态机转换
@@ -617,7 +1271,7 @@ def get_sell_fraction_by_flag(rsi_flag):
 
 
 def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map=None,
-               rsi_state=None, check_weekly_divergence=True):
+               rsi_state=None, check_weekly_divergence=True, rsi_peak_info=None):
     """
     判断卖出信号
 
@@ -726,78 +1380,132 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
         if data_weekly is None or data_daily is None:
             continue
 
-        # ===== 周线顶背离检查（新增逻辑） =====
+        # ===== 周线顶背离检查（改进逻辑） =====
         if check_weekly_divergence and data_weekly is not None:
             # 更新前一个高点信息（用于顶背离判断）
             high_arr = data_weekly['High'].values if 'High' in data_weekly.columns else data_weekly['Close'].values
             macd_hist_arr = data_weekly['MACD_hist'].values if 'MACD_hist' in data_weekly.columns else None
             curr = len(high_arr) - 1
 
-            # 寻找最近 5 周内的最高点
+            # 寻找最近 5 周内的最高点（当前高点）
             recent_lookback = 5
             recent_start = max(curr - recent_lookback + 1, 0)
             recent_max_idx = recent_start + high_arr[recent_start:curr+1].argmax()
             current_high = high_arr[recent_max_idx]
             current_macd = macd_hist_arr[recent_max_idx] if macd_hist_arr is not None else 0
 
-            # 如果还没有记录前一个高点，且当前 MACD 为正，记录下来
-            if return_rsi_state.get('prev_high_price', 0) == 0 and current_macd > 0:
-                return_rsi_state['prev_high_price'] = current_high
-                return_rsi_state['prev_high_macd'] = current_macd
-                return_rsi_state['prev_high_idx'] = recent_max_idx
+            # 获取当前状态
+            diverse_week_flag = return_rsi_state.get('diverse_week_flag', 0)
+            prev_high_price = return_rsi_state.get('prev_high_price', 0)
+            prev_high_macd = return_rsi_state.get('prev_high_macd', 0)
+            prev_high_idx = return_rsi_state.get('prev_high_idx', None)
 
-            # 检查周线顶背离状态
+            # ===== 前高点初始化/更新逻辑 =====
+            # 改进：使用更长的窗口（30周）来找前高点
+            if diverse_week_flag == 0:  # 只有在未形成顶背离时才更新前高点
+                if prev_high_price == 0 or prev_high_idx is None:
+                    # 还没有记录前高点，在更长的窗口内寻找
+                    prev_lookback = 30
+                    # 排除最近5周，在之前的数据中找前高点
+                    prev_end = recent_max_idx - 5 if recent_max_idx > 5 else 0
+                    prev_start = max(prev_end - prev_lookback + 1, 0)
+                    if prev_end > prev_start and macd_hist_arr is not None:
+                        # 找前高点（股价最高且MACD为正）
+                        valid_indices = []
+                        for i in range(prev_start, prev_end + 1):
+                            if macd_hist_arr[i] > 0:  # MACD为正
+                                valid_indices.append(i)
+                        if valid_indices:
+                            prev_max_idx = max(valid_indices, key=lambda i: high_arr[i])
+                            return_rsi_state['prev_high_price'] = high_arr[prev_max_idx]
+                            return_rsi_state['prev_high_macd'] = macd_hist_arr[prev_max_idx]
+                            return_rsi_state['prev_high_idx'] = prev_max_idx
+                else:
+                    # 已有前高点，检查是否需要更新
+                    # 如果当前高点超过了前高点，且MACD红柱也超过了（假背离），则更新前高点
+                    if current_high > prev_high_price and macd_hist_arr is not None:
+                        interval = recent_max_idx - prev_high_idx
+                        if interval >= 5:
+                            # 间隔足够，检查是假背离还是新高点
+                            # 修复：确保两个高点都是红柱
+                            both_red = prev_high_macd > 0 and current_macd > 0
+                            red_bar_grows = current_macd > prev_high_macd
+
+                            if both_red and red_bar_grows:
+                                # MACD红柱也创新高，这是新的高点，更新前高点
+                                return_rsi_state['prev_high_price'] = current_high
+                                return_rsi_state['prev_high_macd'] = current_macd
+                                return_rsi_state['prev_high_idx'] = recent_max_idx
+
+            # 重新获取状态（可能已被更新）
             diverse_week_flag = return_rsi_state.get('diverse_week_flag', 0)
             prev_high_price = return_rsi_state.get('prev_high_price', 0)
             prev_high_macd = return_rsi_state.get('prev_high_macd', 0)
             prev_high_idx = return_rsi_state.get('prev_high_idx', None)
 
             if diverse_week_flag == 0 and prev_high_price > 0 and prev_high_idx is not None:
-                # 检查是否形成顶背离
+                # 检查是否形成顶背离（修复：必须确保两个高点都是红柱）
                 interval = recent_max_idx - prev_high_idx
                 if interval >= 5 and current_high > prev_high_price:
-                    if macd_hist_arr is not None and current_macd < prev_high_macd:
-                        # 顶背离形成
-                        diverse_week_flag = 1
-                        return_rsi_state['diverse_week_flag'] = diverse_week_flag
-                        # 记录顶背离形成日期
-                        curr_date = data_weekly.index[-1]
-                        if hasattr(curr_date, 'strftime'):
-                            div_date_str = curr_date.strftime('%Y-%m-%d')
-                        else:
-                            div_date_str = str(curr_date)[:10]
-                        return_rsi_state['div_weekly_date'] = div_date_str
-                        messages.append(f"【{stock_name}】周线顶背离形成 ({div_date_str}): 股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} < {prev_high_macd:.4f}")
+                    if macd_hist_arr is not None:
+                        # 修复：确保两个高点的MACD柱都是红柱（正值）
+                        both_red_bars = prev_high_macd > 0 and current_macd > 0
+                        # 红柱缩短
+                        red_bar_shortens = current_macd < prev_high_macd
+
+                        if both_red_bars and red_bar_shortens:
+                            # 顶背离形成
+                            diverse_week_flag = 1
+                            return_rsi_state['diverse_week_flag'] = diverse_week_flag
+                            # 记录顶背离形成日期
+                            curr_date = data_weekly.index[-1]
+                            if hasattr(curr_date, 'strftime'):
+                                div_date_str = curr_date.strftime('%Y-%m-%d')
+                            else:
+                                div_date_str = str(curr_date)[:10]
+                            return_rsi_state['div_weekly_date'] = div_date_str
+                            messages.append(f"【{stock_name}】周线顶背离形成 ({div_date_str}): 股价{current_high:.3f} > {prev_high_price:.3f}, MACD红柱{current_macd:.4f} < {prev_high_macd:.4f}")
 
             elif diverse_week_flag == 1:
-                # 检查是否假背离（顶背离失效）
-                if macd_hist_arr is not None and current_high > prev_high_price and current_macd > prev_high_macd:
-                    # 顶背离失效（假背离）
-                    diverse_week_flag = 0
-                    return_rsi_state['diverse_week_flag'] = 0
-                    return_rsi_state['prev_high_price'] = current_high
-                    return_rsi_state['prev_high_macd'] = current_macd
-                    return_rsi_state['prev_high_idx'] = recent_max_idx
-                    messages.append(f"【{stock_name}】周线顶背离失效（假背离）：股价{current_high:.2f} > {prev_high_price:.2f}, MACD 柱{current_macd:.4f} > {prev_high_macd:.4f}")
+                # 检查是否假背离（顶背离失效）（修复：必须确保两个高点都是红柱）
+                if macd_hist_arr is not None:
+                    # 两个高点都必须是红柱
+                    both_red = prev_high_macd > 0 and current_macd > 0
+                    # 红柱增强（假背离）
+                    red_bar_grows = current_macd > prev_high_macd
 
-                # 检查是否 5 日均线跌破 10 日均线（顶背离生效）
-                if 'MA5' in data_weekly.columns and 'MA10' in data_weekly.columns:
-                    ma5_weekly_curr = data_weekly['MA5'].iloc[-1]
-                    ma10_weekly_curr = data_weekly['MA10'].iloc[-1]
-                    if len(data_weekly) >= 2:
-                        ma5_weekly_prev = data_weekly['MA5'].iloc[-2]
-                        ma10_weekly_prev = data_weekly['MA10'].iloc[-2]
+                    if current_high > prev_high_price and both_red and red_bar_grows:
+                        # 顶背离失效（假背离）
+                        diverse_week_flag = 0
+                        return_rsi_state['diverse_week_flag'] = 0
+                        return_rsi_state['prev_high_price'] = current_high
+                        return_rsi_state['prev_high_macd'] = current_macd
+                        return_rsi_state['prev_high_idx'] = recent_max_idx
+                        messages.append(f"【{stock_name}】周线顶背离失效（假背离）：股价{current_high:.3f} > {prev_high_price:.3f}, MACD红柱{current_macd:.4f} > {prev_high_macd:.4f}，更新前高点")
 
-                        if ma5_weekly_prev >= ma10_weekly_prev and ma5_weekly_curr < ma10_weekly_curr:
+                # 检查是否 5 日均线跌破 10 日均线（顶背离生效，使用日线数据）
+                if 'MA5' in data_daily.columns and 'MA10' in data_daily.columns:
+                    ma5_daily_curr = data_daily['MA5'].iloc[-1]
+                    ma10_daily_curr = data_daily['MA10'].iloc[-1]
+                    if len(data_daily) >= 2:
+                        ma5_daily_prev = data_daily['MA5'].iloc[-2]
+                        ma10_daily_prev = data_daily['MA10'].iloc[-2]
+
+                        if ma5_daily_prev >= ma10_daily_prev and ma5_daily_curr < ma10_daily_curr:
                             # 顶背离生效，触发卖出
                             # 获取周线顶背离的详细信息（形成日期和前高价格）
                             div_weekly_date = return_rsi_state.get('div_weekly_date', '未知')
                             prev_high_price = return_rsi_state.get('prev_high_price', 0)
 
+                            # 完全重置周线顶背离状态
                             diverse_week_flag = 0
                             return_rsi_state['diverse_week_flag'] = 0
+                            return_rsi_state['prev_high_price'] = 0
+                            return_rsi_state['prev_high_macd'] = 0
+                            return_rsi_state['prev_high_idx'] = None
+                            return_rsi_state['div_weekly_date'] = None
                             sell_fraction = 0.5  # 卖出 50%
-                            messages.append(f"【{stock_name}】周线顶背离生效 (策略 1-周线顶背离): 顶背离形成于{div_weekly_date}, 前高={prev_high_price:.3f}, 5 周均线下穿 10 周均线确认，建议卖出{sell_fraction*100:.0f}%")
+                            messages.append(f"【{stock_name}】周线顶背离生效 (策略 1-周线顶背离): 顶背离形成于{div_weekly_date}, 前高={prev_high_price:.3f}, 5 日均线下穿 10 日均线确认，建议卖出{sell_fraction*100:.0f}%")
                             # 注意：这里不立即添加卖出信号，而是通过后续的均线跌破逻辑处理
 
         if sell_id == 1:
@@ -843,7 +1551,13 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                 ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
 
                 rsi_detail_msg = ""
-                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
+                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                    peak_date_str = rsi_peak_info['peak_date']
+                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    # 兜底逻辑：从最近20周找峰值
                     weekly_rsi_values = data_weekly['RSI'].values
                     weekly_dates = data_weekly.index
                     curr_idx = len(weekly_rsi_values) - 1
@@ -886,7 +1600,13 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                 ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
 
                 rsi_detail_msg = ""
-                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
+                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                    peak_date_str = rsi_peak_info['peak_date']
+                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    # 兜底逻辑：从最近20周找峰值
                     weekly_rsi_values = data_weekly['RSI'].values
                     weekly_dates = data_weekly.index
                     curr_idx = len(weekly_rsi_values) - 1
@@ -952,7 +1672,13 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                 ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
 
                 rsi_detail_msg = ""
-                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
+                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                    peak_date_str = rsi_peak_info['peak_date']
+                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    # 兜底逻辑：从最近20周找峰值
                     weekly_rsi_values = data_weekly['RSI'].values
                     weekly_dates = data_weekly.index
                     curr_idx = len(weekly_rsi_values) - 1
@@ -994,7 +1720,13 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                 ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
 
                 rsi_detail_msg = ""
-                if data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
+                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                    peak_date_str = rsi_peak_info['peak_date']
+                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
+                    # 兜底逻辑：从最近20周找峰值
                     weekly_rsi_values = data_weekly['RSI'].values
                     weekly_dates = data_weekly.index
                     curr_idx = len(weekly_rsi_values) - 1

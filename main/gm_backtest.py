@@ -18,6 +18,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # 导入策略逻辑
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from strategy import strategy
+from strategy.strategy import LocalHighLogger
 
 
 # --- 日志配置 ---
@@ -186,6 +187,146 @@ def parse_sell_fraction(messages):
                 picked = msg
     return fraction, picked
 
+
+# --- 交易成本模型 ---
+def apply_transaction_cost(price, action, shares, slippage_rate=0.0005, commission_rate=0.000008):
+    """
+    应用交易成本（滑点 + 手续费）
+
+    Args:
+        price: 基准价格（收盘价）
+        action: 'BUY' 或 'SELL'
+        shares: 交易股数
+        slippage_rate: 滑点率，默认 0.5‰（ETF流动性好）
+        commission_rate: 手续费率，默认万0.08
+
+    Returns:
+        tuple: (实际成交价, 总成本/收入)
+    """
+    min_commission = 0.5  # ETF最低手续费通常较低
+
+    if action == 'BUY':
+        # 买入：价格上浮滑点
+        actual_price = price * (1 + slippage_rate)
+        commission = max(actual_price * shares * commission_rate, min_commission)
+        total_cost = actual_price * shares + commission
+        return actual_price, total_cost
+    else:
+        # 卖出：价格下浮滑点
+        actual_price = price * (1 - slippage_rate)
+        commission = max(actual_price * shares * commission_rate, min_commission)
+        # ETF无印花税
+        total_revenue = actual_price * shares - commission
+        return actual_price, total_revenue
+
+
+def check_price_limit(open_price, close_price, prev_close, limit_pct=0.1):
+    """
+    检查涨跌停状态
+
+    Args:
+        open_price: 当日开盘价
+        close_price: 当日收盘价
+        prev_close: 前一日收盘价
+        limit_pct: 涨跌停幅度，默认10%
+
+    Returns:
+        str: 'rise_limit' 涨停, 'fall_limit' 跌停, None 正常
+    """
+    if prev_close is None or prev_close <= 0:
+        return None
+
+    rise_limit = round(prev_close * (1 + limit_pct), 2)
+    fall_limit = round(prev_close * (1 - limit_pct), 2)
+
+    # 涨停判断：收盘价等于涨停价，且当日有涨幅
+    if close_price >= rise_limit and close_price > open_price:
+        return 'rise_limit'
+    # 跌停判断：收盘价等于跌停价，且当日有跌幅
+    if close_price <= fall_limit and close_price < open_price:
+        return 'fall_limit'
+    return None
+
+
+def calculate_performance_metrics_v2(equity_curve, initial_cash, risk_free_rate=0.03):
+    """
+    计算完整的回测绩效指标
+
+    Args:
+        equity_curve: 净值曲线 DataFrame (Date, Equity)
+        initial_cash: 初始资金
+        risk_free_rate: 无风险利率，默认3%
+
+    Returns:
+        dict: 包含各种绩效指标的字典
+    """
+    if equity_curve is None or len(equity_curve) < 2:
+        return {}
+
+    eq = equity_curve.copy()
+    eq['returns'] = eq['Equity'].pct_change()
+
+    # 总收益率
+    final_value = eq['Equity'].iloc[-1]
+    total_return = (final_value / initial_cash - 1) * 100
+
+    # 最大回撤
+    eq['peak'] = eq['Equity'].cummax()
+    eq['drawdown'] = (eq['peak'] - eq['Equity']) / eq['peak'] * 100
+    max_drawdown = eq['drawdown'].max()
+
+    # 年化收益率（假设252个交易日）
+    days = len(eq)
+    annual_return = (pow(final_value / initial_cash, 252 / days) - 1) * 100
+
+    # 夏普比率
+    returns = eq['returns'].dropna()
+    if len(returns) > 1 and returns.std() > 0:
+        daily_rf = risk_free_rate / 252
+        excess_returns = returns - daily_rf
+        sharpe_ratio = excess_returns.mean() / returns.std() * np.sqrt(252)
+    else:
+        sharpe_ratio = 0
+
+    # 卡玛比率 (收益/最大回撤)
+    calmar_ratio = annual_return / max_drawdown if max_drawdown > 0 else 0
+
+    # 盈利天数/亏损天数
+    profit_days = (returns > 0).sum()
+    loss_days = (returns < 0).sum()
+
+    # 最大连续盈利/亏损天数
+    eq['profit_flag'] = (returns > 0).astype(int)
+    eq['loss_flag'] = (returns < 0).astype(int)
+
+    # 计算连续盈利/亏损的长度
+    def max_consecutive(arr):
+        max_len = 0
+        current_len = 0
+        for v in arr:
+            if v == 1:
+                current_len += 1
+                max_len = max(max_len, current_len)
+            else:
+                current_len = 0
+        return max_len
+
+    max_profit_consecutive = max_consecutive(eq['profit_flag'].values)
+    max_loss_consecutive = max_consecutive(eq['loss_flag'].values)
+
+    return {
+        '总收益率(%)': round(total_return, 2),
+        '年化收益率(%)': round(annual_return, 2),
+        '最大回撤(%)': round(max_drawdown, 2),
+        '夏普比率': round(sharpe_ratio, 2),
+        '卡玛比率': round(calmar_ratio, 2),
+        '盈利天数': int(profit_days),
+        '亏损天数': int(loss_days),
+        '最大连续盈利天数': int(max_profit_consecutive),
+        '最大连续亏损天数': int(max_loss_consecutive),
+        '回测天数': int(days),
+    }
+
 def run_backtest_history(
     start_date,
     end_date,
@@ -270,7 +411,12 @@ def run_backtest_history(
         trades = []
         equity_curve = []
         last_sell_date = None  # 记录上次卖出的日期
+        last_buy_date = None   # 记录上次买入的日期
         last_sar_breakdown_week = None  # 记录上次 RSI 阶梯减仓触发的周
+
+        # 交易成本统计
+        total_commission = 0.0
+        total_slippage = 0.0
 
         # RSI flag 状态跟踪
         # 初始化 rsi_flag=0，根据周线 RSI 峰值更新
@@ -312,6 +458,11 @@ def run_backtest_history(
             'div_weekly_date': None
         }
 
+        # ===== 局部高点日志记录器初始化 =====
+        log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        local_high_logger = LocalHighLogger(ticker, name, log_dir)
+        local_high_logger.set_backtest_period(start_date, end_date)
+
         first_close = float(df_daily_raw.loc[trade_days[0]]['Close'])
         hold_shares = int((initial_cash / first_close) // lot_size) * lot_size
         hold_cash = initial_cash - hold_shares * first_close
@@ -346,6 +497,7 @@ def run_backtest_history(
             return idx_ind
 
         for ts in trade_days:
+            sold_today = False  # 跟踪当天是否已卖出，避免同一天买卖
             daily_slice_raw = df_daily_raw.loc[:ts].tail(600)
             weekly_raw = resample_to_weekly(daily_slice_raw)
             monthly_raw = resample_to_monthly(daily_slice_raw)
@@ -378,25 +530,57 @@ def run_backtest_history(
             # 5. 当 5 日均线跌破 10 日均线并触发 RSI 卖出后，rsi_flag=0
 
             current_ma5_breakdown = False
+            rsi_peak_date_str = None  # 峰值日期字符串
 
             # 先计算 RSI flag（在检测均线跌破之前）
+            # 注意：只计算回测开始日期之后的 RSI 峰值
             if weekly is not None and 'RSI' in weekly.columns:
+                # 将 start_date 转换为与 weekly 索引相同的类型
+                start_dt = pd.to_datetime(start_date)
+                if weekly.index.tz is not None:
+                    start_dt = start_dt.tz_localize(weekly.index.tz)
+
                 if last_sar_breakdown_week is not None:
+                    # 从上次均线跌破后的周开始计算
                     weekly_filtered = weekly[weekly.index > last_sar_breakdown_week]
                     if weekly_filtered is not None and not weekly_filtered.empty:
                         rsi_peak_after_breakdown = weekly_filtered['RSI'].max()
+                        # 找到峰值对应的日期
+                        peak_idx = weekly_filtered['RSI'].argmax()
+                        peak_date = weekly_filtered.index[peak_idx]
+                        if hasattr(peak_date, 'strftime'):
+                            rsi_peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            rsi_peak_date_str = str(peak_date)[:10]
                     else:
-                        pass
+                        # 均线跌破后还没有新的周线数据，峰值为0
+                        rsi_peak_after_breakdown = 0
+                        rsi_peak_date_str = None
                 else:
-                    rsi_peak_after_breakdown = weekly['RSI'].max()
+                    # 从回测开始日期开始计算
+                    weekly_filtered = weekly[weekly.index >= start_dt]
+                    if weekly_filtered is not None and not weekly_filtered.empty:
+                        rsi_peak_after_breakdown = weekly_filtered['RSI'].max()
+                        # 找到峰值对应的日期
+                        peak_idx = weekly_filtered['RSI'].argmax()
+                        peak_date = weekly_filtered.index[peak_idx]
+                        if hasattr(peak_date, 'strftime'):
+                            rsi_peak_date_str = peak_date.strftime('%Y-%m-%d')
+                        else:
+                            rsi_peak_date_str = str(peak_date)[:10]
+                    else:
+                        rsi_peak_after_breakdown = 0
+                        rsi_peak_date_str = None
 
                 rsi_flag = strategy.get_rsi_flag_level(rsi_peak_after_breakdown)
 
                 # 如果 RSI 峰值超过 80，记录到日志文件（DEBUG级别）
                 if rsi_flag > 0:
-                    logger.debug(f"[{day_str}] [{name}] 周 RSI 峰值={rsi_peak_after_breakdown:.2f}, flag={rsi_flag}")
+                    logger.debug(f"[{day_str}] [{name}] 周 RSI 峰值={rsi_peak_after_breakdown:.2f}, 峰值日期={rsi_peak_date_str}, flag={rsi_flag}")
             else:
                 rsi_flag = 0
+                rsi_peak_after_breakdown = 0
+                rsi_peak_date_str = None
 
             # 检查当前是否有均线跌破（5 日均线下穿 10 日均线）
             if 'MA5' in daily.columns and 'MA10' in daily.columns:
@@ -407,18 +591,74 @@ def run_backtest_history(
                 # 检测下穿动作：昨天 MA5>=MA10，今天 MA5<MA10
                 if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
                     current_ma5_breakdown = True
-                    logger.debug(f"[{day_str}] [{name}] 5日均线跌破10日均线，当日flag={rsi_flag}")
+                    # 均线跌破时更新 last_sar_breakdown_week
+                    # 这样下一个交易日计算 RSI 峰值时会从当前周之后开始
+                    # 注意：这里不重置 rsi_peak_after_breakdown，因为卖出时需要显示这个值
+                    last_sar_breakdown_week = weekly.index[-1] if weekly is not None else None
+                    logger.debug(f"[{day_str}] [{name}] 5日均线跌破10日均线，更新RSI峰值追踪起点，当日flag={rsi_flag}")
 
             # 保存当前的 rsi_flag 用于 judge_sell（在重置之前）
             rsi_flag_for_sell = rsi_flag
 
-            # 调用 judge_sell，传入当前的 rsi_flag 值
+            # 准备峰值信息字典，用于日志显示
+            rsi_peak_info = {
+                'peak_date': rsi_peak_date_str,
+                'peak_rsi': rsi_peak_after_breakdown
+            }
+
+            # ===== 周线顶背离检测（使用新的局部高点检测方法） =====
+            # 调用 detect_weekly_top_divergence 检测周线顶背离
+            weekly_div_flag, weekly_div_valid, weekly_div_sell, weekly_div_fraction, weekly_div_msgs, rsi_state = \
+                strategy.detect_weekly_top_divergence(weekly, rsi_state, daily)
+
+            # ===== 更新周线局部高点记录 =====
+            # 使用新的周线局部高点检测方法（需要日线数据确认均线跌破）
+            if weekly is not None and len(weekly) > 0:
+                weekly_local_highs = strategy.detect_weekly_local_highs(weekly, daily, drop_threshold=0.08)
+                local_high_logger.update_weekly_highs(weekly_local_highs, day_str)
+
+                # 调试：输出局部高点检测结果（每周输出一次）
+                if len(weekly_local_highs) >= 2 and day_str.endswith('5'):  # 简单判断周几
+                    logger.info(f"[{day_str}] [{name}] 周线局部高点数量={len(weekly_local_highs)}")
+                    for i, h in enumerate(weekly_local_highs[-3:]):  # 只显示最近3个
+                        date_str = str(h.get('date', 'N/A'))[:10]
+                        logger.info(f"  高点{i+1}: 日期={date_str}, 价格={h['price']:.3f}, MACD={h['macd_hist']:.4f}")
+
+            # ===== 更新日线局部高点记录 =====
+            if daily is not None and len(daily) > 0:
+                daily_local_highs = strategy.detect_local_highs(daily, drop_threshold=0.05)
+                local_high_logger.update_daily_highs(daily_local_highs, day_str)
+
+            # 记录周线顶背离日志
+            for msg in weekly_div_msgs:
+                logger.info(f"[{day_str}] [{name}] {msg}")
+                # ===== 记录周线顶背离事件 =====
+                if '周线顶背离形成' in msg:
+                    # 从rsi_state获取详细信息
+                    local_high_logger.record_weekly_divergence('形成', day_str, {
+                        'prev_high': rsi_state.get('prev_high_price', 0),
+                        'prev_macd': rsi_state.get('prev_high_macd', 0),
+                        'div_weekly_date': rsi_state.get('div_weekly_date', '未知')
+                    })
+                elif '周线顶背离失效' in msg or '假背离' in msg:
+                    local_high_logger.record_weekly_divergence('失效', day_str, {
+                        'reason': '假背离' if '假背离' in msg else msg
+                    })
+
+            # 调用 judge_sell，传入当前的 rsi_flag 值和峰值信息
+            # 注意：关闭 judge_sell 中的旧周线顶背离检测逻辑
             sell_msgs, rsi_flag_returned, sar_breakdown, rsi_state = strategy.judge_sell(
-                name, stock_judge_sell_ids, all_data, rsi_flag=rsi_flag_for_sell, rsi_state=rsi_state
+                name, stock_judge_sell_ids, all_data, rsi_flag=rsi_flag_for_sell, rsi_state=rsi_state,
+                rsi_peak_info=rsi_peak_info, check_weekly_divergence=False
             )
 
             # 处理 judge_sell 返回的卖出信号（RSI 阶梯减仓）
             sell_fraction, sell_reason = parse_sell_fraction(sell_msgs)
+
+            # ===== 周线顶背离卖出信号（优先级最高） =====
+            if weekly_div_sell and weekly_div_fraction >= sell_fraction:
+                sell_fraction = weekly_div_fraction
+                sell_reason = weekly_div_msgs[-1] if weekly_div_msgs else "周线顶背离触发清仓"
 
             # ===== 重要：优先级检查 =====
             # 如果 RSI flag=3（周线RSI>90），应该清仓，优先级高于日线顶背离
@@ -443,6 +683,8 @@ def run_backtest_history(
                     div_date = day_str
                     # 记录两个高点中的较高者
                     div_high_price = max(div_details['recent_high'], div_details['prev_high'])
+                    # ===== 记录日线顶背离形成事件 =====
+                    local_high_logger.record_daily_divergence('形成', day_str, div_details)
             else:
                 # 2. 已有潜在顶背离，等待 5 日均线下穿 10 日均线确认
                 # 注意：需要检测的是"下穿"动作，而不是均线状态
@@ -488,6 +730,14 @@ def run_backtest_history(
                             # 3. 间隔足够：interval >= 5
                             # 4. MACD 柱为正：recent_hist > 0
                             if interval >= 5 and recent_high > prev_high and recent_hist > prev_hist and recent_hist > 0:
+                                # ===== 记录日线顶背离失效事件 =====
+                                local_high_logger.record_daily_divergence('失效', day_str, {
+                                    'reason': '假背离',
+                                    'prev_high': prev_high,
+                                    'recent_high': recent_high,
+                                    'prev_macd': prev_hist,
+                                    'recent_macd': recent_hist
+                                })
                                 div_pending_flag = 0
                                 div_date = None
                                 div_high_price = 0
@@ -500,40 +750,58 @@ def run_backtest_history(
                 if sell_fraction < (1.0 / 3.0):
                     sell_fraction = 1.0 / 3.0
                     sell_reason = f"【{name}】卖出信号 (策略 1-顶背离均线): 日线顶背离 ({div_date}) + 5 日均线下穿 10 日均线确认，前高={div_high_price:.3f}, 建议卖出 1/3"
+                    # ===== 记录日线顶背离生效事件 =====
+                    local_high_logger.record_daily_divergence('生效', day_str, {
+                        'prev_high': div_high_price,
+                        'reason': '均线跌破确认'
+                    })
                 div_flag = 0  # 卖出后重置
                 div_pending_flag = 0  # 重置潜在标志
                 div_date = None
                 div_high_price = 0
                 # 注意：实际卖出日志会在下面的统一卖出逻辑中打印，包含日 RSI 和周 RSI
 
-            # ===== 周线顶背离逻辑（使用新的 diverse_week_flag） =====
-            # 注意：周线顶背离的判断现在在 strategy.judge_sell 中处理
-            # 这里只处理卖出信号的触发
+            # ===== 周线顶背离逻辑 =====
+            # 周线顶背离确认条件：5日均线跌破10日均线（使用日线数据）
+            # 周线顶背离触发清仓（100%）
             data_weekly_for_div = all_data.get('weekly')
             if data_weekly_for_div is not None and not data_weekly_for_div.empty:
                 # 从 rsi_state 中获取周线顶背离状态
                 diverse_week_flag = rsi_state.get('diverse_week_flag', 0) if rsi_state else 0
                 prev_high_price = rsi_state.get('prev_high_price', 0) if rsi_state else 0
-                prev_high_macd = rsi_state.get('prev_high_macd', 0) if rsi_state else 0
 
                 # 如果周线顶背离已确认（在 judge_sell 中已经检测），触发卖出
-                if diverse_week_flag == 1 and sell_fraction < 0.5:  # 只在没有更大的卖出信号时触发
-                    # 检查是否发生 5 周均线下穿 10 周均线
-                    if 'MA5' in data_weekly_for_div.columns and 'MA10' in data_weekly_for_div.columns:
-                        ma5_weekly_curr = data_weekly_for_div['MA5'].iloc[-1]
-                        ma10_weekly_curr = data_weekly_for_div['MA10'].iloc[-1]
-                        if len(data_weekly_for_div) >= 2:
-                            ma5_weekly_prev = data_weekly_for_div['MA5'].iloc[-2]
-                            ma10_weekly_prev = data_weekly_for_div['MA10'].iloc[-2]
+                if diverse_week_flag == 1 and sell_fraction < 1.0:  # 清仓优先级最高
+                    # 使用日线数据检查是否发生 5 日均线下穿 10 日均线
+                    if 'MA5' in daily.columns and 'MA10' in daily.columns:
+                        ma5_daily_curr = daily['MA5'].iloc[-1]
+                        ma10_daily_curr = daily['MA10'].iloc[-1]
+                        if len(daily) >= 2:
+                            ma5_daily_prev = daily['MA5'].iloc[-2]
+                            ma10_daily_prev = daily['MA10'].iloc[-2]
 
-                            if ma5_weekly_prev >= ma10_weekly_prev and ma5_weekly_curr < ma10_weekly_curr:
-                                # 顶背离生效，触发卖出
+                            if ma5_daily_prev >= ma10_daily_prev and ma5_daily_curr < ma10_daily_curr:
+                                # 周线顶背离生效，触发清仓
                                 div_sell_triggered = True
-                                sell_fraction = 0.5  # 卖出 50%
+                                sell_fraction = 1.0  # 清仓（100%）
                                 # 获取周线顶背离形成日期
                                 div_weekly_date = rsi_state.get('div_weekly_date', '未知')
-                                sell_reason = f"【{name}】卖出信号 (策略 1-周线顶背离): 顶背离形成于 {div_weekly_date}, 前高={prev_high_price:.3f}, 5 周均线下穿 10 周均线确认，建议卖出 50%"
-                                rsi_state['diverse_week_flag'] = 0  # 重置标志
+                                sell_reason = f"【{name}】卖出信号 (策略 1-周线顶背离): 顶背离形成于 {div_weekly_date}, 前高={prev_high_price:.3f}, 5 日均线下穿 10 日均线确认，建议清仓"
+                                # ===== 记录周线顶背离生效事件 =====
+                                local_high_logger.record_weekly_divergence('生效', day_str, {
+                                    'prev_high': prev_high_price,
+                                    'reason': '均线跌破确认',
+                                    'div_weekly_date': div_weekly_date
+                                })
+                                # 完全重置周线顶背离状态
+                                rsi_state['diverse_week_flag'] = 0
+                                rsi_state['prev_high_price'] = 0
+                                rsi_state['prev_high_macd'] = 0
+                                rsi_state['prev_high_idx'] = None
+                                rsi_state['div_weekly_date'] = None
+                                # 重置日线顶背离标志
+                                div_flag = 0
+                                div_pending_flag = 0
                                 # 注意：实际卖出日志会在下面的统一卖出逻辑中打印，包含日 RSI 和周 RSI
 
             # 检查是否在 5 个交易日内重复触发
@@ -547,36 +815,85 @@ def run_backtest_history(
                     should_skip = True
 
             if sell_fraction > 0 and shares > 0 and not should_skip:
-                # 执行卖出
-                if sell_fraction >= 0.999:
-                    sell_qty = shares
+                # 检查跌停（跌停无法卖出）
+                prev_close = float(df_daily_raw.loc[:ts].iloc[-2]['Close']) if len(df_daily_raw.loc[:ts]) >= 2 else close
+                open_price = float(daily_slice_raw['Open'].iloc[-1]) if 'Open' in daily_slice_raw.columns else close
+                limit_status = check_price_limit(open_price, close, prev_close)
+
+                if limit_status == 'fall_limit':
+                    logger.debug(f"[{day_str}] [{name}] 跌停无法卖出，跳过")
                 else:
-                    sell_qty = int((shares * sell_fraction) // lot_size) * lot_size
-                    sell_qty = min(sell_qty, shares)
-                if sell_qty > 0:
-                    cash += sell_qty * close
-                    shares -= sell_qty
-                    trades.append(
-                        {
-                            'date': day_str,
-                            'action': 'SELL',
-                            'shares': int(sell_qty),
-                            'price': close,
-                            'reason': sell_reason or 'SELL',
-                            'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
-                            'rsi_weekly': rsi_weekly,
-                        }
-                    )
-                    has_sold_before = True
-                    last_sell_date = day_str
-                    # 任何卖出后都重置 RSI 峰值
-                    last_sar_breakdown_week = weekly.index[-1] if weekly is not None else None
-                    rsi_peak_after_breakdown = 0
-                    # 打印卖出日志，包含日线和周线 RSI 值
-                    rsi_daily = daily['RSI'].iloc[-1] if 'RSI' in daily.columns else 0
-                    logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {close:.3f} | 日 RSI:{rsi_daily:.2f} | 周 RSI:{rsi_weekly:.2f} | {sell_reason}")
+                    # 执行卖出
+                    if sell_fraction >= 0.999:
+                        sell_qty = shares
+                    else:
+                        sell_qty = int((shares * sell_fraction) // lot_size) * lot_size
+                        sell_qty = min(sell_qty, shares)
+                    if sell_qty > 0:
+                        # 应用交易成本
+                        actual_price, net_revenue = apply_transaction_cost(close, 'SELL', sell_qty)
+                        cash += net_revenue
+                        shares -= sell_qty
+
+                        # 记录交易成本
+                        total_slippage += sell_qty * close * 0.0005
+                        total_commission += max(actual_price * sell_qty * 0.000008, 0.5)
+
+                        trades.append(
+                            {
+                                'date': day_str,
+                                'action': 'SELL',
+                                'shares': int(sell_qty),
+                                'price': actual_price,
+                                'reason': sell_reason or 'SELL',
+                                'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
+                                'rsi_weekly': rsi_weekly,
+                            }
+                        )
+                        has_sold_before = True
+                        last_sell_date = day_str
+                        sold_today = True  # 标记当天已卖出
+                        # 注意：last_sar_breakdown_week 和 rsi_peak_after_breakdown 已在均线跌破时更新
+                        # 这里不再重复更新
+                        # 打印卖出日志，包含日线和周线 RSI 值
+                        rsi_daily = daily['RSI'].iloc[-1] if 'RSI' in daily.columns else 0
+                        logger.info(f"[{day_str}] 卖出：{sell_qty} 股 @ {actual_price:.3f} (原价:{close:.3f}) | 日 RSI:{rsi_daily:.2f} | 周 RSI:{rsi_weekly:.2f} | {sell_reason}")
+
+                        # 如果卖出后空仓，重置所有状态
+                        if shares == 0:
+                            rsi_flag = 0
+                            if rsi_state is not None:
+                                rsi_state['diverse_week_flag'] = 0
+                                rsi_state['prev_high_price'] = 0
+                                rsi_state['prev_high_macd'] = 0
+                                rsi_state['prev_high_idx'] = None
+                                rsi_state['div_weekly_date'] = None
+                                rsi_state['div_prev_high'] = None
+                                rsi_state['div_prev_macd'] = None
+                                rsi_state['div_recent_high'] = None
+                                rsi_state['div_recent_macd'] = None
+                                rsi_state['div_recent_idx'] = None
+                            div_pending_flag = 0
+                            div_flag = 0
+                            logger.debug(f"[{day_str}] [{name}] 清仓后重置所有状态: rsi_flag=0, diverse_week_flag=0")
             elif sell_fraction > 0 and shares == 0:
-                pass  # 有卖出信号但已空仓，跳过
+                # 有卖出信号但已空仓，重置所有状态参数
+                rsi_flag = 0
+                rsi_peak_after_breakdown = 0
+                if rsi_state is not None:
+                    rsi_state['diverse_week_flag'] = 0
+                    rsi_state['prev_high_price'] = 0
+                    rsi_state['prev_high_macd'] = 0
+                    rsi_state['prev_high_idx'] = None
+                    rsi_state['div_weekly_date'] = None
+                    rsi_state['div_prev_high'] = None
+                    rsi_state['div_prev_macd'] = None
+                    rsi_state['div_recent_high'] = None
+                    rsi_state['div_recent_macd'] = None
+                    rsi_state['div_recent_idx'] = None
+                div_pending_flag = 0
+                div_flag = 0
+                logger.debug(f"[{day_str}] [{name}] 已空仓，重置所有状态: rsi_flag=0, diverse_week_flag=0, div_flag=0")
             elif sell_fraction == 0 and shares > 0:
                 pass  # 无卖出信号，继续持有
 
@@ -592,47 +909,109 @@ def run_backtest_history(
 
             executed_buy = False
 
-            if buy_reason and cash > close * lot_size:
-                # 新资金买入
-                buy_qty = int((cash / close) // lot_size) * lot_size
-                if buy_qty > 0:
-                    cash -= buy_qty * close
-                    shares += buy_qty
-                    trades.append(
-                        {
-                            'date': day_str,
-                            'action': 'BUY',
-                            'shares': int(buy_qty),
-                            'price': close,
-                            'reason': buy_reason,
-                            'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
-                            'rsi_weekly': rsi_weekly,
-                        }
-                    )
-                    executed_buy = True
-                    has_sold_before = False
-                    logger.info(f"[{day_str}] 买入：{buy_qty} 股 @ {close:.3f} | {buy_reason}")
+            # 检查是否在买入冷却期内（买入后5个交易日内不再买入）
+            # 只有当剩余现金不足以买一手时，才进入冷却期
+            in_buy_cooldown = False
+            if last_buy_date is not None:
+                # 检查剩余现金是否足够买一手
+                estimated_min_cost = close * 1.001 * 1.0003 * lot_size  # 买一手需要的最小金额
+                if cash < estimated_min_cost:
+                    # 剩余现金不足一手，进入冷却期
+                    current_date = ts.tz_localize(None) if hasattr(ts, 'tz') and ts.tz is not None else pd.to_datetime(ts)
+                    last_buy_dt = pd.to_datetime(last_buy_date).tz_localize(None)
+                    days_since_last_buy = (current_date - last_buy_dt).days
+                    if days_since_last_buy <= 5:
+                        in_buy_cooldown = True
+                        logger.debug(f"[{day_str}] [{name}] 买入冷却期内（距上次买入{days_since_last_buy}天，剩余现金{cash:.2f}不足一手），跳过买入")
+
+            # 同一天已卖出则不买入（修复同一天买卖问题）
+            if sold_today:
+                logger.debug(f"[{day_str}] [{name}] 当天已卖出，跳过买入")
+            elif in_buy_cooldown:
+                pass  # 买入冷却期内，跳过买入
+            elif buy_reason and cash > close * lot_size:
+                # 检查涨停（涨停无法买入）
+                prev_close_buy = float(df_daily_raw.loc[:ts].iloc[-2]['Close']) if len(df_daily_raw.loc[:ts]) >= 2 else close
+                open_price_buy = float(daily_slice_raw['Open'].iloc[-1]) if 'Open' in daily_slice_raw.columns else close
+                limit_status_buy = check_price_limit(open_price_buy, close, prev_close_buy)
+
+                if limit_status_buy == 'rise_limit':
+                    logger.debug(f"[{day_str}] [{name}] 涨停无法买入，跳过")
+                else:
+                    # 新资金买入
+                    # 预估交易成本，计算可买股数
+                    estimated_price = close * 1.001  # 预估滑点后价格
+                    estimated_cost_per_share = estimated_price * 1.0003  # 预留手续费空间
+                    buy_qty = int((cash / estimated_cost_per_share) // lot_size) * lot_size
+
+                    # 打印买入前的详细信息
+                    logger.info(f"[{day_str}] [{name}] 买入检查: 股价={close:.4f}, 剩余现金={cash:.2f}, "
+                               f"预估成本/股={estimated_cost_per_share:.4f}, 可买股数={buy_qty}, 一手={lot_size}")
+
+                    if buy_qty > 0:
+                        # 应用交易成本
+                        actual_buy_price, total_cost = apply_transaction_cost(close, 'BUY', buy_qty)
+                        cash -= total_cost
+                        shares += buy_qty
+
+                        # 记录交易成本
+                        total_slippage += buy_qty * close * 0.0005
+                        total_commission += max(actual_buy_price * buy_qty * 0.000008, 0.5)
+
+                        trades.append(
+                            {
+                                'date': day_str,
+                                'action': 'BUY',
+                                'shares': int(buy_qty),
+                                'price': actual_buy_price,
+                                'reason': buy_reason,
+                                'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
+                                'rsi_weekly': rsi_weekly,
+                            }
+                        )
+                        executed_buy = True
+                        has_sold_before = False
+                        last_buy_date = day_str  # 记录买入日期
+                        logger.info(f"[{day_str}] 买入：{buy_qty} 股 @ {actual_buy_price:.3f} (原价:{close:.3f}) | 买入后剩余现金={cash:.2f} | {buy_reason}")
+                    else:
+                        logger.info(f"[{day_str}] [{name}] 现金不足一手: 现金={cash:.2f}, 需要约{estimated_cost_per_share * lot_size:.2f}元")
             elif buy_reason:
                 pass  # 有买入信号但没执行（现金不足）
 
-            if not executed_buy and t_buy_reason and has_sold_before and cash > close * lot_size:
+            if not executed_buy and not sold_today and not in_buy_cooldown and t_buy_reason and has_sold_before and cash > close * lot_size:
                 # 做 T 买回
-                t_buy_qty = int((cash / close) // lot_size) * lot_size
-                if t_buy_qty > 0:
-                    cash -= t_buy_qty * close
-                    shares += t_buy_qty
-                    trades.append(
-                        {
-                            'date': day_str,
-                            'action': 'BUY',
-                            'shares': int(t_buy_qty),
-                            'price': close,
-                            'reason': t_buy_reason,
-                            'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
-                            'rsi_weekly': rsi_weekly,
-                        }
-                    )
-                    logger.info(f"[{day_str}] 做 T 买回：{t_buy_qty} 股 @ {close:.3f} | {t_buy_reason}")
+                # 检查涨停
+                prev_close_t = float(df_daily_raw.loc[:ts].iloc[-2]['Close']) if len(df_daily_raw.loc[:ts]) >= 2 else close
+                open_price_t = float(daily_slice_raw['Open'].iloc[-1]) if 'Open' in daily_slice_raw.columns else close
+                limit_status_t = check_price_limit(open_price_t, close, prev_close_t)
+
+                if limit_status_t == 'rise_limit':
+                    logger.debug(f"[{day_str}] [{name}] 涨停无法做T买回，跳过")
+                else:
+                    estimated_price_t = close * 1.001
+                    t_buy_qty = int((cash / estimated_price_t / 1.0003) // lot_size) * lot_size
+                    if t_buy_qty > 0:
+                        # 应用交易成本
+                        actual_t_price, t_total_cost = apply_transaction_cost(close, 'BUY', t_buy_qty)
+                        cash -= t_total_cost
+                        shares += t_buy_qty
+
+                        # 记录交易成本
+                        total_slippage += t_buy_qty * close * 0.0005
+                        total_commission += max(actual_t_price * t_buy_qty * 0.000008, 0.5)
+
+                        trades.append(
+                            {
+                                'date': day_str,
+                                'action': 'BUY',
+                                'shares': int(t_buy_qty),
+                                'price': actual_t_price,
+                                'reason': t_buy_reason,
+                                'rsi_daily': daily['RSI'].iloc[-1] if 'RSI' in daily.columns else None,
+                                'rsi_weekly': rsi_weekly,
+                            }
+                        )
+                        logger.info(f"[{day_str}] 做 T 买回：{t_buy_qty} 股 @ {actual_t_price:.3f} (原价:{close:.3f}) | {t_buy_reason}")
 
         end_close = float(df_daily_raw.loc[trade_days[-1]]['Close'])
         final_value = cash + shares * end_close
@@ -645,12 +1024,27 @@ def run_backtest_history(
         strategy_return = (final_value / initial_cash - 1.0) * 100.0
         hold_return = (hold_value / initial_cash - 1.0) * 100.0
 
+        # 计算完整绩效指标
+        equity_df = pd.DataFrame(equity_curve).set_index('Date')
+        perf_metrics = calculate_performance_metrics_v2(equity_df, initial_cash)
+
         logger.info("=" * 60)
         logger.info(f"{name} ({symbol}) | {start_date} ~ {end_date}")
+        logger.info("=" * 60)
         logger.info(f"策略收益率: {strategy_return:.2f}%")
         logger.info(f"买入持有收益率: {hold_return:.2f}%")
         logger.info(f"策略超额收益: {strategy_return - hold_return:.2f}%")
-        logger.info(f"最大回撤: {max_dd:.2f}%")
+        logger.info("-" * 60)
+        if perf_metrics:
+            logger.info(f"年化收益率: {perf_metrics.get('年化收益率(%)', 0):.2f}%")
+            logger.info(f"最大回撤: {perf_metrics.get('最大回撤(%)', 0):.2f}%")
+            logger.info(f"夏普比率: {perf_metrics.get('夏普比率', 0):.2f}")
+            logger.info(f"卡玛比率: {perf_metrics.get('卡玛比率', 0):.2f}")
+        logger.info("-" * 60)
+        logger.info(f"交易成本统计:")
+        logger.info(f"  滑点成本: {total_slippage:.2f} 元")
+        logger.info(f"  手续费: {total_commission:.2f} 元")
+        logger.info(f"  总成本: {total_slippage + total_commission:.2f} 元")
         logger.info("-" * 60)
         if not trades:
             logger.info("无交易记录")
@@ -666,9 +1060,15 @@ def run_backtest_history(
                 '买入持有(%)': round(hold_return, 2),
                 '超额收益(%)': round(strategy_return - hold_return, 2),
                 '最大回撤(%)': round(max_dd, 2),
+                '夏普比率': perf_metrics.get('夏普比率', 0) if perf_metrics else 0,
+                '卡玛比率': perf_metrics.get('卡玛比率', 0) if perf_metrics else 0,
                 '交易次数': len(trades),
+                '交易成本(元)': round(total_slippage + total_commission, 2),
             }
         )
+
+        # ===== 保存局部高点日志文件 =====
+        local_high_logger.save_log_file()
 
         # 绘制K线图
         plot_kline_with_trades(df_daily_raw, trades, name)
@@ -1199,7 +1599,7 @@ def plot_kline_with_trades(df_daily, trades, name, output_dir=None):
 
 if __name__ == '__main__':
     run_backtest_history(
-        start_date='2025-01-01',
+        start_date='2023-11-10',
         end_date='2026-04-03',
         initial_cash=1000000,
         lot_size=100,
