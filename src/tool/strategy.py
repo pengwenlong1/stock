@@ -1,9 +1,58 @@
+# -*- coding: utf-8 -*-
+"""
+策略核心模块 (strategy.py)
+
+本模块实现了量化交易的核心策略逻辑，包括：
+1. 局部高点检测：使用 scipy.signal.find_peaks 科学检测峰值
+2. 顶背离检测：基于局部高点的 MACD 背离判断
+3. 卖出信号判断：周线/日线顶背离 + RSI 阶梯减仓
+4. 买入信号判断：RSI 超卖判断
+
+技术指标计算已移至 tools.py 模块。
+
+核心设计理念：
+- 使用 find_peaks 进行科学的局部高点检测，避免主观判断
+- 周线顶背离触发清仓（sell_flag=1）
+- 日线顶背离触发减仓1/3（sell_flag=3）
+- RSI 阶梯减仓：根据周线 RSI 峰值分级别减仓
+
+卖出优先级：sell_flag 1 > 2 > 3
+- sell_flag=1: 清仓（周线顶背离/月线顶背离/RSI>90）
+- sell_flag=2: 卖出1/2（RSI>85）
+- sell_flag=3: 卖出1/3（日线顶背离/RSI>80）
+
+作者：量化交易团队
+创建日期：2024
+"""
 import pandas as pd
 import talib
 import logging
 import os
+import numpy as np
+from scipy.signal import find_peaks
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+
+# 导入技术指标计算函数
+try:
+    from strategy.tools import (
+        calculate_indicators,
+        calculate_rsi,
+        calculate_macd,
+        calculate_sma,
+        calculate_atr,
+        calculate_indicators_light
+    )
+except ImportError:
+    # 当作为主模块运行时，使用绝对导入
+    from tools import (
+        calculate_indicators,
+        calculate_rsi,
+        calculate_macd,
+        calculate_sma,
+        calculate_atr,
+        calculate_indicators_light
+    )
 
 # 使用 backtest 的 logger，确保日志输出到同一位置
 logger = logging.getLogger('backtest')
@@ -14,8 +63,37 @@ class LocalHighLogger:
     """
     局部高点日志记录器
 
-    用于收集和存储日线、周线的局部高点信息，
-    并在回测结束时生成独立的日志文件。
+    【功能说明】
+    用于收集和存储日线、周线的局部高点信息，并在回测结束时生成独立的日志文件。
+    该类支持：
+    1. 记录日线/周线局部高点的价格、MACD柱值、日期
+    2. 记录顶背离事件的形成、生效、失效状态
+    3. 在回测结束时生成结构化的日志文件
+
+    【使用场景】
+    - 在回测过程中，每个交易日调用 update_daily_highs() 和 update_weekly_highs()
+    - 检测到顶背离时，调用 record_daily_divergence() 或 record_weekly_divergence()
+    - 回测结束时，调用 save_log_file() 生成日志文件
+
+    【日志文件格式】
+    文件名：{股票代码}.log
+    内容包含：
+    - 日线局部高点列表（序号、日期、价格、MACD柱值、索引、确认日期）
+    - 周线局部高点列表
+    - 日线顶背离事件记录（形成、生效、失效）
+    - 周线顶背离事件记录
+    - 统计信息（高点总数、背离事件数）
+
+    Attributes:
+        ticker: 股票代码
+        name: 股票名称
+        log_dir: 日志目录路径
+        daily_highs: 日线局部高点列表
+        weekly_highs: 周线局部高点列表
+        daily_divergence_events: 日线顶背离事件记录
+        weekly_divergence_events: 周线顶背离事件记录
+        start_date: 回测开始日期
+        end_date: 回测结束日期
     """
 
     def __init__(self, ticker: str, name: str, log_dir: str):
@@ -23,9 +101,9 @@ class LocalHighLogger:
         初始化局部高点日志记录器
 
         Args:
-            ticker: 股票代码
-            name: 股票名称
-            log_dir: 日志目录路径
+            ticker: 股票代码（如 '512480'）
+            name: 股票名称（如 '半导体ETF'）
+            log_dir: 日志目录路径（如 'main/logs'）
         """
         self.ticker = ticker
         self.name = name
@@ -230,71 +308,53 @@ class LocalHighLogger:
         return ", ".join(parts) if parts else "无详情"
 
 
-# ===== 顶背离计算参数配置（根据 conditions.md） =====
+# ===== 顶背离计算参数配置 =====
+# 【配置说明】
+# distance: 相邻峰值之间的最小间隔（单位：K线根数）
+#   - 日线 distance=10：表示两个局部高点之间至少相隔10个交易日
+#   - 周线 distance=10：表示两个周线局部高点之间至少相隔10周
+#   - 该参数用于避免密集小波动被识别为多个高点
 DIVERGENCE_CONFIG = {
     'daily': {
-        'drop_threshold': 0.05,      # 局部高点确认跌幅：5%
-        'min_interval': 5,           # 最小间隔K线数：5根
-        'invalidation_bars': 10,     # 背离失效时间：10天
-        'trend_reversal_pct': 0.10,  # 反向趋势失效：价格下跌10%
+        'distance': 10,  # 局部高点最小间隔：10根K线（约2周交易日）
     },
     'weekly': {
-        'drop_threshold': 0.08,      # 局部高点确认跌幅：8%（且需要均线跌破确认）
-        'min_interval': 5,           # 最小间隔K线数：5周
-        'invalidation_bars': 10,     # 背离失效时间：10周
-        'trend_reversal_pct': 0.10,  # 反向趋势失效：价格下跌10%
+        'distance': 10,  # 局部高点最小间隔：10周（约2.5个月）
     }
 }
 
-def calculate_indicators(data):
-    """计算技术指标 (对齐国内行情软件算法)"""
-    if data is None or data.empty:
-        return None
 
-    # 1. 计算 RSI (使用国内通用的 SMA(x, N, 1) 逻辑)
-    close = data['Close']
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-
-    # 国内 RSI 公式：RSI = SMA(MAX(Close-LC,0),N,1) / SMA(ABS(Close-LC),N,1) * 100
-    ma_up = up.ewm(alpha=1/6, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/6, adjust=False).mean()
-    data['RSI'] = ma_up / (ma_up + ma_down) * 100
-
-    # 2. 计算 MACD (12, 26, 9)
-    data['MACD'], data['MACD_signal'], data['MACD_hist'] = talib.MACD(
-        data['Close'], fastperiod=12, slowperiod=26, signalperiod=9
-    )
-    data['MACD_hist'] = data['MACD_hist'] * 2
-
-    # 3. 计算 SAR (10, 2, 20)
-    data['SAR'] = talib.SAR(data['High'], data['Low'], acceleration=0.02, maximum=0.2)
-
-    # 4. 计算 5 日均线和 10 日均线 (用于替代 SAR 和死叉判断)
-    data['MA5'] = talib.SMA(data['Close'], timeperiod=5)
-    data['MA10'] = talib.SMA(data['Close'], timeperiod=10)
-
-    return data
-
-
-def detect_local_highs(data, drop_threshold=0.05):
+def detect_local_highs(data, distance=10, drop_threshold=None):
     """
-    检测局部高点（无未来函数实现）
+    检测局部高点（使用 scipy.signal.find_peaks）
 
-    核心原则：不提前预判，只在价格下跌5%后才确认之前的高点是局部高点。
+    【功能说明】
+    使用科学算法检测价格序列中的局部高点（峰值）。
+    相比传统的高低点判断方法，find_peaks 能够更准确地识别真正的峰值，
+    并通过参数控制峰值的质量和间隔。
 
-    检测流程：
-    1. 维护一个"候选高点"变量（价格、位置、MACD柱值）
-    2. 当价格创新高时，更新候选高点
-    3. 当价格从候选高点下跌达到5%时：
-       - 确认该候选高点是有效的局部高点
-       - 将高点存入局部高点列表
-       - 将当前价格设为新的候选高点
+    【算法参数】
+    - distance: 相邻峰值之间的最小间隔，避免密集小波动被识别为多个高点
+    - prominence: 峰值的突出度，使用 ATR 动态计算，过滤不重要的小峰
+
+    【ATR动态 prominence 说明】
+    prominence = 0.8 * ATR(14)
+    使用 ATR（平均真实波幅）来动态设置 prominence：
+    - ATR 反映了当前市场的波动水平
+    - 波动大的市场需要更大的 prominence 才能识别为有效高点
+    - 0.8 倍 ATR 是经验值，可根据实际情况调整
+
+    【返回值说明】
+    返回局部高点列表，每个元素包含：
+    - index: 高点在数据中的索引位置
+    - price: 高点价格（High 值）
+    - macd_hist: 高点对应的 MACD 柱值
+    - date: 高点日期（如果数据有日期索引）
 
     Args:
-        data: 包含 High, MACD_hist 的数据
-        drop_threshold: 下跌阈值，默认5%
+        data: DataFrame，包含 High, Low, Close, MACD_hist 列
+        distance: 相邻峰值之间的最小间隔（单位：K线根数），默认10
+        drop_threshold: 保留参数，兼容旧接口，不再使用
 
     Returns:
         list: 局部高点列表，每个元素是字典：
@@ -305,72 +365,73 @@ def detect_local_highs(data, drop_threshold=0.05):
                   'date': 高点日期（如果有索引）
               }
     """
-    if data is None or len(data) < 10:
+    if data is None or len(data) < 20:
         return []
 
     high = data['High'].values if 'High' in data.columns else data['Close'].values
-    macd_hist = data['MACD_hist'].values if 'MACD_hist' in data.columns else None
+    low = data['Low'].values if 'Low' in data.columns else data['Close'].values
     close = data['Close'].values
+    macd_hist = data['MACD_hist'].values if 'MACD_hist' in data.columns else None
+
+    # 计算ATR用于动态设置prominence
+    try:
+        atr = talib.ATR(high, low, close, timeperiod=14)
+        # 使用最新有效的ATR值
+        valid_atr = atr[~np.isnan(atr)]
+        if len(valid_atr) > 0:
+            prominence = 0.8 * valid_atr[-1]
+        else:
+            prominence = None
+    except Exception:
+        prominence = None
+
+    # 使用 find_peaks 检测局部高点
+    peaks_idx, properties = find_peaks(
+        high,
+        distance=distance,
+        prominence=prominence
+    )
 
     local_highs = []
-
-    # 候选高点初始化
-    candidate_high_price = high[0]
-    candidate_high_index = 0
-    candidate_high_macd = macd_hist[0] if macd_hist is not None else 0
-
-    for i in range(1, len(high)):
-        current_high = high[i]
-
-        # 检查是否从候选高点下跌了5%
-        drop_pct = (candidate_high_price - close[i]) / candidate_high_price
-
-        if drop_pct >= drop_threshold:
-            # 确认候选高点是有效的局部高点
-            local_high = {
-                'index': candidate_high_index,
-                'price': candidate_high_price,
-                'macd_hist': candidate_high_macd,
-            }
-            # 添加日期（如果有）
-            if hasattr(data, 'index'):
-                try:
-                    local_high['date'] = data.index[candidate_high_index]
-                except:
-                    pass
-
-            local_highs.append(local_high)
-
-            # 重置候选高点为当前K线
-            candidate_high_price = high[i]
-            candidate_high_index = i
-            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
-
-        elif current_high > candidate_high_price:
-            # 价格创新高，更新候选高点
-            candidate_high_price = current_high
-            candidate_high_index = i
-            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
-
-    # 注意：最后一个候选高点没有被确认（因为还没有下跌5%），不加入列表
+    for idx in peaks_idx:
+        local_high = {
+            'index': idx,
+            'price': high[idx],
+            'macd_hist': macd_hist[idx] if macd_hist is not None else 0,
+        }
+        # 添加日期（如果有）
+        if hasattr(data, 'index'):
+            try:
+                local_high['date'] = data.index[idx]
+            except:
+                pass
+        local_highs.append(local_high)
 
     return local_highs
 
 
-def detect_weekly_local_highs(data_weekly, data_daily, drop_threshold=0.08):
+def detect_weekly_local_highs(data_weekly, data_daily=None, distance=10, drop_threshold=None):
     """
-    检测周线局部高点（无未来函数实现）
+    检测周线局部高点（使用 scipy.signal.find_peaks）
 
-    根据 conditions.md 文档最新规则：
-    - 当价格从候选高点下跌达到 **8%** 且 **5日均线跌破10日均线** 时：
-      - 确认该候选高点是有效的周线级别局部高点
-      - 将高点存入局部高点列表
-      - 将当前价格设为新的周线级别候选高点
+    【功能说明】
+    与 detect_local_highs 类似，但专门用于周线数据的局部高点检测。
+    周线局部高点对于判断中期趋势转折点非常重要。
+
+    【周线 vs 日线局部高点】
+    - 日线局部高点：用于判断短期顶背离
+    - 周线局部高点：用于判断中期顶背离，信号更可靠但滞后性更强
+
+    【参数说明】
+    - data_weekly: 周线数据，需要先计算技术指标
+    - data_daily: 日线数据（保留参数，用于未来扩展均线跌破确认逻辑）
+    - distance: 相邻峰值之间的最小间隔（单位：周K线数），默认10周
 
     Args:
-        data_weekly: 周线数据，包含 High, MACD_hist
-        data_daily: 日线数据，包含 MA5, MA10（用于均线跌破判断）
-        drop_threshold: 下跌阈值，默认8%
+        data_weekly: 周线数据，包含 High, Low, Close, MACD_hist
+        data_daily: 日线数据（保留参数，兼容旧接口）
+        distance: 相邻峰值之间的最小间隔（单位：周K线数），默认10
+        drop_threshold: 保留参数，兼容旧接口，不再使用
 
     Returns:
         list: 周线局部高点列表，每个元素是字典：
@@ -378,178 +439,135 @@ def detect_weekly_local_highs(data_weekly, data_daily, drop_threshold=0.08):
                   'index': 高点在周线数据中的索引,
                   'price': 高点价格,
                   'macd_hist': 高点MACD柱值,
-                  'date': 高点日期,
-                  'confirm_date': 确认日期
+                  'date': 高点日期
               }
     """
-    if data_weekly is None or len(data_weekly) < 10:
+    if data_weekly is None or len(data_weekly) < 20:
         return []
 
-    if data_daily is None or 'MA5' not in data_daily.columns or 'MA10' not in data_daily.columns:
-        # 如果没有日线均线数据，回退到普通的局部高点检测
-        return detect_local_highs(data_weekly, drop_threshold)
-
     high = data_weekly['High'].values if 'High' in data_weekly.columns else data_weekly['Close'].values
-    macd_hist = data_weekly['MACD_hist'].values if 'MACD_hist' in data_weekly.columns else None
+    low = data_weekly['Low'].values if 'Low' in data_weekly.columns else data_weekly['Close'].values
     close = data_weekly['Close'].values
+    macd_hist = data_weekly['MACD_hist'].values if 'MACD_hist' in data_weekly.columns else None
+
+    # 计算ATR用于动态设置prominence
+    try:
+        atr = talib.ATR(high, low, close, timeperiod=14)
+        valid_atr = atr[~np.isnan(atr)]
+        if len(valid_atr) > 0:
+            prominence = 0.8 * valid_atr[-1]
+        else:
+            prominence = None
+    except Exception:
+        prominence = None
+
+    # 使用 find_peaks 检测局部高点
+    peaks_idx, properties = find_peaks(
+        high,
+        distance=distance,
+        prominence=prominence
+    )
 
     local_highs = []
-
-    # 候选高点初始化
-    candidate_high_price = high[0]
-    candidate_high_index = 0
-    candidate_high_macd = macd_hist[0] if macd_hist is not None else 0
-
-    for i in range(1, len(high)):
-        current_high = high[i]
-
-        # 检查是否从候选高点下跌了8%
-        drop_pct = (candidate_high_price - close[i]) / candidate_high_price
-
-        if drop_pct >= drop_threshold:
-            # 价格已下跌8%，现在检查是否有均线跌破确认
-            # 获取当前周线对应的日期
-            current_weekly_date = None
+    for idx in peaks_idx:
+        local_high = {
+            'index': idx,
+            'price': high[idx],
+            'macd_hist': macd_hist[idx] if macd_hist is not None else 0,
+        }
+        # 添加日期（如果有）
+        if hasattr(data_weekly, 'index'):
             try:
-                current_weekly_date = data_weekly.index[i]
+                local_high['date'] = data_weekly.index[idx]
             except:
                 pass
-
-            # 检查日线数据中是否有均线跌破
-            ma_breakdown_found = False
-            confirm_date = None
-
-            if current_weekly_date is not None:
-                # 在日线数据中查找对应时间段内的均线跌破
-                # 遍历日线数据，找到该周线日期对应的日线
-                for j in range(len(data_daily) - 1, -1, -1):
-                    daily_date = data_daily.index[j]
-                    # 检查日线日期是否在当前周线日期附近（同一天或之后一周内）
-                    if daily_date >= current_weekly_date or j == len(data_daily) - 1:
-                        # 检查是否有均线跌破
-                        if j >= 1:
-                            ma5_prev = data_daily['MA5'].iloc[j-1]
-                            ma10_prev = data_daily['MA10'].iloc[j-1]
-                            ma5_curr = data_daily['MA5'].iloc[j]
-                            ma10_curr = data_daily['MA10'].iloc[j]
-
-                            if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
-                                ma_breakdown_found = True
-                                confirm_date = daily_date
-                                break
-
-                        # 向前搜索更多日线（最多5天）
-                        for k in range(1, 6):
-                            if j + k < len(data_daily):
-                                ma5_prev = data_daily['MA5'].iloc[j+k-1]
-                                ma10_prev = data_daily['MA10'].iloc[j+k-1]
-                                ma5_curr = data_daily['MA5'].iloc[j+k]
-                                ma10_curr = data_daily['MA10'].iloc[j+k]
-
-                                if ma5_prev >= ma10_prev and ma5_curr < ma10_curr:
-                                    ma_breakdown_found = True
-                                    confirm_date = data_daily.index[j+k]
-                                    break
-
-                        if ma_breakdown_found:
-                            break
-
-            if ma_breakdown_found:
-                # 确认候选高点是有效的周线局部高点
-                local_high = {
-                    'index': candidate_high_index,
-                    'price': candidate_high_price,
-                    'macd_hist': candidate_high_macd,
-                    'confirm_date': confirm_date
-                }
-
-                # 添加日期
-                if hasattr(data_weekly, 'index'):
-                    try:
-                        local_high['date'] = data_weekly.index[candidate_high_index]
-                    except:
-                        pass
-
-                local_highs.append(local_high)
-
-                # 重置候选高点为当前K线
-                candidate_high_price = high[i]
-                candidate_high_index = i
-                candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
-
-        elif current_high > candidate_high_price:
-            # 价格创新高，更新候选高点
-            candidate_high_price = current_high
-            candidate_high_index = i
-            candidate_high_macd = macd_hist[i] if macd_hist is not None else 0
+        local_highs.append(local_high)
 
     return local_highs
 
 
-def detect_divergence_v2(data, timeframe='daily', min_interval=None, drop_threshold=None):
+def detect_divergence_v2(data, timeframe='daily', distance=None):
     """
-    检测顶背离（新版本，基于局部高点列表）
+    检测顶背离（基于 scipy.signal.find_peaks 局部高点检测）
 
-    根据 conditions.md 文档的顶背离判断逻辑：
+    【顶背离定义】
+    顶背离是指股价创新高，但技术指标（MACD）未创新高的现象。
+    这通常表明上涨动能减弱，是潜在的转折信号。
 
-    一、局部高点检测：
-    - 维护"候选高点"变量
-    - 当价格创新高时，更新候选高点
-    - 当价格从候选高点下跌≥5%时，确认候选高点是有效的局部高点
+    【顶背离形成条件】（需同时满足）：
+    1. 存在上一个局部高点 A（前高）
+    2. 当前局部高点 B 的最高价 > 高点 A 的最高价（股价创新高）
+    3. 高点 B 的 MACD 柱值 < 高点 A 的 MACD 柱值（MACD 柱缩短）
 
-    二、顶背离形成条件（需同时满足）：
-    1. 存在上一个已确认的局部高点A
-    2. 高点B与高点A的K线间隔：日线≥5根，周线≥5周
-    3. 高点B的最高价 > 高点A的最高价
-    4. 高点B的MACD柱值 < 高点A的MACD柱值
+    【图示】
+    价格：
+         B (新高)
+        /\
+       /  \
+      /    \
+     /      \      A (前高)
+    /        \    /\
+   /          \  /  \
+  /            \/    \
 
-    三、连续背离处理：
-    - 如果已有背离标志为1，又形成新的背离C且C比B更背离：更新背离记录为C，覆盖旧背离
+    MACD柱：
+         A (柱值大)
+        /\
+       /  \
+      /    \
+     /      \      B (柱值小)
+    /        \    /\
+   /          \  /  \
+
+    【顶背离信号解读】
+    - 顶背离形成：建议关注，等待确认信号
+    - 5日均线下穿10日均线：顶背离生效，触发卖出
+
+    【参数说明】
+    - data: 需要先调用 calculate_indicators() 计算指标
+    - timeframe: 时间周期，影响 distance 参数的选择
+    - distance: 局部高点检测的最小间隔，None 则使用配置值
 
     Args:
-        data: 包含 High, MACD_hist 的数据
+        data: DataFrame，包含 High, Low, Close, MACD_hist 的数据
         timeframe: 时间周期，'daily' 或 'weekly'
-        min_interval: 两个高点之间的最小间隔，None则使用配置值
-        drop_threshold: 局部高点检测的下跌阈值，None则使用配置值
+        distance: 局部高点检测的最小间隔，None则使用配置值
 
     Returns:
         dict or False: 如果检测到顶背离返回详细信息字典，否则返回 False
+        返回字典包含：
+        - detected: True
+        - prev_high: 前高价格
+        - recent_high: 当前高价格
+        - prev_macd: 前高MACD柱值
+        - recent_macd: 当前高MACD柱值
+        - interval: 两高点间隔（K线数）
+        - prev_high_idx: 前高索引
+        - recent_high_idx: 当前高索引
+        - timeframe: 时间周期
+        - local_highs: 所有局部高点列表
+        - prev_high_date: 前高日期（如果有）
+        - recent_high_date: 当前高日期（如果有）
     """
     # 使用配置参数
     config = DIVERGENCE_CONFIG.get(timeframe, DIVERGENCE_CONFIG['daily'])
-    if min_interval is None:
-        min_interval = config['min_interval']
-    if drop_threshold is None:
-        drop_threshold = config['drop_threshold']
+    if distance is None:
+        distance = config['distance']
 
-    local_highs = detect_local_highs(data, drop_threshold)
+    local_highs = detect_local_highs(data, distance=distance)
 
     if len(local_highs) < 2:
         return False
 
-    # 根据 conditions.md 文档要求：
-    # 从已确认的局部高点列表中，从最近向更早遍历，寻找第一个满足以下条件的高点 A：
-    # - A 的日期比 B 早
-    # - B 与 A 的K线间隔：日线 ≥ 5根，周线 ≥ 5周
-    # - B 的最高价 > A 的最高价
-    # - B 的MACD柱值 < A 的MACD柱值
-
     # 取最新的局部高点 B
-    recent_high = local_highs[-1]  # B点（较晚，最新确认）
+    recent_high = local_highs[-1]
 
     # 从最近向更早遍历，找到第一个满足背离条件的 A
     for i in range(len(local_highs) - 2, -1, -1):
-        prev_high = local_highs[i]  # A点（更早）
-
-        # 检查间隔：B的索引 - A的索引 >= min_interval
-        interval = recent_high['index'] - prev_high['index']
-        if interval < min_interval:
-            # 间隔不足，继续向更早遍历
-            continue
+        prev_high = local_highs[i]
 
         # 检查价格创新高：B的价格 > A的价格
         if recent_high['price'] <= prev_high['price']:
-            # 价格未创新高，继续向更早遍历
             continue
 
         # 检查MACD柱缩短：B的MACD < A的MACD
@@ -557,10 +575,10 @@ def detect_divergence_v2(data, timeframe='daily', min_interval=None, drop_thresh
             continue
 
         if recent_high['macd_hist'] >= prev_high['macd_hist']:
-            # MACD未缩短，继续向更早遍历
             continue
 
         # 找到满足条件的 A，顶背离形成
+        interval = recent_high['index'] - prev_high['index']
         result = {
             'detected': True,
             'prev_high': prev_high['price'],
@@ -571,7 +589,7 @@ def detect_divergence_v2(data, timeframe='daily', min_interval=None, drop_thresh
             'prev_high_idx': prev_high['index'],
             'recent_high_idx': recent_high['index'],
             'timeframe': timeframe,
-            'local_highs': local_highs,  # 返回局部高点列表用于后续判断
+            'local_highs': local_highs,
         }
 
         # 添加日期信息
@@ -582,99 +600,101 @@ def detect_divergence_v2(data, timeframe='daily', min_interval=None, drop_thresh
 
         return result
 
-    # 遍历完所有历史高点，没有找到满足条件的 A
     return False
 
 
 def check_all_invalidation_conditions(data, divergence_info, timeframe='daily'):
     """
-    检查顶背离是否失效（三种失效条件）
+    检查顶背离是否失效
 
-    根据 conditions.md 文档，满足以下任一条件，背离标志清零：
+    【功能说明】
+    顶背离形成后，需要持续监控是否失效。失效条件包括：
+    1. 强信号失效：出现新的局部高点 C，且 C 的价格 > B 的价格 且 C 的 MACD 柱值 > B 的 MACD 柱值
+       这表示上涨动能重新增强，之前的背离信号不再有效
 
-    1. 强信号失效：出现新的局部高点C，且C的价格 > B的价格 且 C的MACD柱值 > B的MACD柱值
-    2. 时间衰减失效：背离形成后，超过10个交易日（日线）或10周（周线）仍未触发均线跌破确认
-    3. 反向趋势失效：价格从高点B下跌超过10%且未反弹（视为趋势逆转）
+    【强信号失效图示】
+    价格：       C (新高)
+                /\
+               /  \
+              /    \
+    价格：   B      \
+            /\      \
+           /  \      \
+          /    \      \
+         /      \      A
+        /        \    /\
+       /          \  /  \
+      /            \/    \
+
+    MACD柱：    C (柱值更大)
+                /\
+               /  \
+              /    \
+    MACD柱：  B      \
+            /\      /
+           /  \    /
+          /    \  /
+         /      \/
+        /        A
+       /        (柱值更小)
+
+    【连续背离更新】
+    如果形成新的更强背离（A→C 比 A→B 更强），则更新背离记录。
+    "更强"定义为：MACD 柱缩短幅度更大
 
     Args:
-        data: 数据
-        divergence_info: 背离信息字典（包含 recent_high_idx, recent_high 等）
+        data: 数据（当前未使用，保留扩展）
+        divergence_info: 背离信息字典，来自 detect_divergence_v2 的返回值
         timeframe: 时间周期，'daily' 或 'weekly'
 
     Returns:
         tuple: (is_invalidated, invalidation_reason, updated_info)
-               - is_invalidated: 是否失效
-               - invalidation_reason: 失效原因（字符串），如果未失效则为 None
-               - updated_info: 更新后的背离信息（如果需要更新）
+        - is_invalidated: bool，是否失效
+        - invalidation_reason: str or None，失效原因
+        - updated_info: dict or None，更新后的背离信息（连续背离时）
     """
     if divergence_info is None or not divergence_info.get('detected'):
         return False, None, divergence_info
 
-    config = DIVERGENCE_CONFIG.get(timeframe, DIVERGENCE_CONFIG['daily'])
     local_highs = divergence_info.get('local_highs', [])
-    recent_high_idx = divergence_info.get('recent_high_idx', 0)
-    recent_high_price = divergence_info.get('recent_high', 0)
 
-    curr_idx = len(data) - 1
-    close = data['Close'].values
-
-    # ===== 失效条件1：时间衰减失效 =====
-    bars_since_divergence = curr_idx - recent_high_idx
-    if bars_since_divergence > config['invalidation_bars']:
-        return True, f"时间衰减失效：背离形成后超过{config['invalidation_bars']}根K线仍未确认", None
-
-    # ===== 失效条件2：反向趋势失效 =====
-    # 价格从高点B下跌超过10%且未反弹
-    current_price = close[curr_idx]
-    drop_from_high = (recent_high_price - current_price) / recent_high_price
-    if drop_from_high > config['trend_reversal_pct']:
-        return True, f"反向趋势失效：价格从高点{recent_high_price:.3f}下跌{drop_from_high*100:.1f}%超过{config['trend_reversal_pct']*100}%", None
-
-    # ===== 失效条件3：强信号失效 =====
-    # 检查是否有新的局部高点C使顶背离失效
+    # ===== 强信号失效 =====
     if len(local_highs) >= 3:
-        high_b = local_highs[-2]  # 之前的最近高点B
-        high_c = local_highs[-1]  # 新确认的高点C
+        high_b = local_highs[-2]
+        high_c = local_highs[-1]
 
-        # 失效条件：C价格 > B价格 且 C的MACD > B的MACD
         if high_c['price'] > high_b['price'] and high_c['macd_hist'] > high_b['macd_hist']:
             return True, f"强信号失效：新高点价格{high_c['price']:.3f} > {high_b['price']:.3f}, MACD柱{high_c['macd_hist']:.4f} > {high_b['macd_hist']:.4f}", None
 
     # ===== 检查连续背离（更新背离记录） =====
-    # 如果有新的局部高点，检查是否形成新的更强背离
     if len(local_highs) >= 3:
-        high_a = local_highs[-3]  # A点（更早）
-        high_c = local_highs[-1]  # C点（最新）
+        high_a = local_highs[-3]
+        high_c = local_highs[-1]
 
-        # 检查是否形成新的背离（C相对于A）
-        interval_ac = high_c['index'] - high_a['index']
-        if interval_ac >= config['min_interval']:
-            if high_c['price'] > high_a['price'] and high_c['macd_hist'] < high_a['macd_hist']:
-                # 新的背离形成，检查是否比原背离更强
-                # "更强"的定义：MACD差距更大
-                original_divergence_strength = divergence_info.get('prev_macd', 0) - divergence_info.get('recent_macd', 0)
-                new_divergence_strength = high_a['macd_hist'] - high_c['macd_hist']
+        if high_c['price'] > high_a['price'] and high_c['macd_hist'] < high_a['macd_hist']:
+            original_divergence_strength = divergence_info.get('prev_macd', 0) - divergence_info.get('recent_macd', 0)
+            new_divergence_strength = high_a['macd_hist'] - high_c['macd_hist']
 
-                if new_divergence_strength > original_divergence_strength:
-                    # 更新背离记录为C，覆盖旧背离
-                    updated_info = {
-                        'detected': True,
-                        'prev_high': high_a['price'],
-                        'recent_high': high_c['price'],
-                        'prev_macd': high_a['macd_hist'],
-                        'recent_macd': high_c['macd_hist'],
-                        'interval': interval_ac,
-                        'prev_high_idx': high_a['index'],
-                        'recent_high_idx': high_c['index'],
-                        'timeframe': timeframe,
-                        'local_highs': local_highs,
-                    }
-                    if 'date' in high_a:
-                        updated_info['prev_high_date'] = high_a['date']
-                    if 'date' in high_c:
-                        updated_info['recent_high_date'] = high_c['date']
+            if new_divergence_strength > original_divergence_strength:
+                interval_ac = high_c['index'] - high_a['index']
+                updated_info = {
+                    'detected': True,
+                    'prev_high': high_a['price'],
+                    'recent_high': high_c['price'],
+                    'prev_macd': high_a['macd_hist'],
+                    'recent_macd': high_c['macd_hist'],
+                    'interval': interval_ac,
+                    'prev_high_idx': high_a['index'],
+                    'recent_high_idx': high_c['index'],
+                    'timeframe': timeframe,
+                    'local_highs': local_highs,
+                }
+                if 'date' in high_a:
+                    updated_info['prev_high_date'] = high_a['date']
+                if 'date' in high_c:
+                    updated_info['recent_high_date'] = high_c['date']
 
-                    return False, "连续背离更新：新的背离比原背离更强，更新背离记录", updated_info
+                return False, "连续背离更新：新的背离比原背离更强", updated_info
 
     return False, None, divergence_info
 
@@ -782,11 +802,35 @@ def get_divergence_details(data, type='top', timeframe='daily'):
 
 def is_ma5_breakdown(data, window=3):
     """
-    检测 5 日均线跌破 10 日均线 (替代死叉和 SAR 跌破判断)
+    检测 5 日均线跌破 10 日均线
+
+    【功能说明】
+    检测短期趋势转弱信号：5 日均线下穿 10 日均线。
+    该信号用于确认顶背离生效，是卖出信号的触发条件。
+
+    【均线跌破图示】
+    MA5:  -----\        /----
+                 \    /
+                  \  /
+                   \/  ← 下穿点（卖出信号）
+                  /\
+                 /  \
+    MA10: -------/    \----
+
+    【检测逻辑】
+    在最近 window 天内，检查是否存在：
+    - 昨天：MA5 >= MA10
+    - 今天：MA5 < MA10
+
+    【参数说明】
+    - window: 检测窗口，默认3天，避免错过信号
 
     Args:
-        data: 包含 MA5 和 MA10 的数据
+        data: DataFrame，包含 MA5 和 MA10 列
         window: 检测最近 N 天内是否有跌破
+
+    Returns:
+        bool: 如果检测到均线跌破返回 True，否则返回 False
     """
     if data is None or len(data) < window + 1:
         return False
@@ -862,14 +906,26 @@ def get_rsi_flag_level(max_rsi):
     """
     根据 RSI 值获取 flag 等级
 
-    RSI 等级规则：
-    - flag=0: RSI <= 80 (正常状态)
-    - flag=1: 80 < RSI <= 85 (周线 RSI 超买，一级警戒)
-    - flag=2: 85 < RSI <= 90 (周线 RSI 严重超买，二级警戒)
-    - flag=3: RSI > 90 (周线 RSI 极度超买，三级警戒/清仓信号)
+    【功能说明】
+    根据周线 RSI 峰值确定风险等级（flag），用于阶梯式减仓策略。
+    RSI 值越高，风险越大，卖出比例越高。
+
+    【RSI flag 等级规则】
+    ┌────────────┬─────────┬────────────────────────────────┐
+    │  RSI 范围  │  flag   │           含义                 │
+    ├────────────┼─────────┼────────────────────────────────┤
+    │  RSI ≤ 80  │    0    │  正常状态，无超买风险          │
+    │ 80 < RSI ≤85│    1   │  一级警戒，轻微超买            │
+    │ 85 < RSI ≤90│    2   │  二级警戒，严重超买            │
+    │  RSI > 90  │    3    │  三级警戒，极度超买（清仓信号）│
+    └────────────┴─────────┴────────────────────────────────┘
+
+    【重要说明】
+    RSI 峰值是从上次 5 日均线跌破 10 日均线后到当前的最大值。
+    这样可以追踪整个上涨过程中的最高风险水平。
 
     Args:
-        max_rsi: 周线 RSI 峰值（从上次 5 日均线跌破 10 日均线后到当前的最大值）
+        max_rsi: 周线 RSI 峰值（从上次均线跌破后到当前的最大值）
 
     Returns:
         int: RSI flag 等级 (0/1/2/3)
@@ -924,39 +980,21 @@ def update_rsi_flag_v2(current_rsi_flag, current_weekly_rsi, rsi_peak_after_brea
 
 def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
     """
-    检测周线顶背离形成（使用新的局部高点检测逻辑）
+    检测周线顶背离形成（使用 find_peaks 局部高点检测）
 
-    根据 conditions.md 文档最新规则：
-
-    一、周线局部高点检测：
-    - 维护"候选高点"变量
-    - 当价格创新高时，更新候选高点
-    - 当价格从候选高点下跌≥8%且5日均线跌破10日均线时，确认候选高点是有效的周线局部高点
-
-    二、顶背离形成条件：
+    顶背离形成条件：
     1. 局部高点列表中至少有2个高点
-    2. 取最近确认的两个高点A（较早）和B（较晚）
-    3. 高点B与高点A的K线间隔≥5周
-    4. 高点B的最高价 > 高点A的最高价
-    5. 高点B的MACD柱值 < 高点A的MACD柱值
+    2. 高点B的最高价 > 高点A的最高价
+    3. 高点B的MACD柱值 < 高点A的MACD柱值
 
-    三、背离失效条件（满足任一条件，背离标志清零）：
-    1. 强信号失效：出现新的局部高点C，且C的价格 > B的价格 且 C的MACD柱值 > B的MACD柱值
-    2. 时间衰减失效：背离形成后，超过10周仍未触发均线跌破确认
-    3. 反向趋势失效：价格从高点B下跌超过10%且未反弹
-
-    四、连续背离处理：
-    - 如果已有背离标志为1，又形成新的背离C且C比B更背离：更新背离记录为C，覆盖旧背离
-
-    五、顶背离生效：
-    - diverse_week_flag = 1
-    - 5日均线跌破10日均线
-    - 清仓
+    背离失效条件：
+    1. 强信号失效：新的局部高点价格更高且MACD更强
+    2. 反向趋势失效：价格从高点下跌超过10%
 
     Args:
-        data_weekly: 周线数据（包含 High, MACD_hist 等）
+        data_weekly: 周线数据（包含 High, Low, Close, MACD_hist 等）
         rsi_state: RSI 状态字典
-        data_daily: 日线数据（用于均线跌破判断，周线局部高点确认必需）
+        data_daily: 日线数据（保留参数）
 
     Returns:
         tuple: (diverse_week_flag, is_valid_divergence, sell_signal, sell_fraction, messages, updated_rsi_state)
@@ -976,8 +1014,8 @@ def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
     # 使用配置参数
     config = DIVERGENCE_CONFIG['weekly']
 
-    # 使用专门的周线局部高点检测函数（需要日线均线数据确认）
-    local_highs = detect_weekly_local_highs(data_weekly, data_daily, drop_threshold=config['drop_threshold'])
+    # 使用 find_peaks 检测周线局部高点
+    local_highs = detect_weekly_local_highs(data_weekly, data_daily, distance=config['distance'])
 
     # 当前K线索引
     curr_idx = len(data_weekly) - 1
@@ -1025,28 +1063,18 @@ def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
             messages.append(f"周线顶背离更新：{invalidation_reason}")
 
     # ===== 顶背离形成判断 =====
-    # 根据 conditions.md 文档要求：
-    # 从已确认的局部高点列表中，从最近向更早遍历，寻找第一个满足背离条件的高点 A
-    # 调试日志：显示函数被调用
     logger.info(f"[周线顶背离检测] 函数被调用: diverse_week_flag={diverse_week_flag}, local_highs数量={len(local_highs)}")
 
     if diverse_week_flag == 0 and len(local_highs) >= 2:
         # 取最新的局部高点 B
-        recent_high = local_highs[-1]  # B点（较晚，最新确认）
+        recent_high = local_highs[-1]
 
         # 从最近向更早遍历，找到第一个满足背离条件的 A
         for i in range(len(local_highs) - 2, -1, -1):
-            prev_high = local_highs[i]  # A点（更早）
-
-            # 检查间隔：B的索引 - A的索引 >= min_interval
-            interval = recent_high['index'] - prev_high['index']
-            if interval < config['min_interval']:
-                # 间隔不足，继续向更早遍历
-                continue
+            prev_high = local_highs[i]
 
             # 检查价格创新高：B的价格 > A的价格
             if recent_high['price'] <= prev_high['price']:
-                # 价格未创新高，继续向更早遍历
                 continue
 
             # 检查MACD柱缩短：B的MACD < A的MACD
@@ -1054,12 +1082,11 @@ def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
                 continue
 
             if recent_high['macd_hist'] >= prev_high['macd_hist']:
-                # MACD未缩短，继续向更早遍历
                 continue
 
             # 找到满足条件的 A，顶背离形成
             diverse_week_flag = 1
-            # 记录顶背离信息
+            interval = recent_high['index'] - prev_high['index']
             updated_rsi_state['div_prev_high'] = prev_high['price']
             updated_rsi_state['div_prev_macd'] = prev_high['macd_hist']
             updated_rsi_state['div_recent_high'] = recent_high['price']
@@ -1076,19 +1103,15 @@ def detect_weekly_top_divergence(data_weekly, rsi_state, data_daily=None):
                     div_weekly_date = None
             updated_rsi_state['div_weekly_date'] = div_weekly_date
 
-            # 添加日期信息到 prev_high
             prev_high_date = prev_high.get('date', None)
-
             div_date_str = str(div_weekly_date)[:10] if div_weekly_date else "未知"
             prev_date_str = str(prev_high_date)[:10] if prev_high_date else "未知"
             messages.append(f"周线顶背离形成 ({div_date_str}): 股价{recent_high['price']:.3f} > {prev_high['price']:.3f} ({prev_date_str}), MACD柱{recent_high['macd_hist']:.4f} < {prev_high['macd_hist']:.4f}")
             logger.info(f"[周线顶背离检测] 检测到背离: A({prev_date_str}, 价{prev_high['price']:.3f}, MACD{prev_high['macd_hist']:.4f}) vs B({div_date_str}, 价{recent_high['price']:.3f}, MACD{recent_high['macd_hist']:.4f})")
 
-            # 找到第一个满足条件的 A 后退出循环
             break
 
         if diverse_week_flag == 0:
-            # 没有找到满足条件的 A，记录调试日志
             logger.info(f"[周线顶背离检测] 遍历所有历史高点后未找到满足背离条件的配对")
 
     # ===== 顶背离生效判断（5日均线跌破10日均线） =====
@@ -1249,17 +1272,40 @@ def get_sell_fraction_by_flag(rsi_flag):
     """
     根据 RSI flag 获取卖出比例
 
-    RSI flag 与卖出比例对应关系：
-    - flag=0: 无卖出信号 (RSI <= 80)
-    - flag=1: 卖出 1/3 (80 < RSI <= 85)
-    - flag=2: 卖出 1/2 (85 < RSI <= 90)
-    - flag=3: 清仓 (RSI > 90)
+    【功能说明】
+    根据周线 RSI 风险等级（flag）确定卖出比例。
+    这是"阶梯式减仓"策略的核心：风险越高，减仓越多。
+
+    【RSI flag 与卖出比例对应关系】
+    ┌────────┬─────────────┬──────────────────────────┐
+    │  flag  │  卖出比例   │         触发条件         │
+    ├────────┼─────────────┼──────────────────────────┤
+    │   0    │    0%       │  RSI ≤ 80，无超买风险    │
+    │   1    │    33.3%    │  80 < RSI ≤ 85           │
+    │   2    │    50%      │  85 < RSI ≤ 90           │
+    │   3    │    100%     │  RSI > 90，清仓信号      │
+    └────────┴─────────────┴──────────────────────────┘
+
+    【阶梯式减仓逻辑】
+    当 5 日均线跌破 10 日均线时：
+    1. 检查从上次均线跌破后的周线 RSI 峰值
+    2. 根据峰值确定 flag 等级
+    3. 根据 flag 等级确定卖出比例
+    4. 卖出后重置 flag 为 0
+
+    【与顶背离的关系】
+    - 周线顶背离：清仓（100%）
+    - 日线顶背离：减仓1/3（33.3%）
+    - RSI阶梯减仓：根据 flag 等级确定比例
+    - 多信号同时触发时，取最大卖出比例
 
     Args:
         rsi_flag: RSI flag 等级 (0/1/2/3)
 
     Returns:
         tuple: (卖出比例，卖出建议描述)
+        - 卖出比例：0.0 ~ 1.0
+        - 卖出建议描述：str or None
     """
     if rsi_flag == 3:
         return 1.0, "建议卖出全部剩余仓位"
@@ -1275,46 +1321,81 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
     """
     判断卖出信号
 
-    卖出策略 1 (sell_id=1):
-    1. 减仓 1/3：日线顶背离 + 5 日均线下穿 10 日均线
-    2. 清仓：周线顶背离 + 5 日均线下穿 10 日均线
-    3. 阶梯减仓：5 日均线下穿 10 日均线，根据周线 RSI flag 决定卖出比例
+    【核心功能】
+    综合多种技术信号判断是否需要卖出，返回卖出建议和比例。
 
-    卖出策略 2 (sell_id=2):
-    1. 减仓 1/3：日线顶背离 + 5 日均线下穿 10 日均线
-    2. 清仓：周线顶背离 + 5 日均线下穿 10 日均线
-    3. 阶梯减仓：5 日均线下穿 10 日均线，根据周线 RSI flag 决定卖出比例
+    【卖出策略 sell_id=1】（按照优先级从高到低执行）
+    ┌───────────────────────────────────────────────────────────────────┐
+    │  优先级  │         触发条件              │  sell_flag  │  操作   │
+    ├───────────────────────────────────────────────────────────────────┤
+    │   最高   │ 周线顶背离 + 5日均线下穿10日均线│     1      │  清仓   │
+    │   最高   │ 月线顶背离 + 5日均线下穿10日均线│     1      │  清仓   │
+    │   高     │ 周线RSI>90 + 5日均线下穿10日均线│     1      │  清仓   │
+    │   中     │ 周线RSI>85 + 5日均线下穿10日均线│     2      │ 卖出1/2 │
+    │   低     │ 日线顶背离 + 5日均线下穿10日均线│     3      │ 卖出1/3 │
+    │   低     │ 周线RSI>80 + 5日均线下穿10日均线│     3      │ 卖出1/3 │
+    └───────────────────────────────────────────────────────────────────┘
 
-    RSI flag 更新规则：
-    - 初始化：rsi_flag = 0
-    - 周线 RSI > 80: rsi_flag = 1
-    - 周线 RSI > 85: rsi_flag = 2
-    - 周线 RSI > 90: rsi_flag = 3
-    - 当 5 日均线跌破 10 日均线时：rsi_flag = 0 (重置)
+    【sell_flag 优先级】
+    sell_flag 用于判断卖出优先级：1 > 2 > 3
+    当多个卖出信号同时触发时，执行最高优先级的操作。
 
-    周线顶背离判断逻辑：
-    - 当前最高点股价比之前局部最高点股价高，且 MACD 红柱子比之前局部最高点 MACD 柱子短
-      → 顶背离形成，diverse_week_flag = 1
-    - 后续股价继续新高且 MACD 柱子比之前局部最高点高
-      → 顶背离失效（假背离），diverse_week_flag = 0
-    - 5 日均线跌破 10 日均线
-      → 顶背离生效，diverse_week_flag = 0，同时卖出规定比例的金额
+    【RSI flag 状态机】
+    ┌──────────────────────────────────────────────────────────────────┐
+    │                     RSI flag 状态转换图                          │
+    ├──────────────────────────────────────────────────────────────────┤
+    │                                                                  │
+    │   初始化: rsi_flag = 0                                           │
+    │       │                                                          │
+    │       ▼                                                          │
+    │   ┌──────────┐     RSI > 80     ┌──────────┐                    │
+    │   │ flag = 0 │ ───────────────► │ flag = 1 │                    │
+    │   │ (正常)   │                   │ (警戒1)  │                    │
+    │   └──────────┘                   └──────────┘                    │
+    │       ▲                               │                          │
+    │       │                               │ RSI > 85                 │
+    │       │                               ▼                          │
+    │       │                         ┌──────────┐                    │
+    │       │         RSI > 90        │ flag = 2 │                    │
+    │       │      ┌─────────────────►│ (警戒2)  │                    │
+    │       │      │                  └──────────┘                    │
+    │       │      │                       │                          │
+    │       │      │                       │ RSI > 90                 │
+    │       │      │                       ▼                          │
+    │       │      │                 ┌──────────┐                    │
+    │       │      │                 │ flag = 3 │                    │
+    │       │      │                 │ (清仓)   │                    │
+    │       │      │                 └──────────┘                    │
+    │       │      │                      │                           │
+    │       │      └──────────────────────┤                           │
+    │       │                             │                           │
+    │       └─────────────────────────────┘                           │
+    │              5日均线下穿10日均线                                 │
+    │              (触发卖出后重置)                                    │
+    └──────────────────────────────────────────────────────────────────┘
+
+    【周线顶背离判断逻辑】
+    1. 当前最高点股价 > 前一个局部最高点股价（股价创新高）
+    2. 当前最高点 MACD 红柱 < 前一个局部最高点 MACD 红柱（MACD 柱缩短）
+    3. → 顶背离形成，diverse_week_flag = 1
+    4. 后续股价继续新高且 MACD 柱也创新高 → 顶背离失效（假背离）
+    5. 5 日均线跌破 10 日均线 → 顶背离生效，触发卖出
 
     Args:
-        stock_name: 股票名称
-        judge_sell_ids: 卖出策略 ID 列表
-        all_data: 包含 weekly, daily, 120min 数据的字典
+        stock_name: 股票名称，用于日志输出
+        judge_sell_ids: 卖出策略 ID 列表，如 [1]
+        all_data: 包含 weekly, daily, 120min, monthly 数据的字典
         rsi_flag: 可选，外部传入的 RSI flag 状态 (0/1/2/3)
         rsi_peak_map: 可选，外部传入的 RSI 峰值字典 {'max_rsi': float, 'ma5_breakdown': bool}
-                      用于更精确地控制 RSI flag 状态
         rsi_state: 可选，RSI 状态字典，用于跟踪位置 1-5 和周线顶背离状态
         check_weekly_divergence: 是否检查周线顶背离（默认 True）
+        rsi_peak_info: 可选，RSI 峰值信息，用于日志显示
 
     Returns:
-        messages: 卖出信号列表
-        rsi_flag: 当前的 RSI flag 状态（如果均线跌破则返回 0，否则保持原值或根据 RSI 更新）
+        messages: 卖出信号列表，每个元素是一条卖出建议消息
+        rsi_flag: 当前的 RSI flag 状态（如果均线跌破则返回 0）
         sar_breakdown: 是否发生了 5 日均线下穿 10 日均线
-        rsi_state: 更新后的 RSI 状态字典（仅当传入 rsi_state 时返回）
+        rsi_state: 更新后的 RSI 状态字典
     """
     messages = []
     data_weekly = all_data.get('weekly')
@@ -1512,9 +1593,19 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
             # 策略 1: 优先使用 120 分钟均线跌破 (用于实时监控)，如果没有则回退到日线 (用于回测)
             data_cross = data_120min if data_120min is not None else data_daily
 
-            # ===== 优先级1: 清仓信号 - 周线顶背离 =====
-            # 使用 grace_bars=5，允许周线顶背离在最近 5 周内持续有效
-            if detect_divergence(data_weekly, 'top', grace_bars=5) and is_ma5_breakdown(data_cross, window=3):
+            # ===== 计算各信号的 sell_flag =====
+            # sell_flag=1: 清仓, sell_flag=2: 卖出1/2, sell_flag=3: 卖出1/3
+            # 优先级: 1 > 2 > 3
+
+            sell_flag = 0  # 0 表示无信号
+            sell_msg_detail = None
+
+            ma_breakdown = is_ma5_breakdown(data_cross, window=3)
+            ma_breakdown_daily = is_ma5_breakdown(data_daily, window=3)
+
+            # 1. 周线顶背离 + 均线跌破 → sell_flag=1
+            if detect_divergence(data_weekly, 'top', grace_bars=5) and ma_breakdown:
+                sell_flag = 1
                 cross_name = "120 分钟" if data_120min is not None else "日线"
                 weekly_div_details = get_divergence_details(data_weekly, 'top')
                 if weekly_div_details and weekly_div_details.get('detected'):
@@ -1525,107 +1616,99 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
                     else:
                         div_date_str = "未知"
                     prev_high = weekly_div_details.get('prev_high', 0)
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 周线顶背离 ({div_date_str}) + {cross_name}5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
+                    sell_msg_detail = f"周线顶背离 ({div_date_str}) + {cross_name}5日均线下穿10日均线确认，前高={prev_high:.3f}，建议清仓"
                 else:
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [周线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议清仓")
+                    sell_msg_detail = f"周线顶背离 + {cross_name}5日均线下穿10日均线，建议清仓"
 
-            # ===== 优先级2: 清仓信号 - 月线顶背离 =====
-            elif data_monthly is not None and detect_divergence(data_monthly, 'top') and is_ma5_breakdown(data_daily, window=3):
-                monthly_div_details = get_divergence_details(data_monthly, 'top')
-                if monthly_div_details and monthly_div_details.get('detected'):
-                    monthly_high_idx = monthly_div_details.get('recent_high_idx', 0)
-                    if monthly_high_idx > 0 and len(data_monthly.index) > monthly_high_idx:
-                        div_date = data_monthly.index[monthly_high_idx]
-                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
-                    else:
-                        div_date_str = "未知"
-                    prev_high = monthly_div_details.get('prev_high', 0)
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 月线顶背离 ({div_date_str}) + 日线 5 日均线下穿 10 日均线确认，前高={prev_high:.3f}，建议清仓")
-                else:
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): 触发 [月线顶背离 + 日线 5 日均线下穿 10 日均线]，建议清仓")
-
-            # ===== 优先级3: 清仓信号 - RSI flag=3（周线RSI>90）=====
-            elif rsi_flag == 3 and is_ma5_breakdown(data_daily, window=3):
-                sar_breakdown = True
-                ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
-                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
-
-                rsi_detail_msg = ""
-                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
-                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
-                    peak_date_str = rsi_peak_info['peak_date']
-                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
-                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
-                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
-                    # 兜底逻辑：从最近20周找峰值
-                    weekly_rsi_values = data_weekly['RSI'].values
-                    weekly_dates = data_weekly.index
-                    curr_idx = len(weekly_rsi_values) - 1
-                    lookback = min(20, len(weekly_rsi_values))
-                    recent_start = max(curr_idx - lookback + 1, 0)
-                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
-                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
-                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
-                        peak_date = weekly_dates[peak_idx_in_slice]
-                        if hasattr(peak_date, 'strftime'):
-                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+            # 2. 月线顶背离 + 均线跌破 → sell_flag=1
+            elif data_monthly is not None and detect_divergence(data_monthly, 'top') and ma_breakdown_daily:
+                if sell_flag < 1:  # 只有当前优先级更低时才更新
+                    sell_flag = 1
+                    monthly_div_details = get_divergence_details(data_monthly, 'top')
+                    if monthly_div_details and monthly_div_details.get('detected'):
+                        monthly_high_idx = monthly_div_details.get('recent_high_idx', 0)
+                        if monthly_high_idx > 0 and len(data_monthly.index) > monthly_high_idx:
+                            div_date = data_monthly.index[monthly_high_idx]
+                            div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
                         else:
-                            peak_date_str = str(peak_date)[:10]
-                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
-
-                messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): 触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag=3{rsi_detail_msg}，建议清仓")
-                rsi_flag = 0
-
-            # ===== 优先级4: 减仓信号 - 日线顶背离 =====
-            elif detect_divergence(data_daily, 'top', grace_bars=3) and is_ma5_breakdown(data_cross, window=3):
-                cross_name = "120 分钟" if data_120min is not None else "日线"
-                daily_div_details = get_divergence_details(data_daily, 'top')
-                if daily_div_details and daily_div_details.get('detected'):
-                    daily_high_idx = daily_div_details.get('recent_high_idx', 0)
-                    if daily_high_idx > 0 and len(data_daily.index) > daily_high_idx:
-                        div_date = data_daily.index[daily_high_idx]
-                        div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
+                            div_date_str = "未知"
+                        prev_high = monthly_div_details.get('prev_high', 0)
+                        sell_msg_detail = f"月线顶背离 ({div_date_str}) + 日线5日均线下穿10日均线确认，前高={prev_high:.3f}，建议清仓"
                     else:
-                        div_date_str = "未知"
-                    prev_high = daily_div_details.get('prev_high', 0)
-                    recent_high = daily_div_details.get('recent_high', 0)
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-顶背离均线): 日线顶背离 ({div_date_str}) + {cross_name}5 日均线下穿 10 日均线确认，前高={prev_high:.3f}, 高={recent_high:.3f}, 建议卖出 1/3")
-                else:
-                    messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): 触发 [日线顶背离 + {cross_name}5 日均线下穿 10 日均线]，建议卖出 1/3")
+                        sell_msg_detail = f"月线顶背离 + 日线5日均线下穿10日均线，建议清仓"
 
-            # ===== 优先级5: 阶梯式减仓 - RSI flag=1或2 =====
-            elif rsi_flag > 0 and is_ma5_breakdown(data_daily, window=3):
-                sar_breakdown = True
-                ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
-                ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+            # 3. 阶梯式减仓 - 周线RSI>90 → sell_flag=1
+            if rsi_flag == 3 and ma_breakdown_daily:
+                if sell_flag < 1:
+                    sell_flag = 1
+                    sar_breakdown = True
+                    ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
+                    ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+                    rsi_detail_msg = ""
+                    if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                        peak_date_str = rsi_peak_info['peak_date']
+                        peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                        rsi_detail_msg = f" (RSI峰值:{peak_date_str}={peak_rsi:.2f})"
+                    sell_msg_detail = f"日线5日均线下穿10日均线 ({ma5_breakdown_day})，周线RSI>90{rsi_detail_msg}，建议清仓"
+                    rsi_flag = 0
 
-                rsi_detail_msg = ""
-                # 优先使用传入的峰值信息（已正确过滤重置后的周线数据）
-                if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
-                    peak_date_str = rsi_peak_info['peak_date']
-                    peak_rsi = rsi_peak_info.get('peak_rsi', 0)
-                    rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
-                elif data_weekly is not None and 'RSI' in data_weekly.columns and len(data_weekly) > 0:
-                    # 兜底逻辑：从最近20周找峰值
-                    weekly_rsi_values = data_weekly['RSI'].values
-                    weekly_dates = data_weekly.index
-                    curr_idx = len(weekly_rsi_values) - 1
-                    lookback = min(20, len(weekly_rsi_values))
-                    recent_start = max(curr_idx - lookback + 1, 0)
-                    if len(weekly_rsi_values[recent_start:curr_idx+1]) > 0:
-                        peak_idx_in_slice = recent_start + weekly_rsi_values[recent_start:curr_idx+1].argmax()
-                        peak_rsi = weekly_rsi_values[peak_idx_in_slice]
-                        peak_date = weekly_dates[peak_idx_in_slice]
-                        if hasattr(peak_date, 'strftime'):
-                            peak_date_str = peak_date.strftime('%Y-%m-%d')
+            # 4. 日线顶背离 + 均线跌破 → sell_flag=3
+            if detect_divergence(data_daily, 'top', grace_bars=3) and ma_breakdown:
+                if sell_flag < 3:  # 只有当前优先级更低时才更新
+                    sell_flag = 3
+                    cross_name = "120 分钟" if data_120min is not None else "日线"
+                    daily_div_details = get_divergence_details(data_daily, 'top')
+                    if daily_div_details and daily_div_details.get('detected'):
+                        daily_high_idx = daily_div_details.get('recent_high_idx', 0)
+                        if daily_high_idx > 0 and len(data_daily.index) > daily_high_idx:
+                            div_date = data_daily.index[daily_high_idx]
+                            div_date_str = div_date.strftime('%Y-%m-%d') if hasattr(div_date, 'strftime') else str(div_date)[:10]
                         else:
-                            peak_date_str = str(peak_date)[:10]
-                        rsi_detail_msg = f" (RSI 峰值:{peak_date_str}={peak_rsi:.2f})"
+                            div_date_str = "未知"
+                        prev_high = daily_div_details.get('prev_high', 0)
+                        recent_high = daily_div_details.get('recent_high', 0)
+                        sell_msg_detail = f"日线顶背离 ({div_date_str}) + {cross_name}5日均线下穿10日均线确认，前高={prev_high:.3f}, 高={recent_high:.3f}，建议卖出1/3"
+                    else:
+                        sell_msg_detail = f"日线顶背离 + {cross_name}5日均线下穿10日均线，建议卖出1/3"
 
-                sell_fraction, sell_msg = get_sell_fraction_by_flag(rsi_flag)
-                trigger_reason = f"触发 [日线 5 日均线下穿 10 日均线 ({ma5_breakdown_day})]，周线 RSI flag={rsi_flag}{rsi_detail_msg}"
-                messages.append(f"【{stock_name}】卖出信号 (策略 1-阶梯): {trigger_reason}，{sell_msg}")
-                rsi_flag = 0
+            # 5. 阶梯式减仓 - 周线RSI>85 → sell_flag=2
+            if rsi_flag == 2 and ma_breakdown_daily:
+                if sell_flag < 2:
+                    sell_flag = 2
+                    sar_breakdown = True
+                    ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
+                    ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+                    rsi_detail_msg = ""
+                    if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                        peak_date_str = rsi_peak_info['peak_date']
+                        peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                        rsi_detail_msg = f" (RSI峰值:{peak_date_str}={peak_rsi:.2f})"
+                    sell_msg_detail = f"日线5日均线下穿10日均线 ({ma5_breakdown_day})，周线RSI>85{rsi_detail_msg}，建议卖出1/2"
+                    rsi_flag = 0
+
+            # 6. 阶梯式减仓 - 周线RSI>80 → sell_flag=3
+            if rsi_flag == 1 and ma_breakdown_daily:
+                if sell_flag < 3:
+                    sell_flag = 3
+                    sar_breakdown = True
+                    ma5_breakdown_ts = find_ma5_breakdown_date(data_daily, window=3)
+                    ma5_breakdown_day = ma5_breakdown_ts.strftime('%Y-%m-%d') if ma5_breakdown_ts is not None and hasattr(ma5_breakdown_ts, 'strftime') else "未知"
+                    rsi_detail_msg = ""
+                    if rsi_peak_info is not None and rsi_peak_info.get('peak_date') is not None:
+                        peak_date_str = rsi_peak_info['peak_date']
+                        peak_rsi = rsi_peak_info.get('peak_rsi', 0)
+                        rsi_detail_msg = f" (RSI峰值:{peak_date_str}={peak_rsi:.2f})"
+                    sell_msg_detail = f"日线5日均线下穿10日均线 ({ma5_breakdown_day})，周线RSI>80{rsi_detail_msg}，建议卖出1/3"
+                    rsi_flag = 0
+
+            # 输出卖出信号
+            if sell_flag > 0 and sell_msg_detail:
+                if sell_flag == 1:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-清仓): {sell_msg_detail}")
+                elif sell_flag == 2:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): {sell_msg_detail}")
+                elif sell_flag == 3:
+                    messages.append(f"【{stock_name}】卖出信号 (策略 1-减仓): {sell_msg_detail}")
 
             # 均线跌破但没有任何信号时，重置 flag
             if ma5_breakdown_now:
@@ -1751,14 +1834,33 @@ def judge_sell(stock_name, judge_sell_ids, all_data, rsi_flag=None, rsi_peak_map
 
 def judge_t_buy(stock_name, judge_t_ids, all_data, get_index_data_func=None, has_sold_before=False):
     """
-    判断做 T 买回信号 (买回之前卖出的资金)
+    判断做 T 买回信号（买回之前卖出的资金）
+
+    【功能说明】
+    在卖出后，等待合适的时机买回。做 T 买回使用与普通买入相同的 RSI 条件，
+    但需要满足 has_sold_before=True（之前有过卖出操作）。
+
+    【做 T 策略说明】
+    "做 T" 是指在持有底仓的情况下，高抛低吸：
+    1. 高位卖出部分仓位（触发卖出信号）
+    2. 等待回调到超卖区域
+    3. 买回之前卖出的资金
+
+    【买入条件复用】
+    judge_t_ids 中的策略 ID 会复用 judge_buy 的逻辑：
+    - t_id=1: 日线 RSI < 20 且 周线 RSI < 25（保守型）
+    - t_id=2: 日线 RSI < 25 且 周线 RSI < 30（标准型）
+    - t_id=3: 创业板指 日线 RSI < 25（指数保护型）
+    - t_id=4: 日线 RSI < 20 且 周线 RSI < 20（极度保守型）
 
     Args:
         stock_name: 股票名称
-        judge_t_ids: 做 T 策略 ID 列表
+        judge_t_ids: 做 T 策略 ID 列表，如 [2]
         all_data: 包含 weekly, daily, 120min 数据的字典
-        get_index_data_func: 获取指数数据的函数
+        get_index_data_func: 获取指数数据的函数（用于指数保护型买入）
         has_sold_before: 是否之前有过卖出操作（关键参数）
+                        - True: 检查买入条件
+                        - False: 直接返回空列表，不触发买回
 
     Returns:
         messages: 做 T 买回信号列表（如果没有卖出过则返回空列表）
@@ -1812,17 +1914,43 @@ def judge_buy(stock_name, judge_buy_ids, all_data, get_index_data_func=None):
     """
     判断买入信号
 
-    买入条件：
-    - buy_id=1: 日线 RSI < 20 且 周线 RSI < 25 (保守型)
-    - buy_id=2: 日线 RSI < 25 且 周线 RSI < 30 (标准型)
-    - buy_id=3: 上证指数或创业板指 日线 RSI < 25 (指数保护型)
-    - buy_id=4: 日线 RSI < 20 且 周线 RSI < 20 (极度保守型)
+    【功能说明】
+    根据 RSI 超卖条件判断买入时机。买入策略分为多个级别，从保守到激进。
+
+    【买入策略详解】
+    ┌────────┬──────────┬───────────────────────────────────────────────────┐
+    │ buy_id │   类型   │                    触发条件                       │
+    ├────────┼──────────┼───────────────────────────────────────────────────┤
+    │   1    │ 保守型   │ 日线 RSI < 20 且 周线 RSI < 25                     │
+    │   2    │ 标准型   │ 日线 RSI < 25 且 周线 RSI < 30                     │
+    │   3    │ 指数保护 │ 创业板指(399006) 日线 RSI < 25                    │
+    │   4    │ 极度保守 │ 日线 RSI < 20 且 周线 RSI < 20                     │
+    │   5    │ 指数保护 │ 创业板指(399006) 日线 RSI < 20                    │
+    └────────┴──────────┴───────────────────────────────────────────────────┘
+
+    【策略选择建议】
+    - 保守型投资者：使用 buy_id=1 或 4，要求更严格的超卖条件
+    - 标准型投资者：使用 buy_id=2，平衡风险和机会
+    - 指数保护型：使用 buy_id=3 或 5，当大盘超卖时买入
+
+    【RSI 超卖区间说明】
+    - RSI < 20：极度超卖，反弹概率高
+    - RSI < 25：超卖，可能出现反弹
+    - RSI < 30：接近超卖，谨慎观察
+
+    【指数保护型买入】
+    当创业板指 RSI < 25（或 < 20）时，表明市场整体处于超卖状态，
+    此时买入个股的成功率更高。这是一种"顺势而为"的策略。
 
     Args:
-        stock_name: 股票名称
-        judge_buy_ids: 买入策略 ID 列表
+        stock_name: 股票名称，用于日志输出
+        judge_buy_ids: 买入策略 ID 列表，如 [1, 2]
         all_data: 包含 weekly, daily, 120min 数据的字典
-        get_index_data_func: 获取指数数据的函数
+        get_index_data_func: 获取指数数据的函数（用于指数保护型买入）
+                             函数签名：get_index_data_func(ticker) -> DataFrame
+
+    Returns:
+        messages: 买入信号列表，每个元素是一条买入建议消息
     """
     messages = []
     for buy_id in judge_buy_ids:
