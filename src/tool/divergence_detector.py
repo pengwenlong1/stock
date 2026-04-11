@@ -150,6 +150,13 @@ class DivergenceDetector:
         Returns:
             DataFrame
         """
+        # 延迟导入gm.api（确保在调用时才导入）
+        try:
+            from gm.api import history, set_token, ADJUST_PREV
+        except ImportError:
+            logger.error("未安装掘金量化SDK，请先安装: pip install gm")
+            return pd.DataFrame()
+
         logger.info(f"获取历史数据: {symbol}, {start_date} ~ {end_date}")
 
         df = history(
@@ -557,6 +564,7 @@ class DivergenceDetector:
             for idx in after_data.index:
                 if self.check_ma_cross_down(idx):
                     div.is_confirmed = True
+                    div.confirmation_date = idx  # 记录均线跌破生效日期
                     confirmed.append(div)
                     logger.info(f"[{div.timeframe.value}顶背离生效] {div.date.strftime('%Y-%m-%d')} 形成的背离 "
                                f"在 {idx.strftime('%Y-%m-%d')} 均线跌破确认生效")
