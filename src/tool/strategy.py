@@ -277,7 +277,8 @@ class TradingStrategy:
         weekly_rsi: float,
         state: StrategyState,
         has_new_cash: bool,
-        has_sold_cash: bool
+        has_sold_cash: bool,
+        index_daily_rsi: float = np.nan
     ) -> Optional[BuySignal]:
         """
         检查买入信号
@@ -289,6 +290,7 @@ class TradingStrategy:
             state: 当前策略状态
             has_new_cash: 是否有新资金（未进入市场的资金）
             has_sold_cash: 是否有卖出后待买回的资金
+            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
 
         Returns:
             BuySignal 或 None（无信号）
@@ -310,12 +312,12 @@ class TradingStrategy:
         # 首先检查 judge_buy_ids（优先级更高，买入新资金+买回卖出资金）
         if has_new_cash or has_sold_cash:
             for buy_id in self.buy_ids:
-                if self._check_single_buy_condition(buy_id, daily_rsi, weekly_rsi):
+                if self._check_single_buy_condition(buy_id, daily_rsi, weekly_rsi, index_daily_rsi):
                     # judge_buy_ids触发：买入新资金 + 买回卖出资金
                     return BuySignal(
                         triggered=True,
                         is_new_cash=True,  # 包含新资金买入
-                        reason=f"买入信号 (策略-buy_id={buy_id}): 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 买入新资金+买回卖出资金",
+                        reason=f"买入信号 (策略-buy_id={buy_id}): 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 指数RSI={index_daily_rsi:.2f}, 买入新资金+买回卖出资金",
                         daily_rsi=daily_rsi,
                         weekly_rsi=weekly_rsi
                     )
@@ -323,19 +325,19 @@ class TradingStrategy:
         # 然后检查 judge_t_ids（只买回卖出资金）
         if has_sold_cash:
             for t_id in self.t_ids:
-                if self._check_single_buy_condition(t_id, daily_rsi, weekly_rsi):
+                if self._check_single_buy_condition(t_id, daily_rsi, weekly_rsi, index_daily_rsi):
                     # judge_t_ids触发：只买回卖出资金
                     return BuySignal(
                         triggered=True,
                         is_new_cash=False,  # 不包含新资金
-                        reason=f"做T买回信号 (策略-t_id={t_id}): 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 只买回卖出资金",
+                        reason=f"做T买回信号 (策略-t_id={t_id}): 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 指数RSI={index_daily_rsi:.2f}, 只买回卖出资金",
                         daily_rsi=daily_rsi,
                         weekly_rsi=weekly_rsi
                     )
 
         return None
 
-    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float) -> bool:
+    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan) -> bool:
         """
         检查单个买入ID的条件
 
@@ -343,23 +345,38 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
+            index_daily_rsi: 创业板指数日线RSI值
 
         Returns:
             bool: 是否满足买入条件
         """
-        daily_thresh = RSI_THRESHOLDS['daily_buy'].get(buy_id, 25)
-        weekly_thresh = RSI_THRESHOLDS['weekly_buy'].get(buy_id, 30)
+        if buy_id == 1:
+            # 保守型：日RSI<20 且 周RSI<25
+            return daily_rsi < 20 and weekly_rsi < 25
 
-        if buy_id in [3, 5]:
-            # 指数保护型：需要创业板指数数据，暂不支持
-            logger.warning(f"buy_id={buy_id} 需要创业板指数数据，暂不支持")
-            return False
+        elif buy_id == 2:
+            # 标准型：日RSI<25 且 周RSI<30
+            return daily_rsi < 25 and weekly_rsi < 30
 
-        # 检查RSI条件
-        daily_ok = daily_rsi < daily_thresh
-        weekly_ok = weekly_rsi < weekly_thresh if weekly_thresh != 999 else True
+        elif buy_id == 3:
+            # 指数保护型：创业板指数日RSI<25
+            if np.isnan(index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少创业板指数RSI数据")
+                return False
+            return index_daily_rsi < 25
 
-        return daily_ok and weekly_ok
+        elif buy_id == 4:
+            # 极度保守型：日RSI<20 且 周RSI<20
+            return daily_rsi < 20 and weekly_rsi < 20
+
+        elif buy_id == 5:
+            # 指数保护型：创业板指数日RSI<20
+            if np.isnan(index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少创业板指数RSI数据")
+                return False
+            return index_daily_rsi < 20
+
+        return False
 
     def update_rsi_flag(
         self,
