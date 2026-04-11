@@ -142,10 +142,10 @@ class BacktestRunner:
         self._daily_divergences: List[DivergenceSignal] = []
         self._weekly_divergences: List[DivergenceSignal] = []
 
-        # 持仓状态
-        self._position: float = 0.0      # 当前持仓比例 (0-1)
-        self._cash: float = 1.0          # 剩余资金比例（新资金）
-        self._sold_cash: float = 0.0     # 卖出后待买回的资金比例（做T资金）
+        # 持仓状态（使用金额追踪）
+        self._shares: float = 0.0         # 持有股票数量
+        self._cash: float = initial_capital  # 剩余新资金（金额）
+        self._sold_cash: float = 0.0      # 卖出后待买回的资金（金额）
 
         # 交易记录
         self._trade_records: List[TradeRecord] = []
@@ -416,12 +416,16 @@ class BacktestRunner:
         return None
 
     def _execute_sell(self, date: pd.Timestamp, signal: SellSignal) -> None:
-        """执行卖出操作"""
+        """
+        执行卖出操作
+
+        使用金额追踪：卖出股票转为现金
+        """
         price = self._get_value_at_date(date, self._close_series)
-        if np.isnan(price) or self._position <= 0:
+        if np.isnan(price) or self._shares <= 0:
             return
 
-        # 计算卖出比例
+        # 计算卖出股票数量比例
         if signal.flag == SellFlag.CLEAR_ALL:
             sell_ratio = 1.0
         elif signal.flag == SellFlag.SELL_HALF:
@@ -429,11 +433,15 @@ class BacktestRunner:
         else:
             sell_ratio = 1.0 / 3.0
 
-        actual_sell_ratio = min(sell_ratio, self._position)
+        # 计算实际卖出股票数量
+        sell_shares = self._shares * sell_ratio
 
-        # 更新持仓（卖出资金进入待买回资金池）
-        self._position -= actual_sell_ratio
-        self._sold_cash += actual_sell_ratio  # 卖出资金进入做T资金池
+        # 计算卖出金额
+        sell_amount = sell_shares * price
+
+        # 更新持仓
+        self._shares -= sell_shares
+        self._sold_cash += sell_amount  # 卖出金额进入做T资金池
 
         # 调用策略重置状态
         self.strategy.reset_after_sell(self.state, signal.flag, date)
@@ -442,7 +450,7 @@ class BacktestRunner:
         trade = TradeRecord(
             date=date,
             action='sell',
-            amount=actual_sell_ratio,
+            amount=sell_shares,
             price=price,
             reason=signal.reason,
             daily_rsi=signal.daily_rsi,
@@ -451,14 +459,14 @@ class BacktestRunner:
         self._trade_records.append(trade)
 
         # 日志输出
-        shares = int(actual_sell_ratio * self.initial_capital / price)
-        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 卖出: {shares}股 @ {price:.3f} | "
-                        f"日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
+        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 卖出: {int(sell_shares)}股 @ {price:.3f} | "
+                        f"金额:{sell_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
 
     def _execute_buy(self, date: pd.Timestamp, signal: BuySignal) -> None:
         """
         执行买入操作
 
+        使用金额追踪：用现金买入股票
         买入规则：
         - is_new_cash=True (judge_buy_ids触发): 买入新资金 + 买回卖出资金
         - is_new_cash=False (judge_t_ids触发): 只买回卖出资金
@@ -470,25 +478,28 @@ class BacktestRunner:
         # 计算买入金额
         if signal.is_new_cash:
             # judge_buy_ids触发：买入新资金 + 买回卖出资金
-            buy_ratio = self._cash + self._sold_cash
+            buy_amount = self._cash + self._sold_cash
             self._cash = 0.0
             self._sold_cash = 0.0
         else:
             # judge_t_ids触发：只买回卖出资金
-            buy_ratio = self._sold_cash
+            buy_amount = self._sold_cash
             self._sold_cash = 0.0
 
-        if buy_ratio <= 0:
+        if buy_amount <= 0:
             return
 
+        # 计算买入股票数量
+        buy_shares = buy_amount / price
+
         # 更新持仓
-        self._position += buy_ratio
+        self._shares += buy_shares
 
         # 记录交易
         trade = TradeRecord(
             date=date,
             action='buy',
-            amount=buy_ratio,
+            amount=buy_shares,
             price=price,
             reason=signal.reason,
             daily_rsi=signal.daily_rsi,
@@ -497,10 +508,9 @@ class BacktestRunner:
         self._trade_records.append(trade)
 
         # 日志输出
-        shares = int(buy_ratio * self.initial_capital / price)
         buy_type = "新资金+买回" if signal.is_new_cash else "做T买回"
-        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入({buy_type}): {shares}股 @ {price:.3f} | "
-                        f"日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
+        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入({buy_type}): {int(buy_shares)}股 @ {price:.3f} | "
+                        f"金额:{buy_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
 
     def run_backtest(self) -> Dict:
         """
@@ -552,10 +562,10 @@ class BacktestRunner:
                 weekly_rsi=weekly_rsi,
                 ma_cross_down=ma_cross_down,
                 state=self.state,
-                position=self._position
+                position=self._shares * self._get_value_at_date(date, self._close_series) / self.initial_capital if self._shares > 0 else 0
             )
 
-            if sell_signal is not None and self._position > 0:
+            if sell_signal is not None and self._shares > 0:
                 self._execute_sell(date, sell_signal)
                 continue  # 卖出后当天不买入
 
@@ -600,8 +610,8 @@ class BacktestRunner:
 
         # 计算最终市值
         last_price = self._close_series.iloc[-1]
-        final_value = self._position * last_price + self._cash + self._sold_cash
-        total_return = (final_value - 1.0) * 100
+        final_value = self._shares * last_price + self._cash + self._sold_cash
+        total_return = (final_value - self.initial_capital) / self.initial_capital * 100
 
         # 计算基准收益率（买入持有策略）
         first_price = self._get_first_backtest_price()
@@ -622,7 +632,20 @@ class BacktestRunner:
             'benchmark_return': benchmark_return,
             'excess_return': excess_return,
             'max_drawdown': max_drawdown,
-            'final_position': self._position,
+            'final_shares': self._shares,
+            'final_cash': self._cash,
+            'final_sold_cash': self._sold_cash,
+            'trades': len(self._trade_records),
+            'buy_count': buy_count,
+            'sell_count': sell_count
+        }
+
+        return {
+            'total_return': total_return,
+            'benchmark_return': benchmark_return,
+            'excess_return': excess_return,
+            'max_drawdown': max_drawdown,
+            'final_shares': self._shares,
             'final_cash': self._cash,
             'final_sold_cash': self._sold_cash,
             'trades': len(self._trade_records),
@@ -657,20 +680,21 @@ class BacktestRunner:
             if np.isnan(price):
                 continue
 
-            # 简化计算：根据交易记录估算当日持仓
-            # 找到截至当日最后的持仓状态
-            position = 0.0
-            cash = 1.0
+            # 根据交易记录计算当日持仓状态
+            shares = 0.0
+            cash = self.initial_capital
+            sold_cash = 0.0
             for trade in self._trade_records:
                 if trade.date <= date:
                     if trade.action == 'buy':
-                        position += trade.amount
-                        cash -= trade.amount
+                        shares += trade.amount
+                        cash -= trade.amount * trade.price if trade.amount * trade.price <= cash else 0
+                        sold_cash -= trade.amount * trade.price if trade.amount * trade.price <= sold_cash else sold_cash
                     else:
-                        position -= trade.amount
-                        cash += trade.amount
+                        shares -= trade.amount
+                        sold_cash += trade.amount * trade.price
 
-            value = position * price + cash
+            value = shares * price + cash + sold_cash
             daily_values.append((date, value))
 
         if len(daily_values) < 2:
@@ -704,7 +728,7 @@ class BacktestRunner:
         for trade in self._trade_records:
             action = "买入" if trade.action == 'buy' else "卖出"
             self.logger.info(f"[{trade.date.strftime('%Y-%m-%d')}] {action}: "
-                           f"比例={trade.amount:.2%} | 价格={trade.price:.3f} | "
+                           f"股数={int(trade.amount)} | 价格={trade.price:.3f} | "
                            f"日RSI={trade.daily_rsi:.2f} | 周RSI={trade.weekly_rsi:.2f}")
             self.logger.info(f"  原因: {trade.reason}")
 
@@ -721,9 +745,9 @@ class BacktestRunner:
         self.logger.info(f"交易次数: {results['trades']} 次")
         self.logger.info(f"  买入: {results['buy_count']} 次")
         self.logger.info(f"  卖出: {results['sell_count']} 次")
-        self.logger.info(f"最终持仓比例: {results['final_position']:.2%}")
-        self.logger.info(f"剩余新资金: {results['final_cash']:.2%}")
-        self.logger.info(f"待买回资金: {results['final_sold_cash']:.2%}")
+        self.logger.info(f"最终持仓股数: {int(results['final_shares'])}股")
+        self.logger.info(f"剩余新资金: {results['final_cash']:.2f}元")
+        self.logger.info(f"待买回资金: {results['final_sold_cash']:.2f}元")
 
         self.logger.info("")
         self.logger.info(f"日志文件: {self.log_file}")
