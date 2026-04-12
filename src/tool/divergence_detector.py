@@ -818,17 +818,20 @@ def run_demo():
     logger.info("=" * 60)
 
     # 测试参数
-    symbol = 'SHSE.512480'
-    start_date = '2024-01-01'
+    symbol = 'SHSE.510880'
+    # 注意：需要包含预热数据（提前1年），否则峰点检测结果不同
+    start_date = '2023-01-01'  # 预热数据起始
+    test_start_date = '2024-01-01'  # 实际检测起始
     end_date = '2026-04-10'
 
-    logger.info(f"测试股票: 半导体ETF (512480)")
-    logger.info(f"测试时间: {start_date} ~ {end_date}")
+    logger.info(f"测试股票: 上证红利ETF (510880)")
+    logger.info(f"数据时间: {start_date} ~ {end_date} (包含预热)")
+    logger.info(f"检测时间: {test_start_date} ~ {end_date}")
 
     # 创建检测器
     detector = DivergenceDetector()
 
-    # 准备数据
+    # 准备数据（包含预热）
     df = detector.prepare_data(symbol, start_date, end_date)
 
     if df.empty:

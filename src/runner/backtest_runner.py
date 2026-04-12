@@ -25,7 +25,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -43,12 +43,13 @@ from src.tool.peak_detector import PeakDetector
 from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal, DivergenceType, TimeFrame
 
 try:
-    from gm.api import history, set_token, ADJUST_PREV, get_trading_dates
+    from gm.api import history, set_token, ADJUST_PREV, get_trading_dates, get_instruments
 except ImportError:
     history = None
     set_token = None
     ADJUST_PREV = None
     get_trading_dates = None
+    get_instruments = None
 
 
 # ==================== 数据结构 ====================
@@ -113,6 +114,10 @@ class BacktestRunner:
         self.judge_sell_ids = judge_sell_ids
         self.initial_capital = initial_capital
 
+        # 初始化掘金token并获取股票名称
+        self._init_gm_token()
+        self.stock_name = self._get_stock_name(symbol)
+
         # 创建策略实例
         self.strategy = TradingStrategy(
             buy_ids=judge_buy_ids,
@@ -148,10 +153,18 @@ class BacktestRunner:
         self._index_daily_rsi: Optional[pd.Series] = None
         self._index_symbol = 'SZSE.399006'  # 创业板指数
 
+        # 上证指数数据（用于buy_id=6和buy_id=7）
+        self._sh_index_daily_rsi: Optional[pd.Series] = None
+        self._sh_index_symbol = 'SHSE.000001'  # 上证指数
+
         # 背离检测器
         self._divergence_detector: Optional[DivergenceDetector] = None
         self._daily_divergences: List[DivergenceSignal] = []
         self._weekly_divergences: List[DivergenceSignal] = []
+
+        # 已处理的背离信号ID集合（避免重复触发）
+        self._processed_daily_divergences: Set[str] = set()
+        self._processed_weekly_divergences: Set[str] = set()
 
         # 持仓状态（使用金额追踪）
         self._shares: float = 0.0         # 持有股票数量
@@ -163,6 +176,38 @@ class BacktestRunner:
 
         # 日志配置
         self._setup_logging()
+
+    def _init_gm_token(self) -> None:
+        """初始化掘金token"""
+        config_path = os.path.join(project_root, 'config', 'settings.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                gm_token = config.get('gm_token')
+                if gm_token and set_token is not None:
+                    set_token(gm_token)
+
+    def _get_stock_name(self, symbol: str) -> str:
+        """
+        获取股票/ETF的中文名称
+
+        Args:
+            symbol: 股票代码（掘金格式，如 SHSE.512480）
+
+        Returns:
+            股票名称
+        """
+        try:
+            if get_instruments is None:
+                return "未知"
+
+            instruments = get_instruments(symbol)
+            if instruments:
+                ins = instruments[0]
+                return getattr(ins, 'sec_name', '未知')
+            return "未知"
+        except Exception:
+            return "未知"
 
     def _setup_logging(self) -> None:
         """配置日志"""
@@ -196,21 +241,12 @@ class BacktestRunner:
             self.logger.error("未安装掘金量化SDK，请先安装: pip install gm")
             return False
 
-        # 设置token
-        config_path = os.path.join(project_root, 'config', 'settings.json')
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                gm_token = config.get('gm_token')
-                if gm_token:
-                    set_token(gm_token)
-                    self.logger.info("掘金量化 SDK 初始化成功")
-                else:
-                    self.logger.error("配置文件中未找到 gm_token")
-                    return False
-        else:
-            self.logger.error(f"配置文件不存在: {config_path}")
+        # 设置token（确保已初始化）
+        if set_token is None:
+            self.logger.error("掘金SDK未正确导入")
             return False
+
+        self.logger.info("掘金量化 SDK 初始化成功")
 
         # 获取预热数据起始日期（提前1年）
         warmup_start = (pd.Timestamp(self.start_date) - pd.Timedelta(days=365)).strftime('%Y-%m-%d')
@@ -287,20 +323,48 @@ class BacktestRunner:
         self._calculate_index_rsi()
 
     def _calculate_index_rsi(self) -> None:
-        """计算创业板指数的日线RSI"""
-        # 检查是否需要指数保护型买入（buy_id=3或5）
-        need_index = any(id in [3, 5] for id in self.judge_buy_ids + self.judge_t_ids)
-        if not need_index:
-            self.logger.info("不需要创业板指数数据（无buy_id=3或5）")
-            return
-
-        self.logger.info(f"获取创业板指数数据: {self._index_symbol}")
-
+        """计算指数的日线RSI（创业板指数和上证指数）"""
         warmup_start = (pd.Timestamp(self.start_date) - pd.Timedelta(days=365)).strftime('%Y-%m-%d')
+
+        # 检查是否需要创业板指数（buy_id=3或5）
+        need_cyb_index = any(id in [3, 5] for id in self.judge_buy_ids + self.judge_t_ids)
+        if need_cyb_index:
+            self._calculate_single_index_rsi(
+                symbol=self._index_symbol,
+                index_name='创业板指数',
+                rsi_attr='_index_daily_rsi',
+                warmup_start=warmup_start
+            )
+        else:
+            self.logger.info("不需要创业板指数数据（无buy_id=3或5）")
+
+        # 检查是否需要上证指数（buy_id=6或7）
+        need_sh_index = any(id in [6, 7] for id in self.judge_buy_ids + self.judge_t_ids)
+        if need_sh_index:
+            self._calculate_single_index_rsi(
+                symbol=self._sh_index_symbol,
+                index_name='上证指数',
+                rsi_attr='_sh_index_daily_rsi',
+                warmup_start=warmup_start
+            )
+        else:
+            self.logger.info("不需要上证指数数据（无buy_id=6或7）")
+
+    def _calculate_single_index_rsi(self, symbol: str, index_name: str, rsi_attr: str, warmup_start: str) -> None:
+        """
+        计算单个指数的日线RSI
+
+        Args:
+            symbol: 指数代码
+            index_name: 指数名称（用于日志）
+            rsi_attr: RSI存储属性名
+            warmup_start: 预热数据起始日期
+        """
+        self.logger.info(f"获取{index_name}数据: {symbol}")
 
         try:
             index_data = history(
-                symbol=self._index_symbol,
+                symbol=symbol,
                 frequency='1d',
                 start_time=warmup_start + ' 09:00:00',
                 end_time=self.end_date + ' 15:30:00',
@@ -310,25 +374,26 @@ class BacktestRunner:
             )
 
             if index_data is None or index_data.empty:
-                self.logger.warning(f"获取创业板指数数据失败，buy_id=3/5将不可用")
+                self.logger.warning(f"获取{index_name}数据失败")
                 return
 
-            self.logger.info(f"获取到 {len(index_data)} 条创业板指数数据")
+            self.logger.info(f"获取到 {len(index_data)} 条{index_name}数据")
 
             index_data['eob'] = pd.to_datetime(index_data['eob'])
             index_close = pd.Series(
                 index_data['close'].values,
                 index=index_data['eob'],
-                name='Index_Close'
+                name=f'{index_name}_Close'
             )
 
-            # 计算创业板指数日线RSI(6)
+            # 计算日线RSI(6)
             rsi_calculator = RSI(period=6, freq='daily')
-            self._index_daily_rsi = rsi_calculator.calculate(index_close)
-            self.logger.info(f"创业板指数RSI计算完成: {self._index_daily_rsi.notna().sum()} 个有效值")
+            rsi_series = rsi_calculator.calculate(index_close)
+            setattr(self, rsi_attr, rsi_series)
+            self.logger.info(f"{index_name}RSI计算完成: {rsi_series.notna().sum()} 个有效值")
 
         except Exception as e:
-            self.logger.warning(f"计算创业板指数RSI失败: {e}，buy_id=3/5将不可用")
+            self.logger.warning(f"计算{index_name}RSI失败: {e}")
 
     def _init_divergence_detector(self) -> None:
         """初始化背离检测器"""
@@ -379,6 +444,12 @@ class BacktestRunner:
             return np.nan
         return self._get_value_at_date(date, self._index_daily_rsi)
 
+    def _get_sh_index_rsi_at_date(self, date: pd.Timestamp) -> float:
+        """获取指定日期的上证指数RSI值"""
+        if self._sh_index_daily_rsi is None:
+            return np.nan
+        return self._get_value_at_date(date, self._sh_index_daily_rsi)
+
     def _detect_ma_cross_down(self, date: pd.Timestamp) -> bool:
         """检测5日均线是否在当日跌破10日均线"""
         try:
@@ -405,12 +476,23 @@ class BacktestRunner:
             return False
 
     def _get_divergence_info(self, date: pd.Timestamp, timeframe: str) -> Optional[Dict]:
-        """获取指定日期的背离信息"""
+        """获取指定日期的背离信息（跳过已处理的信号）"""
         divergences = self._daily_divergences if timeframe == 'daily' else self._weekly_divergences
+        processed_set = self._processed_daily_divergences if timeframe == 'daily' else self._processed_weekly_divergences
 
         for div in divergences:
             if div.confirmation_date is not None:
                 if div.confirmation_date.strftime('%Y-%m-%d') == date.strftime('%Y-%m-%d'):
+                    # 生成唯一ID（使用形成日期）
+                    div_id = div.date.strftime('%Y-%m-%d')
+
+                    # 跳过已处理的背离信号
+                    if div_id in processed_set:
+                        continue
+
+                    # 标记为已处理
+                    processed_set.add(div_id)
+
                     return {
                         'date': div.date,
                         'prev_high': div.peak_a_price,
@@ -464,9 +546,28 @@ class BacktestRunner:
         )
         self._trade_records.append(trade)
 
-        # 日志输出
-        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 卖出: {int(sell_shares)}股 @ {price:.3f} | "
-                        f"金额:{sell_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
+        # 输出日志
+        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 卖出: {sell_shares:.0f}股 @ {price:.3f} | "
+                        f"金额:{sell_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | "
+                        f"{signal.reason}")
+
+    def _execute_fake_sell(self, date: pd.Timestamp, signal: SellSignal) -> None:
+        """
+        执行假卖出操作（无持仓时重置状态）
+
+        当均线跌破触发卖出信号，但当前无持仓时，
+        仍需重置信号状态，避免信号继续生效影响后续交易。
+
+        Args:
+            date: 交易日期
+            signal: 卖出信号
+        """
+        # 调用策略重置状态（不实际交易）
+        self.strategy.reset_after_sell(self.state, signal.flag, date)
+
+        # 记录假卖出日志（不加入交易记录）
+        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 假卖出（无持仓）: {signal.reason}")
+        self.logger.info(f"  状态重置: rsi_flag=0, daily_divergence_flag=0, weekly_divergence_flag=0")
 
     def _execute_buy(self, date: pd.Timestamp, signal: BuySignal) -> None:
         """
@@ -528,7 +629,7 @@ class BacktestRunner:
         self.logger.info("=" * 60)
         self.logger.info("开始回测")
         self.logger.info("=" * 60)
-        self.logger.info(f"股票: {self.symbol}")
+        self.logger.info(f"股票: {self.symbol} ({self.stock_name})")
         self.logger.info(f"时间段: {self.start_date} ~ {self.end_date}")
         self.logger.info(f"策略: {self.strategy}")
         self.logger.info("=" * 60)
@@ -571,12 +672,22 @@ class BacktestRunner:
                 position=self._shares * self._get_value_at_date(date, self._close_series) / self.initial_capital if self._shares > 0 else 0
             )
 
-            if sell_signal is not None and self._shares > 0:
-                self._execute_sell(date, sell_signal)
-                continue  # 卖出后当天不买入
+            # 处理卖出信号
+            if sell_signal is not None:
+                if self._shares > 0:
+                    # 有持仓：执行实际卖出
+                    self._execute_sell(date, sell_signal)
+                    continue  # 卖出后当天不买入
+                else:
+                    # 无持仓：执行假卖出（只重置状态，不实际交易）
+                    self._execute_fake_sell(date, sell_signal)
+                    continue  # 假卖出后当天不买入
 
             # 获取创业板指数RSI值
             index_daily_rsi = self._get_index_rsi_at_date(date)
+
+            # 获取上证指数RSI值
+            sh_index_daily_rsi = self._get_sh_index_rsi_at_date(date)
 
             # 调用策略检测买入信号
             buy_signal = self.strategy.check_buy_signal(
@@ -586,7 +697,8 @@ class BacktestRunner:
                 state=self.state,
                 has_new_cash=self._cash > 0,
                 has_sold_cash=self._sold_cash > 0,
-                index_daily_rsi=index_daily_rsi
+                index_daily_rsi=index_daily_rsi,
+                sh_index_daily_rsi=sh_index_daily_rsi
             )
 
             if buy_signal is not None and buy_signal.triggered:

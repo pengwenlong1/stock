@@ -138,11 +138,11 @@ class TradingStrategy:
 
         # 验证ID范围
         for buy_id in buy_ids:
-            if buy_id not in [1, 2, 3, 4, 5]:
-                raise ValueError(f"buy_id 必须为 1-5，当前值: {buy_id}")
+            if buy_id not in [1, 2, 3, 4, 5, 6, 7]:
+                raise ValueError(f"buy_id 必须为 1-7，当前值: {buy_id}")
         for t_id in t_ids:
-            if t_id not in [1, 2, 3, 4, 5]:
-                raise ValueError(f"t_id 必须为 1-5，当前值: {t_id}")
+            if t_id not in [1, 2, 3, 4, 5, 6, 7]:
+                raise ValueError(f"t_id 必须为 1-7，当前值: {t_id}")
 
         logger.info(f"策略初始化: buy_ids={buy_ids}, t_ids={t_ids}, sell_ids={sell_ids}")
 
@@ -169,12 +169,8 @@ class TradingStrategy:
         Returns:
             SellSignal 或 None（无信号）
         """
-        # 检查持仓
-        if position <= 0:
-            return None
-
-        # 检查卖出冷却期
-        if state.last_sell_date is not None:
+        # 检查卖出冷却期（只在有持仓时检查）
+        if position > 0 and state.last_sell_date is not None:
             days_since_sell = (date - state.last_sell_date).days
             if days_since_sell < COOLDOWN_DAYS:
                 return None
@@ -278,7 +274,8 @@ class TradingStrategy:
         state: StrategyState,
         has_new_cash: bool,
         has_sold_cash: bool,
-        index_daily_rsi: float = np.nan
+        index_daily_rsi: float = np.nan,
+        sh_index_daily_rsi: float = np.nan
     ) -> Optional[BuySignal]:
         """
         检查买入信号
@@ -291,6 +288,7 @@ class TradingStrategy:
             has_new_cash: 是否有新资金（未进入市场的资金）
             has_sold_cash: 是否有卖出后待买回的资金
             index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和buy_id=7）
 
         Returns:
             BuySignal 或 None（无信号）
@@ -312,7 +310,7 @@ class TradingStrategy:
         # 首先检查 judge_buy_ids（优先级更高，买入新资金+买回卖出资金）
         if has_new_cash or has_sold_cash:
             for buy_id in self.buy_ids:
-                condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi)
+                condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
                 if condition_met:
                     # judge_buy_ids触发：买入新资金 + 买回卖出资金
                     return BuySignal(
@@ -326,7 +324,7 @@ class TradingStrategy:
         # 然后检查 judge_t_ids（只买回卖出资金）
         if has_sold_cash:
             for t_id in self.t_ids:
-                condition_met, condition_desc = self._check_single_buy_condition_with_desc(t_id, daily_rsi, weekly_rsi, index_daily_rsi)
+                condition_met, condition_desc = self._check_single_buy_condition_with_desc(t_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
                 if condition_met:
                     # judge_t_ids触发：只买回卖出资金
                     return BuySignal(
@@ -339,7 +337,7 @@ class TradingStrategy:
 
         return None
 
-    def _check_single_buy_condition_with_desc(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan) -> Tuple[bool, str]:
+    def _check_single_buy_condition_with_desc(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan) -> Tuple[bool, str]:
         """
         检查单个买入ID的条件并返回条件描述
 
@@ -347,7 +345,8 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
-            index_daily_rsi: 创业板指数日线RSI值
+            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和5）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和7）
 
         Returns:
             Tuple[bool, str]: (是否满足条件, 条件描述)
@@ -388,6 +387,24 @@ class TradingStrategy:
                 return True, f"buy_id=5(指数保护型): 创业板指数日RSI={index_daily_rsi:.2f}<20"
             return False, ""
 
+        elif buy_id == 6:
+            # 上证指数保护型：上证指数(000001)日RSI<20
+            if np.isnan(sh_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少上证指数RSI数据")
+                return False, ""
+            if sh_index_daily_rsi < 20:
+                return True, f"buy_id=6(上证指数保护型): 上证指数日RSI={sh_index_daily_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 7:
+            # 上证指数保护型：上证指数(000001)日RSI<25
+            if np.isnan(sh_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少上证指数RSI数据")
+                return False, ""
+            if sh_index_daily_rsi < 25:
+                return True, f"buy_id=7(上证指数保护型): 上证指数日RSI={sh_index_daily_rsi:.2f}<25"
+            return False, ""
+
         return False, ""
 
     def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan) -> bool:
@@ -398,12 +415,13 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
-            index_daily_rsi: 创业板指数日线RSI值
+            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和5）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和7）
 
         Returns:
             bool: 是否满足买入条件
         """
-        condition_met, _ = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi)
+        condition_met, _ = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
         return condition_met
 
     def update_rsi_flag(

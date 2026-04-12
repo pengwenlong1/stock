@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
 
     # ==================== 测试参数配置 ====================
-    TEST_TICKER = '512480'
+    TEST_TICKER = '510880'
     TEST_NAME = '半导体ETF'
     START_DATE = '2024-01-01'
     END_DATE = '2026-04-10'

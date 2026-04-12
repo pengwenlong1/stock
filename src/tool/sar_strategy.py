@@ -72,8 +72,9 @@ class SARStrategy:
     基于抛物线转向指标（SAR）的趋势转折检测。
 
     【参数配置】
-    - acceleration: 加速因子初始值，默认0.02
-    - maximum: 加速因子最大值，默认0.20
+    SAR(10,2,20) 参数格式：
+    - acceleration: 加速因子步长，默认0.02 (对应参数中的2，即2%)
+    - maximum: 加速因子最大值，默认0.20 (对应参数中的20，即20%)
 
     【使用方法】
     strategy = SARStrategy(acceleration=0.02, maximum=0.20)
@@ -88,8 +89,13 @@ class SARStrategy:
         初始化SAR策略
 
         Args:
-            acceleration: 加速因子初始值（通常为0.02）
-            maximum: 加速因子最大值（通常为0.20）
+            acceleration: 加速因子步长（SAR参数中的"2"，即2%步长）
+            maximum: 加速因子最大值（SAR参数中的"20"，即20%极限）
+
+        【SAR(10,2,20)参数说明】
+        - 10: 观察周期（talib.SAR不直接使用此参数）
+        - 2: 加速因子步长 = 2% = 0.02
+        - 20: 加速因子最大值 = 20% = 0.20
         """
         self.acceleration = acceleration
         self.maximum = maximum
@@ -781,7 +787,9 @@ if __name__ == "__main__":
     START_DATE = '2025-01-01'
     END_DATE = '2026-04-10'
 
-    # SAR参数
+    # SAR参数 SAR(10,2,20)
+    # acceleration = 2% = 0.02
+    # maximum = 20% = 0.20
     SAR_ACCELERATION = 0.02
     SAR_MAXIMUM = 0.20
 
@@ -790,8 +798,9 @@ if __name__ == "__main__":
 
     logger.info(f"测试股票: {TEST_NAME} ({TEST_TICKER})")
     logger.info(f"  检测时间段: {START_DATE} ~ {END_DATE}")
-    logger.info(f"  SAR加速因子: {SAR_ACCELERATION}")
-    logger.info(f"  SAR最大因子: {SAR_MAXIMUM}")
+    logger.info(f"  SAR参数: SAR(10,2,20)")
+    logger.info(f"  加速因子步长: {SAR_ACCELERATION} (对应参数中的2)")
+    logger.info(f"  加速因子最大: {SAR_MAXIMUM} (对应参数中的20)")
     logger.info(f"  初始资金: {INITIAL_CASH:,.2f} 元")
 
     try:

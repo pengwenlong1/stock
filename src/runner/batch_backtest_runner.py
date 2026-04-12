@@ -91,17 +91,18 @@ class BacktestResult:
     """单个股票的回测结果"""
     symbol: str
     config: BacktestConfig
-    total_return: float
-    benchmark_return: float
-    excess_return: float
-    max_drawdown: float
-    trades: int
-    buy_count: int
-    sell_count: int
-    final_value: float
-    log_file: str
-    chart_file: str
-    success: bool
+    stock_name: str = ""             # 股票名称
+    total_return: float = 0.0
+    benchmark_return: float = 0.0
+    excess_return: float = 0.0
+    max_drawdown: float = 0.0
+    trades: int = 0
+    buy_count: int = 0
+    sell_count: int = 0
+    final_value: float = 0.0
+    log_file: str = ""
+    chart_file: str = ""
+    success: bool = True
     error_message: str = ""
 
 
@@ -219,12 +220,15 @@ class BatchBacktestRunner:
                 output_dir=self.output_dir  # 使用统一的输出目录
             )
 
+            stock_name = runner.stock_name  # 获取股票名称
+
             # 运行回测
             results = runner.run_backtest()
 
             if 'error' in results:
                 return BacktestResult(
                     symbol=config.symbol,
+                    stock_name=stock_name,
                     config=config,
                     total_return=0.0,
                     benchmark_return=0.0,
@@ -250,6 +254,7 @@ class BatchBacktestRunner:
 
             result = BacktestResult(
                 symbol=config.symbol,
+                stock_name=stock_name,
                 config=config,
                 total_return=results.get('total_return', 0.0),
                 benchmark_return=results.get('benchmark_return', 0.0),
@@ -264,7 +269,7 @@ class BatchBacktestRunner:
                 success=True
             )
 
-            self.logger.info(f"回测完成: {config.symbol} | "
+            self.logger.info(f"回测完成: {config.symbol} ({stock_name}) | "
                            f"收益率={result.total_return:.2f}% | "
                            f"超额={result.excess_return:.2f}% | "
                            f"回撤={result.max_drawdown:.2f}%")
@@ -366,6 +371,7 @@ class BatchBacktestRunner:
             config = result.config
             summary_data.append({
                 '股票代码': result.symbol,
+                '股票名称': result.stock_name,
                 '开始日期': config.start_date,
                 '结束日期': config.end_date,
                 '买入策略ID': ';'.join(map(str, config.judge_buy_ids)),
@@ -410,17 +416,17 @@ class BatchBacktestRunner:
         # 打印表格
         self.logger.info("")
         self.logger.info("【各股票回测结果】")
-        self.logger.info("-" * 80)
-        header = f"{'股票代码':^12} | {'收益率':^10} | {'超额收益':^10} | {'回撤':^8} | {'交易':^6} | {'状态':^6}"
+        self.logger.info("-" * 100)
+        header = f"{'股票代码':^12} | {'股票名称':^16} | {'收益率':^10} | {'超额收益':^10} | {'回撤':^8} | {'交易':^6} | {'状态':^6}"
         self.logger.info(header)
-        self.logger.info("-" * 80)
+        self.logger.info("-" * 100)
 
         for result in self.results:
             status = "成功" if result.success else "失败"
-            row = f"{result.symbol:^12} | {result.total_return:^10.2f}% | {result.excess_return:^10.2f}% | {result.max_drawdown:^8.2f}% | {result.trades:^6} | {status:^6}"
+            row = f"{result.symbol:^12} | {result.stock_name:^16} | {result.total_return:^10.2f}% | {result.excess_return:^10.2f}% | {result.max_drawdown:^8.2f}% | {result.trades:^6} | {status:^6}"
             self.logger.info(row)
 
-        self.logger.info("-" * 80)
+        self.logger.info("-" * 100)
         self.logger.info(f"主日志文件: {self.log_file}")
         self.logger.info("=" * 60)
 
