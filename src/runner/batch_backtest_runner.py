@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -114,7 +115,16 @@ class BatchBacktestRunner:
 
     【功能说明】
     从CSV读取配置，使用线程池并行执行多个股票的回测。
+    每个股票完成后立即写入汇总CSV，无需等待全部完成。
     """
+
+    # CSV列顺序（按用户指定）
+    CSV_COLUMNS = [
+        '股票代码', '策略收益率(%)', '基准收益率(%)', '超额收益率(%)', '最大回撤率(%)',
+        '买入策略ID', '做T策略ID', '卖出策略ID', '股票名称', '开始日期', '结束日期',
+        '初始资金', '交易次数', '买入次数', '卖出次数', '最终市值', '是否成功',
+        '错误信息', '日志文件', '图表文件'
+    ]
 
     def __init__(self, config_path: str = None, max_workers: int = 4) -> None:
         """
@@ -140,8 +150,21 @@ class BatchBacktestRunner:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
+        # 汇总CSV文件路径
+        self.summary_csv_path = os.path.join(self.output_dir, 'backtest_summary.csv')
+
+        # 线程锁（保护并发写入CSV）
+        self._csv_lock = threading.Lock()
+
+        # 已完成计数
+        self._completed_count = 0
+        self._total_count = 0
+
         # 设置日志
         self._setup_logging()
+
+        # 初始化CSV文件（写入表头）
+        self._init_summary_csv()
 
     def _setup_logging(self) -> None:
         """配置主日志"""
@@ -162,6 +185,55 @@ class BatchBacktestRunner:
         )
         self.logger = logging.getLogger(__name__)
         self.log_file = log_file
+
+    def _init_summary_csv(self) -> None:
+        """初始化汇总CSV文件（写入表头）"""
+        with open(self.summary_csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(self.CSV_COLUMNS)
+        self.logger.info(f"汇总CSV文件已创建: {self.summary_csv_path}")
+
+    def _append_result_to_csv(self, result: BacktestResult) -> None:
+        """
+        将单个回测结果追加写入CSV（线程安全）
+
+        Args:
+            result: 回测结果
+        """
+        config = result.config
+        row_data = [
+            result.symbol,
+            round(result.total_return, 2),
+            round(result.benchmark_return, 2),
+            round(result.excess_return, 2),
+            round(result.max_drawdown, 2),
+            ';'.join(map(str, config.judge_buy_ids)),
+            ';'.join(map(str, config.judge_t_ids)),
+            ';'.join(map(str, config.judge_sell_ids)),
+            result.stock_name,
+            config.start_date,
+            config.end_date,
+            config.initial_capital,
+            result.trades,
+            result.buy_count,
+            result.sell_count,
+            round(result.final_value, 2),
+            '是' if result.success else '否',
+            result.error_message,
+            result.log_file,
+            result.chart_file
+        ]
+
+        # 使用线程锁保护写入操作
+        with self._csv_lock:
+            with open(self.summary_csv_path, 'a', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row_data)
+
+            # 更新完成计数
+            self._completed_count += 1
+            progress = f"[{self._completed_count}/{self._total_count}]"
+            self.logger.info(f"{progress} 结果已写入CSV: {result.symbol} ({result.stock_name})")
 
     def load_configs(self) -> List[BacktestConfig]:
         """
@@ -226,7 +298,7 @@ class BatchBacktestRunner:
             results = runner.run_backtest()
 
             if 'error' in results:
-                return BacktestResult(
+                result = BacktestResult(
                     symbol=config.symbol,
                     stock_name=stock_name,
                     config=config,
@@ -243,6 +315,9 @@ class BatchBacktestRunner:
                     success=False,
                     error_message=results.get('error', '未知错误')
                 )
+                # 立即写入CSV
+                self._append_result_to_csv(result)
+                return result
 
             # 生成报告和图表
             runner.generate_report()
@@ -274,11 +349,13 @@ class BatchBacktestRunner:
                            f"超额={result.excess_return:.2f}% | "
                            f"回撤={result.max_drawdown:.2f}%")
 
+            # 立即写入CSV
+            self._append_result_to_csv(result)
             return result
 
         except Exception as e:
             self.logger.error(f"回测失败: {config.symbol}, 错误: {e}")
-            return BacktestResult(
+            result = BacktestResult(
                 symbol=config.symbol,
                 config=config,
                 total_return=0.0,
@@ -294,6 +371,9 @@ class BatchBacktestRunner:
                 success=False,
                 error_message=str(e)
             )
+            # 立即写入CSV（即使失败）
+            self._append_result_to_csv(result)
+            return result
 
     def run_batch_backtest(self) -> List[BacktestResult]:
         """
@@ -308,12 +388,16 @@ class BatchBacktestRunner:
             self.logger.error("没有加载到任何回测配置")
             return []
 
+        # 设置总任务数（用于进度显示）
+        self._total_count = len(configs)
+
         self.logger.info("=" * 60)
         self.logger.info("开始批量回测")
         self.logger.info("=" * 60)
         self.logger.info(f"配置文件: {self.config_path}")
         self.logger.info(f"股票数量: {len(configs)}")
         self.logger.info(f"并行线程: {self.max_workers}")
+        self.logger.info(f"汇总CSV: {self.summary_csv_path}")
         self.logger.info("=" * 60)
 
         results = []
@@ -333,12 +417,15 @@ class BatchBacktestRunner:
                     results.append(result)
                 except Exception as e:
                     self.logger.error(f"任务执行异常: {config.symbol}, 错误: {e}")
-                    results.append(BacktestResult(
+                    result = BacktestResult(
                         symbol=config.symbol,
                         config=config,
                         success=False,
                         error_message=str(e)
-                    ))
+                    )
+                    results.append(result)
+                    # 立即写入CSV（异常情况）
+                    self._append_result_to_csv(result)
 
         self.results = results
 
@@ -347,93 +434,34 @@ class BatchBacktestRunner:
         self.logger.info("批量回测完成")
         self.logger.info("=" * 60)
 
-        # 生成汇总报告
-        self.generate_summary_csv()
+        # 输出最终汇总统计
+        self._print_final_summary()
 
         return results
 
-    def generate_summary_csv(self) -> str:
-        """
-        生成汇总CSV报告
-
-        Returns:
-            CSV文件路径
-        """
+    def _print_final_summary(self) -> None:
+        """输出最终汇总统计信息"""
         if len(self.results) == 0:
-            self.logger.warning("没有回测结果，无法生成汇总报告")
-            return ""
+            return
 
-        csv_path = os.path.join(self.output_dir, 'backtest_summary.csv')
-
-        # 构建汇总数据
-        summary_data = []
-        for result in self.results:
-            config = result.config
-            summary_data.append({
-                '股票代码': result.symbol,
-                '股票名称': result.stock_name,
-                '开始日期': config.start_date,
-                '结束日期': config.end_date,
-                '买入策略ID': ';'.join(map(str, config.judge_buy_ids)),
-                '做T策略ID': ';'.join(map(str, config.judge_t_ids)),
-                '卖出策略ID': ';'.join(map(str, config.judge_sell_ids)),
-                '初始资金': config.initial_capital,
-                '策略收益率(%)': round(result.total_return, 2),
-                '基准收益率(%)': round(result.benchmark_return, 2),
-                '超额收益率(%)': round(result.excess_return, 2),
-                '最大回撤率(%)': round(result.max_drawdown, 2),
-                '交易次数': result.trades,
-                '买入次数': result.buy_count,
-                '卖出次数': result.sell_count,
-                '最终市值': round(result.final_value, 2),
-                '是否成功': '成功' if result.success else '失败',
-                '错误信息': result.error_message,
-                '日志文件': result.log_file,
-                '图表文件': result.chart_file
-            })
-
-        # 写入CSV
-        df = pd.DataFrame(summary_data)
-        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-
-        self.logger.info("")
-        self.logger.info("【汇总报告】")
-        self.logger.info("-" * 60)
-        self.logger.info(f"汇总CSV已保存: {csv_path}")
-
-        # 打印汇总统计
         success_count = sum(1 for r in self.results if r.success)
         avg_return = sum(r.total_return for r in self.results if r.success) / success_count if success_count > 0 else 0
         avg_excess = sum(r.excess_return for r in self.results if r.success) / success_count if success_count > 0 else 0
         avg_drawdown = sum(r.max_drawdown for r in self.results if r.success) / success_count if success_count > 0 else 0
 
+        self.logger.info("")
+        self.logger.info("【汇总统计】")
+        self.logger.info("-" * 40)
         self.logger.info(f"回测成功: {success_count}/{len(self.results)}")
         self.logger.info(f"平均收益率: {avg_return:.2f}%")
         self.logger.info(f"平均超额收益: {avg_excess:.2f}%")
         self.logger.info(f"平均最大回撤: {avg_drawdown:.2f}%")
-        self.logger.info("=" * 60)
-
-        # 打印表格
         self.logger.info("")
-        self.logger.info("【各股票回测结果】")
-        self.logger.info("-" * 100)
-        header = f"{'股票代码':^12} | {'股票名称':^16} | {'收益率':^10} | {'超额收益':^10} | {'回撤':^8} | {'交易':^6} | {'状态':^6}"
-        self.logger.info(header)
-        self.logger.info("-" * 100)
-
-        for result in self.results:
-            status = "成功" if result.success else "失败"
-            row = f"{result.symbol:^12} | {result.stock_name:^16} | {result.total_return:^10.2f}% | {result.excess_return:^10.2f}% | {result.max_drawdown:^8.2f}% | {result.trades:^6} | {status:^6}"
-            self.logger.info(row)
-
-        self.logger.info("-" * 100)
+        self.logger.info(f"汇总CSV: {self.summary_csv_path}")
         self.logger.info(f"主日志文件: {self.log_file}")
         self.logger.info("=" * 60)
 
-        return csv_path
-
-
-# ==================== 主函数 ====================
+    # ==================== 主函数 ====================
 
 if __name__ == "__main__":
     # ===== 可配置参数 =====
