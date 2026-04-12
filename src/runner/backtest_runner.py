@@ -831,8 +831,13 @@ class BacktestRunner:
 
         return max_drawdown
 
-    def generate_report(self) -> None:
-        """生成回测报告"""
+    def generate_report(self) -> Dict:
+        """
+        生成回测报告
+
+        Returns:
+            Dict: 包含所有报告数据的字典，按指定列顺序排列
+        """
         self.logger.info("")
         self.logger.info("=" * 60)
         self.logger.info("回测报告")
@@ -876,6 +881,44 @@ class BacktestRunner:
             self.logger.info(f"图表文件: {chart_path}")
 
         self.logger.info("=" * 60)
+
+        # 计算最终市值
+        last_price = self._close_series.iloc[-1] if self._close_series is not None else 0.0
+        final_value = results['final_shares'] * last_price + results['final_cash'] + results['final_sold_cash']
+
+        # 按指定列顺序构建报告数据
+        report_data = {
+            '股票代码': self.symbol,
+            '策略收益率(%)': f"{results['total_return']:.2f}",
+            '基准收益率(%)': f"{results['benchmark_return']:.2f}",
+            '超额收益率(%)': f"{results['excess_return']:.2f}",
+            '最大回撤率(%)': f"{results['max_drawdown']:.2f}",
+            '买入策略ID': str(self.judge_buy_ids),
+            '做T策略ID': str(self.judge_t_ids),
+            '卖出策略ID': str(self.judge_sell_ids),
+            '股票名称': self.stock_name,
+            '开始日期': self.start_date,
+            '结束日期': self.end_date,
+            '初始资金': f"{self.initial_capital:.2f}",
+            '交易次数': results['trades'],
+            '买入次数': results['buy_count'],
+            '卖出次数': results['sell_count'],
+            '最终市值': f"{final_value:.2f}",
+            '是否成功': '是',
+            '错误信息': '',
+            '日志文件': self.log_file,
+            '图表文件': chart_path or ''
+        }
+
+        # 输出CSV格式汇总（一行）
+        self.logger.info("")
+        self.logger.info("【CSV格式汇总】")
+        header = "股票代码,策略收益率(%),基准收益率(%),超额收益率(%),最大回撤率(%),买入策略ID,做T策略ID,卖出策略ID,股票名称,开始日期,结束日期,初始资金,交易次数,买入次数,卖出次数,最终市值,是否成功,错误信息,日志文件,图表文件"
+        self.logger.info(header)
+        row = f"{self.symbol},{results['total_return']:.2f},{results['benchmark_return']:.2f},{results['excess_return']:.2f},{results['max_drawdown']:.2f},{self.judge_buy_ids},{self.judge_t_ids},{self.judge_sell_ids},{self.stock_name},{self.start_date},{self.end_date},{self.initial_capital:.2f},{results['trades']},{results['buy_count']},{results['sell_count']},{final_value:.2f},是,,{self.log_file},{chart_path or ''}"
+        self.logger.info(row)
+
+        return report_data
 
     def plot_backtest_results(self, output_path: Optional[str] = None) -> Optional[str]:
         """
@@ -930,7 +973,7 @@ class BacktestRunner:
 
         # 创建图表（3个子图）
         fig, axes = plt.subplots(3, 1, figsize=(16, 12), gridspec_kw={'height_ratios': [3, 1, 1]})
-        fig.suptitle(f'{self.symbol} 回测结果 ({self.start_date} ~ {self.end_date})\n'
+        fig.suptitle(f'{self.symbol} ({self.stock_name}) 回测结果 ({self.start_date} ~ {self.end_date})\n'
                     f'策略: {self.strategy}',
                     fontsize=12, fontweight='bold')
 

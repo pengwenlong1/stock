@@ -3,7 +3,7 @@
 批量回测执行器模块 (batch_backtest_runner.py)
 
 【功能说明】
-从 config/settings_backtest.csv 读取配置，并行执行多个股票的回测。
+从 config/stocks_backtest.csv 读取配置，并行执行多个股票的回测。
 使用线程池提高效率，生成汇总CSV报告。
 
 【CSV配置格式】
@@ -125,7 +125,7 @@ class BatchBacktestRunner:
             max_workers: 最大并行线程数
         """
         if config_path is None:
-            config_path = os.path.join(project_root, 'config', 'settings_backtest.csv')
+            config_path = os.path.join(project_root, 'config', 'stocks_backtest.csv')
 
         self.config_path = config_path
         self.max_workers = max_workers
