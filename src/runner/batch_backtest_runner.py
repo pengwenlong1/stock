@@ -466,7 +466,7 @@ class BatchBacktestRunner:
 if __name__ == "__main__":
     # ===== 可配置参数 =====
     CONFIG_PATH = None                   # CSV配置文件路径（None则使用默认路径）
-    MAX_WORKERS = 10                      # 最大并行线程数
+    MAX_WORKERS = 20                      # 最大并行线程数
 
     # ===== 执行批量回测 =====
     batch_runner = BatchBacktestRunner(
