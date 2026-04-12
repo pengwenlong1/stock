@@ -86,7 +86,8 @@ class BacktestRunner:
                  judge_buy_ids: List[int] = [1],
                  judge_t_ids: List[int] = [2],
                  judge_sell_ids: List[int] = [1],
-                 initial_capital: float = 100000.0) -> None:
+                 initial_capital: float = 100000.0,
+                 output_dir: Optional[str] = None) -> None:
         """
         初始化回测执行器
 
@@ -98,6 +99,7 @@ class BacktestRunner:
             judge_t_ids: 做T买回策略ID列表（触发时只买回卖出资金）
             judge_sell_ids: 卖出策略ID列表
             initial_capital: 初始资金
+            output_dir: 输出目录路径（None则自动创建时间戳目录）
 
         买入规则说明：
         - judge_buy_ids触发: 一次性买入新资金 + 买回之前卖出的资金
@@ -120,6 +122,15 @@ class BacktestRunner:
 
         # 策略状态
         self.state = StrategyState()
+
+        # 输出目录设置
+        if output_dir is None:
+            logs_base = os.path.join(project_root, 'logs')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = os.path.join(logs_base, f'backtest_{timestamp}')
+        self.output_dir = output_dir
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
 
         # 数据存储
         self._df: Optional[pd.DataFrame] = None
@@ -155,13 +166,8 @@ class BacktestRunner:
 
     def _setup_logging(self) -> None:
         """配置日志"""
-        log_dir = os.path.join(project_root, 'logs')
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         symbol_clean = self.symbol.replace('.', '_')
-        log_file = os.path.join(log_dir, f'backtest_{symbol_clean}_{timestamp}.log')
+        log_file = os.path.join(self.output_dir, f'backtest_{symbol_clean}.log')
 
         # 清除已有handlers
         for handler in logging.root.handlers[:]:
@@ -769,6 +775,8 @@ class BacktestRunner:
         Returns:
             图表保存路径
         """
+        import matplotlib
+        matplotlib.use('Agg')  # 使用非交互式后端，避免线程问题
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
@@ -900,9 +908,8 @@ class BacktestRunner:
 
         # 保存图表
         if output_path is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             symbol_clean = self.symbol.replace('.', '_')
-            output_path = os.path.join(project_root, 'logs', f'backtest_chart_{symbol_clean}_{timestamp}.png')
+            output_path = os.path.join(self.output_dir, f'backtest_chart_{symbol_clean}.png')
 
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
