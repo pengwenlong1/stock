@@ -518,8 +518,22 @@ if __name__ == "__main__":
     START_DATE = '2024-01-01'
     END_DATE = '2025-01-20'
 
-    # 测试标的（掘金量化代码格式：SHSE.512480 或 SZSE.000001）
-    SYMBOL = 'SHSE.510880'
+    # 测试标的（只需输入数字代码，脚本自动添加交易所前缀）
+    SYMBOL = '510880'                    # 红利ETF -> SHSE.510880
+
+    # 自动添加交易所前缀
+    def _add_exchange_prefix(code: str) -> str:
+        code = code.strip()
+        if code.startswith('SHSE.') or code.startswith('SZSE.'):
+            return code
+        if code.startswith('6') or code.startswith('5'):
+            return f'SHSE.{code}'
+        elif code.startswith('0') or code.startswith('3') or code.startswith('1'):
+            return f'SZSE.{code}'
+        else:
+            return f'SZSE.{code}'
+
+    SYMBOL_FULL = _add_exchange_prefix(SYMBOL)
 
     # ==================== 日志配置 ====================
 
@@ -531,7 +545,7 @@ if __name__ == "__main__":
         os.makedirs(LOG_DIR)
 
     LOG_FILE = os.path.join(LOG_DIR,
-                            f'rsi_test_{SYMBOL.replace(".", "_")}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+                            f'rsi_test_{SYMBOL_FULL.replace(".", "_")}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
 
     logging.basicConfig(
         level=logging.INFO,
@@ -551,7 +565,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
 
     logger.info(f"测试参数配置:")
-    logger.info(f"  股票代码: {SYMBOL}")
+    logger.info(f"  股票代码: {SYMBOL_FULL}")
     logger.info(f"  开始时间: {START_DATE}")
     logger.info(f"  结束时间: {END_DATE}")
     logger.info(f"  日志文件: {LOG_FILE}")
@@ -585,7 +599,7 @@ if __name__ == "__main__":
         # 使用1年的预热数据来确保EMA状态稳定
         warmup_start = '2023-01-01'
         daily_data = history(
-            symbol=SYMBOL,
+            symbol=SYMBOL_FULL,
             frequency='1d',
             start_time=warmup_start + ' 09:00:00',
             end_time=END_DATE + ' 15:30:00',
@@ -595,7 +609,7 @@ if __name__ == "__main__":
         )
 
         if daily_data is None or daily_data.empty:
-            logger.error(f"获取数据失败，请检查股票代码 {SYMBOL} 是否正确")
+            logger.error(f"获取数据失败，请检查股票代码 {SYMBOL_FULL} 是否正确")
             raise Exception("数据获取失败")
 
         logger.info(f"获取到 {len(daily_data)} 条日线数据（包含预热数据）")

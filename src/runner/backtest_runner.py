@@ -1075,9 +1075,37 @@ class BacktestRunner:
 
 # ==================== 主函数 ====================
 
+def _add_exchange_prefix(code: str) -> str:
+    """
+    自动添加交易所前缀
+
+    Args:
+        code: 股票代码（纯数字，如 512480）
+
+    Returns:
+        str: 完整股票代码（如 SHSE.512480）
+    """
+    code = code.strip()
+    if code.startswith('SHSE.') or code.startswith('SZSE.'):
+        return code
+
+    # 6开头: 上海主板
+    # 5开头: 上海基金/ETF
+    # 0开头: 深圳主板
+    # 3开头: 创业板
+    # 1开头: 深圳基金
+    if code.startswith('6') or code.startswith('5'):
+        return f'SHSE.{code}'
+    elif code.startswith('0') or code.startswith('3') or code.startswith('1'):
+        return f'SZSE.{code}'
+    else:
+        return f'SZSE.{code}'
+
+
 if __name__ == "__main__":
     # ===== 可配置参数 =====
-    SYMBOL = 'SHSE.512480'              # 股票代码（SHSE/SZSE前缀）
+    # 股票代码只需输入数字，脚本自动添加交易所前缀
+    SYMBOL = '512480'                   # 半导体ETF -> SHSE.512480
     START_DATE = '2024-01-01'           # 回测开始日期
     END_DATE = '2026-04-10'             # 回测结束日期
 
@@ -1108,8 +1136,11 @@ if __name__ == "__main__":
     INITIAL_CAPITAL = 100000            # 初始资金
 
     # ===== 执行回测 =====
+    # 自动添加交易所前缀
+    SYMBOL_FULL = _add_exchange_prefix(SYMBOL)
+
     runner = BacktestRunner(
-        symbol=SYMBOL,
+        symbol=SYMBOL_FULL,
         start_date=START_DATE,
         end_date=END_DATE,
         judge_buy_ids=JUDGE_BUY_IDS,
