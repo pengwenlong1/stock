@@ -6,6 +6,11 @@
 执行历史数据回测验证。调用 strategy.py 中的交易策略类进行信号检测。
 不包含策略逻辑，仅负责：数据准备、指标计算、调用策略、执行交易、生成报告。
 
+【SAR跌破替代均线死叉】
+使用SAR绿转红信号替代原有的MA5跌破MA10（均线死叉）逻辑：
+- 原逻辑：MA5跌破MA10 → 卖出信号触发
+- 新逻辑：SAR绿转红（SAR从价格下方转到上方）→ 卖出信号触发
+
 【使用方法】
 修改 main 函数中的参数后运行：
     python src/runner/backtest_runner.py
@@ -37,7 +42,7 @@ sys.path.insert(0, project_root)
 # 导入策略类和工具类
 from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag
 from src.tool.rsi_calculator import RSI
-from src.tool.ma_calculator import MACalculator
+from src.tool.sar_strategy import SARStrategy, SARSignal  # 导入SAR策略类
 from src.tool.macd_calculator import MACDCalculator
 from src.tool.peak_detector import PeakDetector
 from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal, DivergenceType, TimeFrame
@@ -50,6 +55,10 @@ except ImportError:
     ADJUST_PREV = None
     get_trading_dates = None
     get_instruments = None
+
+# SAR参数：SAR(10,2,20)
+SAR_ACCELERATION = 0.02
+SAR_MAXIMUM = 0.20
 
 
 # ==================== 数据结构 ====================
@@ -146,8 +155,11 @@ class BacktestRunner:
         # 指标数据
         self._daily_rsi: Optional[pd.Series] = None
         self._weekly_rsi: Optional[pd.Series] = None
-        self._ma5: Optional[pd.Series] = None
-        self._ma10: Optional[pd.Series] = None
+
+        # SAR指标数据（替代MA均线）
+        self._sar_strategy: Optional[SARStrategy] = None
+        self._sar_series: Optional[pd.Series] = None
+        self._sar_signals: List[SARSignal] = []  # 预计算的SAR转折信号
 
         # 创业板指数数据（用于buy_id=3和buy_id=5）
         self._index_daily_rsi: Optional[pd.Series] = None
@@ -314,10 +326,21 @@ class BacktestRunner:
         self._weekly_rsi = rsi_weekly.calculate(self._close_series)
         self.logger.info(f"周线RSI计算完成: {self._weekly_rsi.notna().sum()} 个有效值")
 
-        # 计算均线 MA5/MA10
-        ma_calculator = MACalculator(fast_period=5, slow_period=10, ma_type='SMA')
-        self._ma5, self._ma10 = ma_calculator.calculate(self._close_series)
-        self.logger.info(f"均线计算完成")
+        # 计算SAR指标（替代MA均线）
+        self._sar_strategy = SARStrategy(
+            acceleration=SAR_ACCELERATION,
+            maximum=SAR_MAXIMUM
+        )
+        self._sar_strategy.prepare_data(self._high_series, self._low_series, self._close_series)
+        self._sar_series = self._sar_strategy._sar_series
+        self.logger.info(f"SAR计算完成: SAR(10,2,20)")
+
+        # 预计算回测时间段内的SAR转折信号
+        sar_signals = self._sar_strategy.detect_signals(self.start_date, self.end_date)
+        self._sar_signals = sar_signals
+        self.logger.info(f"SAR转折信号预计算完成: {len(sar_signals)} 个信号")
+        for s in sar_signals:
+            self.logger.info(f"  [{s.date.strftime('%Y-%m-%d')}] {s.signal_type}: SAR={s.sar_value:.3f}")
 
         # 计算创业板指数RSI（用于buy_id=3和buy_id=5）
         self._calculate_index_rsi()
@@ -450,30 +473,27 @@ class BacktestRunner:
             return np.nan
         return self._get_value_at_date(date, self._sh_index_daily_rsi)
 
-    def _detect_ma_cross_down(self, date: pd.Timestamp) -> bool:
-        """检测5日均线是否在当日跌破10日均线"""
-        try:
-            # 获取当日和前一天的均线值
-            ma5_today = self._get_value_at_date(date, self._ma5)
-            ma10_today = self._get_value_at_date(date, self._ma10)
+    def _detect_sar_cross_down(self, date: pd.Timestamp) -> bool:
+        """
+        检测SAR是否发生绿转红（跌破信号）
 
-            # 获取前一天的数据
-            prev_dates = self._close_series.index[self._close_series.index < date]
-            if len(prev_dates) == 0:
-                return False
-            prev_date = prev_dates[-1]
+        【逻辑说明】
+        SAR绿转红 = SAR从价格下方转到上方，趋势从多头转为空头
+        检测条件：SAR(t) > Close(t) 且 SAR(t-1) <= Close(t-1)
 
-            ma5_prev = self._get_value_at_date(prev_date, self._ma5)
-            ma10_prev = self._get_value_at_date(prev_date, self._ma10)
+        替代原有的MA5跌破MA10（均线死叉）逻辑
 
-            if np.isnan(ma5_today) or np.isnan(ma10_today) or np.isnan(ma5_prev) or np.isnan(ma10_prev):
-                return False
+        Args:
+            date: 当前日期
 
-            # 死叉条件：前一天MA5>=MA10，当日MA5<MA10
-            return ma5_prev >= ma10_prev and ma5_today < ma10_today
-
-        except Exception:
-            return False
+        Returns:
+            bool: 是否发生SAR绿转红（跌破）
+        """
+        # 检查预计算的SAR信号中是否有该日期的绿转红信号
+        for signal in self._sar_signals:
+            if signal.signal_type == '绿转红' and signal.date.strftime('%Y-%m-%d') == date.strftime('%Y-%m-%d'):
+                return True
+        return False
 
     def _get_divergence_info(self, date: pd.Timestamp, timeframe: str) -> Optional[Dict]:
         """获取指定日期的背离信息（跳过已处理的信号）"""
@@ -648,7 +668,7 @@ class BacktestRunner:
             # 获取当日指标值
             daily_rsi = self._get_value_at_date(date, self._daily_rsi)
             weekly_rsi = self._get_value_at_date(date, self._weekly_rsi)
-            ma_cross_down = self._detect_ma_cross_down(date)
+            sar_cross_down = self._detect_sar_cross_down(date)  # SAR绿转红替代MA死叉
 
             # 更新RSI警戒级别
             self.strategy.update_rsi_flag(weekly_rsi, self.state, date)
@@ -667,7 +687,7 @@ class BacktestRunner:
                 date=date,
                 daily_rsi=daily_rsi,
                 weekly_rsi=weekly_rsi,
-                ma_cross_down=ma_cross_down,
+                ma_cross_down=sar_cross_down,  # SAR跌破传入策略（参数名保持兼容）
                 state=self.state,
                 position=self._shares * self._get_value_at_date(date, self._close_series) / self.initial_capital if self._shares > 0 else 0
             )
@@ -951,13 +971,9 @@ class BacktestRunner:
             (self._close_series.index.strftime('%Y-%m-%d') >= start_str) &
             (self._close_series.index.strftime('%Y-%m-%d') <= end_str)
         ]
-        ma5_data = self._ma5[
-            (self._ma5.index.strftime('%Y-%m-%d') >= start_str) &
-            (self._ma5.index.strftime('%Y-%m-%d') <= end_str)
-        ]
-        ma10_data = self._ma10[
-            (self._ma10.index.strftime('%Y-%m-%d') >= start_str) &
-            (self._ma10.index.strftime('%Y-%m-%d') <= end_str)
+        sar_data = self._sar_series[
+            (self._sar_series.index.strftime('%Y-%m-%d') >= start_str) &
+            (self._sar_series.index.strftime('%Y-%m-%d') <= end_str)
         ]
         daily_rsi_data = self._daily_rsi[
             (self._daily_rsi.index.strftime('%Y-%m-%d') >= start_str) &
@@ -974,7 +990,7 @@ class BacktestRunner:
         # 创建图表（3个子图）
         fig, axes = plt.subplots(3, 1, figsize=(16, 12), gridspec_kw={'height_ratios': [3, 1, 1]})
         fig.suptitle(f'{self.symbol} ({self.stock_name}) 回测结果 ({self.start_date} ~ {self.end_date})\n'
-                    f'策略: {self.strategy}',
+                    f'策略: {self.strategy} | SAR参数: SAR(10,2,20)',
                     fontsize=12, fontweight='bold')
 
         ax_price = axes[0]
@@ -983,16 +999,47 @@ class BacktestRunner:
 
         dates = close_data.index
 
-        # ===== 绘制价格曲线 + 均线 =====
+        # ===== 绘制价格曲线 + SAR点 =====
         ax_price.plot(dates, close_data.values, 'b-', linewidth=1.5, label='收盘价', alpha=0.8)
-        ax_price.plot(dates, ma5_data.values, 'y-', linewidth=1, label='MA5', alpha=0.7)
-        ax_price.plot(dates, ma10_data.values, 'm-', linewidth=1, label='MA10', alpha=0.7)
+
+        # 绘制SAR点（红色=上方/空头，绿色=下方/多头）
+        sar_above = []
+        sar_above_dates = []
+        sar_below = []
+        sar_below_dates = []
+
+        for i, date in enumerate(dates):
+            sar = sar_data.loc[date]
+            close = close_data.loc[date]
+            if sar > close:
+                sar_above.append(sar)
+                sar_above_dates.append(date)
+            else:
+                sar_below.append(sar)
+                sar_below_dates.append(date)
+
+        # 绘制SAR点
+        if sar_above_dates:
+            ax_price.scatter(sar_above_dates, sar_above, color='red', marker='.',
+                            s=30, label='SAR(空头)', alpha=0.7)
+        if sar_below_dates:
+            ax_price.scatter(sar_below_dates, sar_below, color='green', marker='.',
+                            s=30, label='SAR(多头)', alpha=0.7)
+
+        # 标记SAR转折信号
+        for signal in self._sar_signals:
+            if signal.signal_type == '绿转红':
+                ax_price.scatter(signal.date, signal.close_price, color='red',
+                                marker='x', s=100, zorder=5, label='SAR跌破' if signal == self._sar_signals[0] else '')
+            elif signal.signal_type == '红转绿':
+                ax_price.scatter(signal.date, signal.close_price, color='green',
+                                marker='o', s=100, zorder=5, label='SAR突破' if signal == self._sar_signals[0] else '')
 
         # 标记买入点（绿色向上箭头）
         buy_trades = [t for t in self._trade_records if t.action == 'buy']
         for trade in buy_trades:
             ax_price.scatter(trade.date, trade.price, color='green', marker='^', s=150,
-                            label='买入' if trade == buy_trades[0] else '', zorder=5)
+                            label='买入' if trade == buy_trades[0] else '', zorder=6)
             ax_price.annotate(f'买入\n{trade.price:.3f}',
                              (trade.date, trade.price),
                              textcoords="offset points", xytext=(5, 15),
@@ -1002,7 +1049,7 @@ class BacktestRunner:
         sell_trades = [t for t in self._trade_records if t.action == 'sell']
         for trade in sell_trades:
             ax_price.scatter(trade.date, trade.price, color='red', marker='v', s=150,
-                            label='卖出' if trade == sell_trades[0] else '', zorder=5)
+                            label='卖出' if trade == sell_trades[0] else '', zorder=6)
             ax_price.annotate(f'卖出\n{trade.price:.3f}',
                              (trade.date, trade.price),
                              textcoords="offset points", xytext=(5, -20),
