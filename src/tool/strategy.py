@@ -188,9 +188,9 @@ class TradingStrategy:
         divergence_prev_high = 0.0
 
         # 优先级1：周线顶背离生效 → 清仓
-        if state.weekly_divergence_flag == 1 and state.weekly_divergence_info is not None:
+        if state.weekly_divergence_flag == 1:
             sell_flag = SellFlag.CLEAR_ALL
-            div_info = state.weekly_divergence_info
+            div_info = state.weekly_divergence_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
             reason = f"周线顶背离生效 (策略-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高={divergence_prev_high:.3f}, 建议清仓"
@@ -234,12 +234,12 @@ class TradingStrategy:
             )
 
         # 优先级4：日线顶背离生效 → 卖出1/3
-        if state.daily_divergence_flag == 1 and state.daily_divergence_info is not None:
+        if state.daily_divergence_flag == 1:
             sell_flag = SellFlag.SELL_ONE_THIRD
-            div_info = state.daily_divergence_info
+            div_info = state.daily_divergence_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
-            reason = f"卖出信号 (策略-顶背离均线): 日线顶背离 ({divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}) + 5日均线下穿10日均线确认, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
+            reason = f"卖出信号 (策略-顶背离均线): 日线顶背离 ({divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}) + SAR死叉确认, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,

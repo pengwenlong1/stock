@@ -1,5 +1,5 @@
 {
-    "gm_token": "f349d4226004c4f0aaac5c45762266dfe2dd9957",
-    "dingtalk_webhook": "https://oapi.dingtalk.com/robot/send?access_token=f2f2dbca162d963b1619dbdbde91f2d70572836aac58b94ea4713e42167da160",
+    "gm_token": "636e058e519d0f1bc4b985d08251635f035ad7bb",
+    "dingtalk_webhook": "https://oapi.dingtalk.com/robot/send?access_token=de9d1a4e054f99cdcad00c6d1bf1b08d1efc932aa23f412a58adde65db873ab3",
     "dingtalk_secret": "SECbf80e6ffe5fdd6ac64c51008d0a56303fdba94f6296d75f4d7134abc5fa49395"
 }
