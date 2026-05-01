@@ -558,7 +558,9 @@ class DatabaseFiller:
         logger.info("计算MACD...")
         macd_calculator = MACDCalculator(fast_period=12, slow_period=26, signal_period=9)
         macd_calculator.prepare_data(close_series)
-        macd_series = macd_calculator._macd_series
+        dif_series = macd_calculator._dif_series  # DIF值（快线）
+        dea_series = macd_calculator._dea_series  # DEA值（慢线）
+        macd_series = macd_calculator._macd_series  # MACD柱值
 
         # ========== 4. 计算SAR和SAR死叉 ==========
         logger.info("计算SAR...")
@@ -642,20 +644,23 @@ class DatabaseFiller:
         # ========== 构建插入数据 ==========
         sql = """
             INSERT INTO stock_daily_metrics
-            (stock_id, trade_date, close_price, ma5, ma10, ma5_ma10_dead_cross,
-             rsi_daily, rsi_weekly, macd, sar,
+            (stock_id, trade_date, close_price, low_price, ma5, ma10, ma5_ma10_dead_cross,
+             rsi_daily, rsi_weekly, macd, dif, dea, sar,
              is_daily_top_divergence, is_daily_bottom_divergergence,
              is_weekly_top_divergence, is_weekly_bottom_divergergence,
              is_sar_dead_cross, is_local_high, is_local_low, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 close_price = VALUES(close_price),
+                low_price = VALUES(low_price),
                 ma5 = VALUES(ma5),
                 ma10 = VALUES(ma10),
                 ma5_ma10_dead_cross = VALUES(ma5_ma10_dead_cross),
                 rsi_daily = VALUES(rsi_daily),
                 rsi_weekly = VALUES(rsi_weekly),
                 macd = VALUES(macd),
+                dif = VALUES(dif),
+                dea = VALUES(dea),
                 sar = VALUES(sar),
                 is_daily_top_divergence = VALUES(is_daily_top_divergence),
                 is_daily_bottom_divergergence = VALUES(is_daily_bottom_divergergence),
@@ -673,6 +678,7 @@ class DatabaseFiller:
 
             # 获取各项指标值
             close_price = close_series.loc[date]
+            low_price = low_series.loc[date] if date in low_series.index else None  # 最低价
 
             # MA值
             ma5_val = ma5_series.loc[date] if date in ma5_series.index else None
@@ -685,8 +691,10 @@ class DatabaseFiller:
             rsi_daily_val = rsi_daily_series.loc[date] if date in rsi_daily_series.index else None
             rsi_weekly_val = rsi_weekly_series.loc[date] if date in rsi_weekly_series.index else None
 
-            # MACD值
+            # MACD值（MACD柱、DIF、DEA）
             macd_val = macd_series.loc[date] if date in macd_series.index else None
+            dif_val = dif_series.loc[date] if date in dif_series.index else None
+            dea_val = dea_series.loc[date] if date in dea_series.index else None
 
             # SAR值
             sar_val = sar_series.loc[date] if date in sar_series.index else None
@@ -705,23 +713,29 @@ class DatabaseFiller:
             is_weekly_bottom_div = 1 if date_str in weekly_bottom_div_dates else 0
 
             # 处理NaN值
+            low_price = None if pd.isna(low_price) else round(float(low_price), 2)
             ma5_val = None if pd.isna(ma5_val) else round(float(ma5_val), 2)
             ma10_val = None if pd.isna(ma10_val) else round(float(ma10_val), 2)
             rsi_daily_val = None if pd.isna(rsi_daily_val) else round(float(rsi_daily_val), 2)
             rsi_weekly_val = None if pd.isna(rsi_weekly_val) else round(float(rsi_weekly_val), 2)
             macd_val = None if pd.isna(macd_val) else round(float(macd_val), 4)
+            dif_val = None if pd.isna(dif_val) else round(float(dif_val), 4)
+            dea_val = None if pd.isna(dea_val) else round(float(dea_val), 4)
             sar_val = None if pd.isna(sar_val) else round(float(sar_val), 4)
 
             params = (
                 self._get_stock_db_id(ticker),  # stock_id (BIGINT)
                 date_str,  # trade_date
                 round(float(close_price), 2),  # close_price
+                low_price,  # low_price
                 ma5_val,  # ma5
                 ma10_val,  # ma10
                 ma_dead_cross,  # ma5_ma10_dead_cross
                 rsi_daily_val,  # rsi_daily
                 rsi_weekly_val,  # rsi_weekly
                 macd_val,  # macd
+                dif_val,  # dif
+                dea_val,  # dea
                 sar_val,  # sar
                 is_daily_top_div,  # is_daily_top_divergence
                 is_daily_bottom_div,  # is_daily_bottom_divergergence
@@ -791,8 +805,9 @@ def load_stock_list() -> List[Dict]:
     """
     加载股票列表
 
-    从config/stocks_backtest.csv加载股票列表（所有股票，不考虑active字段）
-    包含每只股票的时间参数，名称通过API获取
+    从config/stocks_backtest.csv加载股票列表（仅加载active字段为1的股票）
+    包含每只股票的时间参数，名称通过API获取。
+    如果CSV的name列为空，会自动通过API获取并更新CSV文件。
 
     Returns:
         List[Dict]: 股票列表，包含 ticker, name, start_date, end_date
@@ -806,18 +821,137 @@ def load_stock_list() -> List[Dict]:
     # 使用 dtype 参数确保股票代码作为字符串读取，不丢失前导0
     df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str})
 
+    # 确保 name 列存在
+    if 'name' not in df.columns:
+        df['name'] = ''
+
+    # 仅筛选 active 字段为 1 的股票
+    if 'active' in df.columns:
+        df = df[df['active'] == 1]
+        logger.info(f"筛选 active=1 的股票，共 {len(df)} 只")
+    else:
+        logger.warning("CSV文件中未找到 active 列，将加载所有股票")
+
+    # 检查是否有缺失的 name，如果有则先设置token再获取
+    needs_update = False
+    has_missing_name = any(pd.isna(df.loc[idx, 'name']) or str(df.loc[idx, 'name']).strip() == '' for idx in df.index)
+
+    if has_missing_name and get_instruments is not None:
+        # 先设置掘金token（在调用API之前）
+        _init_gm_token()
+
+        # 检查并填充缺失的 name
+        for idx in df.index:
+            name_val = df.loc[idx, 'name']
+            if pd.isna(name_val) or str(name_val).strip() == '':
+                ticker = str(df.loc[idx, 'symbol'])
+                # 通过API获取股票名称
+                stock_name = _get_stock_name_from_api(ticker)
+                if stock_name:
+                    df.loc[idx, 'name'] = stock_name
+                    logger.info(f"自动填充股票名称: {ticker} -> {stock_name}")
+                    needs_update = True
+
+    # 如果有更新，保存回CSV文件（保存完整文件，包括active=0的股票）
+    if needs_update:
+        # 重新读取完整文件以保留所有股票
+        full_df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str})
+        if 'name' not in full_df.columns:
+            full_df['name'] = ''
+        # 更新缺失的name
+        for idx in full_df.index:
+            name_val = full_df.loc[idx, 'name']
+            if pd.isna(name_val) or str(name_val).strip() == '':
+                ticker = str(full_df.loc[idx, 'symbol'])
+                stock_name = _get_stock_name_from_api(ticker)
+                if stock_name:
+                    full_df.loc[idx, 'name'] = stock_name
+                    logger.info(f"更新CSV: {ticker} -> {stock_name}")
+        # 保存完整文件
+        full_df.to_csv(str(stock_csv_path), index=False, encoding='utf-8')
+        logger.info(f"已更新股票名称到CSV文件: {stock_csv_path}")
+
     stock_list = []
     for row in df.to_dict('records'):
         ticker = str(row['symbol'])
-        # 名称通过API获取（在填充stock_info表时获取）
+        name = str(row['name']) if not pd.isna(row['name']) else ''
         stock_list.append({
             'ticker': ticker,
-            'name': '',
+            'name': name,
             'start_date': str(row['start_date']),
             'end_date': str(row['end_date'])
         })
 
     return stock_list
+
+
+def _init_gm_token() -> bool:
+    """
+    初始化掘金Token（用于调用API前设置token）
+
+    Returns:
+        bool: 是否成功设置token
+    """
+    if set_token is None:
+        logger.warning("掘金SDK未安装")
+        return False
+
+    settings_path = project_root / "config" / "settings.json"
+    if settings_path.exists():
+        with settings_path.open('r', encoding='utf-8') as f:
+            config = json.load(f)
+            gm_token = config.get('gm_token')
+            if gm_token:
+                set_token(gm_token)
+                logger.info("掘金Token设置成功（load_stock_list）")
+                return True
+            else:
+                logger.warning("settings.json中未找到gm_token")
+    else:
+        logger.warning(f"配置文件不存在: {settings_path}")
+
+    return False
+
+
+def _get_stock_name_from_api(ticker: str) -> Optional[str]:
+    """
+    通过掘金API获取股票名称
+
+    Args:
+        ticker: 股票代码（不带交易所前缀）
+
+    Returns:
+        Optional[str]: 股票名称，如果获取失败返回 None
+    """
+    if get_instruments is None:
+        logger.warning(f"掘金SDK未安装，无法获取 {ticker} 名称")
+        return None
+
+    try:
+        # 添加交易所前缀
+        if ticker.startswith('SHSE.') or ticker.startswith('SZSE.'):
+            full_symbol = ticker
+        elif ticker.startswith('51') or ticker.startswith('58') or ticker.startswith('6') or ticker.startswith('5'):
+            full_symbol = f'SHSE.{ticker}'
+        elif ticker.startswith('0') or ticker.startswith('3') or ticker.startswith('1'):
+            full_symbol = f'SZSE.{ticker}'
+        elif ticker.startswith('688'):
+            full_symbol = f'SHSE.{ticker}'
+        else:
+            full_symbol = f'SZSE.{ticker}'
+
+        instruments = get_instruments(symbols=full_symbol)
+        if instruments and len(instruments) > 0:
+            instrument = instruments[0]
+            # 获取名称（掘金API不同版本属性名不同）
+            name = getattr(instrument, 'sec_name', None) or \
+                   getattr(instrument, 'symbol_name', None) or \
+                   getattr(instrument, 'display_name', None) or None
+            return name
+    except Exception as e:
+        logger.warning(f"获取股票名称失败: {ticker} - {e}")
+
+    return None
 
 
 def run():

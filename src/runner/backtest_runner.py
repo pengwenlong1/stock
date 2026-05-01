@@ -161,6 +161,11 @@ class BacktestRunner:
         self._sar_series: Optional[pd.Series] = None
         self._sar_signals: List[SARSignal] = []  # 预计算的SAR转折信号
 
+        # MACD指标数据（用于sell_id=2）
+        self._dif_series: Optional[pd.Series] = None  # DIF值（快线）
+        self._dea_series: Optional[pd.Series] = None  # DEA值（慢线）
+        self._macd_series: Optional[pd.Series] = None  # MACD柱值
+
         # 创业板指数数据（用于buy_id=3和buy_id=5）
         self._index_daily_rsi: Optional[pd.Series] = None
         self._index_symbol = 'SZSE.399006'  # 创业板指数
@@ -342,6 +347,14 @@ class BacktestRunner:
         for s in sar_signals:
             self.logger.info(f"  [{s.date.strftime('%Y-%m-%d')}] {s.signal_type}: SAR={s.sar_value:.3f}")
 
+        # 计算MACD指标（用于sell_id=2）
+        macd_calculator = MACDCalculator()
+        macd_calculator.prepare_data(self._close_series)
+        self._dif_series = macd_calculator._dif_series  # DIF值（用于判断死叉）
+        self._dea_series = macd_calculator._dea_series  # DEA值
+        self._macd_series = macd_calculator._macd_series  # MACD柱值
+        self.logger.info(f"MACD计算完成: DIF={self._dif_series.notna().sum()} 个有效值")
+
         # 计算创业板指数RSI（用于buy_id=3和buy_id=5）
         self._calculate_index_rsi()
 
@@ -495,6 +508,57 @@ class BacktestRunner:
                 return True
         return False
 
+    def _detect_macd_cross_down(self, date: pd.Timestamp) -> bool:
+        """
+        检测MACD是否发生跌破死叉
+
+        【逻辑说明】
+        MACD跌破死叉 = MACD死叉（DIF下穿DEA） + 最低价跌破SAR
+        - MACD死叉：DIF（快线）从上方穿过DEA（慢线）下方
+        - 跌破：最低价低于SAR值
+
+        检测条件：
+        1. DIF(t) < DEA(t) 且 DIF(t-1) >= DEA(t-1)
+        2. Low(t) < SAR(t)
+
+        Args:
+            date: 当前日期
+
+        Returns:
+            bool: 是否发生MACD跌破死叉
+        """
+        if self._dif_series is None or self._dea_series is None or self._sar_series is None:
+            return False
+
+        current_dif = self._get_value_at_date(date, self._dif_series)
+        current_dea = self._get_value_at_date(date, self._dea_series)
+        current_sar = self._get_value_at_date(date, self._sar_series)
+        current_low = self._get_value_at_date(date, self._low_series)
+
+        if np.isnan(current_dif) or np.isnan(current_dea) or np.isnan(current_sar) or np.isnan(current_low):
+            return False
+
+        # 条件1：最低价跌破SAR
+        if current_low >= current_sar:
+            return False
+
+        # 条件2：MACD死叉（DIF下穿DEA）
+        trading_dates = self._get_trading_dates()
+        try:
+            date_idx = trading_dates.index(date)
+            if date_idx > 0:
+                prev_date = trading_dates[date_idx - 1]
+                prev_dif = self._get_value_at_date(prev_date, self._dif_series)
+                prev_dea = self._get_value_at_date(prev_date, self._dea_series)
+                # 死叉：DIF从上方穿过DEA下方
+                if not np.isnan(prev_dif) and not np.isnan(prev_dea):
+                    if prev_dif >= prev_dea and current_dif < current_dea:
+                        return True
+        except Exception:
+            pass
+
+        return False
+
     def _get_divergence_info(self, date: pd.Timestamp, timeframe: str) -> Optional[Dict]:
         """获取指定日期的背离信息（跳过已处理的信号）"""
         divergences = self._daily_divergences if timeframe == 'daily' else self._weekly_divergences
@@ -582,8 +646,8 @@ class BacktestRunner:
             date: 交易日期
             signal: 卖出信号
         """
-        # 调用策略重置状态（不实际交易）
-        self.strategy.reset_after_sell(self.state, signal.flag, date)
+        # 调用策略重置状态（不设置last_sell_date，因为没有实际交易）
+        self.strategy.reset_after_sell(self.state, signal.flag, date, is_fake_sell=True)
 
         # 记录假卖出日志（不加入交易记录）
         self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 假卖出（无持仓）: {signal.reason}")
@@ -670,6 +734,12 @@ class BacktestRunner:
             weekly_rsi = self._get_value_at_date(date, self._weekly_rsi)
             sar_cross_down = self._detect_sar_cross_down(date)  # SAR绿转红替代MA死叉
 
+            # 判断 MACD 死叉（MACD 从正变负）
+            macd_cross_down = self._detect_macd_cross_down(date)
+
+            # 根据 judge_sell_ids 选择触发条件
+            sell_id = self.judge_sell_ids[0] if self.judge_sell_ids else 1
+
             # 更新RSI警戒级别
             self.strategy.update_rsi_flag(weekly_rsi, self.state, date)
 
@@ -687,9 +757,11 @@ class BacktestRunner:
                 date=date,
                 daily_rsi=daily_rsi,
                 weekly_rsi=weekly_rsi,
-                ma_cross_down=sar_cross_down,  # SAR跌破传入策略（参数名保持兼容）
+                sar_cross_down=sar_cross_down,
+                macd_cross_down=macd_cross_down,
                 state=self.state,
-                position=self._shares * self._get_value_at_date(date, self._close_series) / self.initial_capital if self._shares > 0 else 0
+                position=self._shares * self._get_value_at_date(date, self._close_series) / self.initial_capital if self._shares > 0 else 0,
+                sell_id=sell_id
             )
 
             # 处理卖出信号
@@ -701,7 +773,7 @@ class BacktestRunner:
                 else:
                     # 无持仓：执行假卖出（只重置状态，不实际交易）
                     self._execute_fake_sell(date, sell_signal)
-                    continue  # 假卖出后当天不买入
+                    # 假卖出后不跳过，继续检测买入信号（假卖出只是重置状态，没有实际交易）
 
             # 获取创业板指数RSI值
             index_daily_rsi = self._get_index_rsi_at_date(date)

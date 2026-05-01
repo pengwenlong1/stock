@@ -38,7 +38,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -165,6 +165,7 @@ class MonitorResult:
     judge_t_ids: List[int]
     judge_sell_ids: List[int]
     sar_cross_down_events: List[SARCrossDownInfo]  # SAR死叉跌破事件列表
+    pending_warnings: List[Dict] = field(default_factory=list)  # 待触发卖出信号告警
 
 
 # ==================== 钉钉告警类 ====================
@@ -410,12 +411,19 @@ class DailyMonitor:
         """获取股票名称"""
         try:
             if get_instruments is None:
+                self.logger.warning(f"get_instruments API未加载，无法获取 {symbol} 名称")
                 return "未知"
             instruments = get_instruments(symbol)
             if instruments:
-                return getattr(instruments[0], 'sec_name', '未知')
+                name = getattr(instruments[0], 'sec_name', None)
+                if name:
+                    return name
+                self.logger.warning(f"{symbol} API返回数据缺少sec_name属性")
+                return "未知"
+            self.logger.warning(f"get_instruments({symbol}) 返回空列表")
             return "未知"
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"获取股票名称失败: {symbol} - {e}")
             return "未知"
 
     def _add_exchange_prefix(self, code: str) -> str:
@@ -498,6 +506,8 @@ class DailyMonitor:
         """
         加载股票配置（从 stocks_monitor_by_day.csv）
 
+        如果CSV的name列为空，会自动通过API获取并更新CSV文件。
+
         Returns:
             股票配置列表（只包含active=1的股票）
         """
@@ -505,7 +515,30 @@ class DailyMonitor:
             self.logger.error(f"配置文件不存在: {self.config_path}")
             return []
 
-        df = pd.read_csv(self.config_path)
+        df = pd.read_csv(self.config_path, dtype={'symbol': str})
+
+        # 确保 name 列存在
+        if 'name' not in df.columns:
+            df['name'] = ''
+
+        # 检查并填充缺失的 name（对所有股票，包括active=0的）
+        needs_update = False
+        for idx in df.index:
+            name_val = df.loc[idx, 'name']
+            if pd.isna(name_val) or str(name_val).strip() == '':
+                ticker = str(df.loc[idx, 'symbol'])
+                symbol = self._add_exchange_prefix(ticker)
+                stock_name = self._get_stock_name(symbol)
+                if stock_name and stock_name != "未知":
+                    df.loc[idx, 'name'] = stock_name
+                    self.logger.info(f"自动填充股票名称: {ticker} -> {stock_name}")
+                    needs_update = True
+
+        # 如果有更新，保存回CSV文件
+        if needs_update:
+            df.to_csv(self.config_path, index=False, encoding='utf-8')
+            self.logger.info(f"已更新股票名称到CSV文件: {self.config_path}")
+
         stocks = []
 
         for _, row in df.iterrows():
@@ -1186,9 +1219,11 @@ class DailyMonitor:
                     date=current_cross_down_date,
                     daily_rsi=daily_rsi_at_signal,
                     weekly_rsi=weekly_rsi_at_signal,
-                    ma_cross_down=True,  # SAR死叉跌破触发卖出
+                    sar_cross_down=True,  # SAR死叉跌破触发卖出
+                    macd_cross_down=False,  # 暂不支持MACD死叉触发
                     state=state,
-                    position=1.0
+                    position=1.0,
+                    sell_id=1  # 默认使用sell_id=1
                 )
 
                 if sell_signal_obj is not None:
@@ -1233,9 +1268,66 @@ class DailyMonitor:
                     signals.append(signal_info)
                     self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
 
-        # 获取最新日期的数据
+        # ==================== 独立买入信号检测 ====================
+        # 买入条件只依赖RSI，不应该依赖SAR死叉事件
+        # 如果最近交易日没有通过SAR循环触发买入信号，则独立检测买入条件
         last_date = df.index[-1]
         last_date_str = last_date.strftime('%Y-%m-%d')
+        recent_dates = self.get_recent_trading_dates(end_date, RECENT_TRADING_DAYS)
+
+        # 检查最新日期是否在最近交易日范围内，且当天没有买入信号
+        if last_date_str in recent_dates:
+            # 检查当天是否已经有买入信号（通过SAR循环触发）
+            has_buy_signal_today = any(
+                sig.signal_type == 'buy' and sig.signal_date == last_date_str
+                for sig in signals
+            )
+
+            if not has_buy_signal_today:
+                latest_daily_rsi = daily_rsi.iloc[-1] if len(daily_rsi) > 0 else np.nan
+                latest_weekly_rsi = weekly_rsi.iloc[-1] if len(weekly_rsi) > 0 else np.nan
+                latest_index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, last_date_str)
+                latest_index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, last_date_str)
+
+                if not np.isnan(latest_daily_rsi) and not np.isnan(latest_weekly_rsi):
+                    # 创建策略实例和状态（用于独立买入检测）
+                    strategy = TradingStrategy(
+                        buy_ids=stock_config.judge_buy_ids,
+                        t_ids=stock_config.judge_t_ids,
+                        sell_ids=stock_config.judge_sell_ids
+                    )
+                    state = StrategyState()
+
+                    # 检测买入信号（独立于SAR事件）
+                    buy_signal_obj = strategy.check_buy_signal(
+                        date=last_date,
+                        daily_rsi=latest_daily_rsi,
+                        weekly_rsi=latest_weekly_rsi,
+                        state=state,
+                        has_new_cash=True,
+                        has_sold_cash=True,
+                        index_daily_rsi=latest_index_rsi_cyb,
+                        sh_index_daily_rsi=latest_index_rsi_sh
+                    )
+
+                    if buy_signal_obj is not None and buy_signal_obj.triggered:
+                        signal_info = SignalInfo(
+                            signal_date=last_date_str,
+                            signal_type='buy',
+                            signal_detail=f"[{'新资金买入' if buy_signal_obj.is_new_cash else '做T买回'}] {buy_signal_obj.reason} (独立RSI触发)",
+                            current_price=df['close'].iloc[-1],
+                            daily_rsi=latest_daily_rsi,
+                            weekly_rsi=latest_weekly_rsi,
+                            index_daily_rsi_cyb=latest_index_rsi_cyb,
+                            index_daily_rsi_sh=latest_index_rsi_sh,
+                            sar_cross_down_info=None  # 无SAR事件
+                        )
+                        signals.append(signal_info)
+                        self.logger.info(f"  [独立买入检测] {last_date_str}: "
+                                       f"日RSI={latest_daily_rsi:.2f}, 周RSI={latest_weekly_rsi:.2f}")
+                        self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
+
+        # 获取最新数据用于监控结果展示
 
         latest_daily_rsi = daily_rsi.iloc[-1] if len(daily_rsi) > 0 else np.nan
         latest_weekly_rsi = weekly_rsi.iloc[-1] if len(weekly_rsi) > 0 else np.nan
@@ -1246,6 +1338,90 @@ class DailyMonitor:
 
         # 判断当前SAR趋势
         latest_sar_trend = '多头' if latest_sar < latest_price else '空头'
+
+        # ==================== 待触发卖出信号告警 ====================
+        # 只显示最近一次SAR死叉之后至今的告警
+        # 如果从未发生过SAR死叉，则显示所有告警
+        pending_warnings = []
+
+        # 获取最近一次SAR死叉日期（通过SAR值和收盘价判断）
+        # SAR死叉（绿转红）= SAR从价格下方转到上方：SAR(t) > Close(t) 且 SAR(t-1) <= Close(t-1)
+        last_sar_cross_down_date = None
+        if sar_series is not None and len(sar_series) > 1 and df is not None:
+            # 从最新日期往前查找最近一次死叉
+            for i in range(len(sar_series) - 1, 0, -1):
+                curr_sar = sar_series.iloc[i]
+                prev_sar = sar_series.iloc[i - 1]
+                curr_close = df['close'].iloc[i]
+                prev_close = df['close'].iloc[i - 1]
+                curr_date = sar_series.index[i]
+
+                # 判断是否发生SAR死叉（绿转红）
+                if curr_sar > curr_close and prev_sar <= prev_close:
+                    last_sar_cross_down_date = pd.Timestamp(curr_date.strftime('%Y-%m-%d'))
+                    break
+
+        # 检查周线顶背离已生效但还没有SAR死叉
+        # 只显示在最近一次SAR死叉之后生效的背离
+        if weekly_divergences_confirmed and len(weekly_divergences_confirmed) > 0:
+            for div in weekly_divergences_confirmed:
+                if div.confirmation_date is not None:
+                    # 过滤：只显示最近一次SAR死叉之后生效的背离
+                    # 统一时区处理：去掉时区信息进行比较
+                    div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
+                    if last_sar_cross_down_date is None or div_date > last_sar_cross_down_date:
+                        pending_warnings.append({
+                            'type': '周线顶背离',
+                            'detail': f"周线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发清仓",
+                            'severity': 'HIGH',
+                            'confirmation_date': div.confirmation_date
+                        })
+                        self.logger.warning(f"  [待触发告警] 周线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发清仓")
+
+        # 检查周线RSI已达警戒级别但还没有SAR死叉
+        # RSI警戒是当前状态，始终显示（如果当前SAR趋势是多头，即还没死叉）
+        if not np.isnan(latest_weekly_rsi) and latest_sar_trend == '多头':
+            if latest_weekly_rsi >= 90:
+                pending_warnings.append({
+                    'type': 'RSI清仓警戒',
+                    'detail': f"周线RSI={latest_weekly_rsi:.2f}>90，等待SAR死叉触发清仓",
+                    'severity': 'HIGH',
+                    'confirmation_date': pd.Timestamp(end_date)
+                })
+                self.logger.warning(f"  [待触发告警] 周线RSI>90，等待SAR死叉触发清仓")
+            elif latest_weekly_rsi >= 85:
+                pending_warnings.append({
+                    'type': 'RSI减仓警戒',
+                    'detail': f"周线RSI={latest_weekly_rsi:.2f}>85，等待SAR死叉触发卖出1/2",
+                    'severity': 'MEDIUM',
+                    'confirmation_date': pd.Timestamp(end_date)
+                })
+                self.logger.warning(f"  [待触发告警] 周线RSI>85，等待SAR死叉触发卖出1/2")
+            elif latest_weekly_rsi >= 80:
+                pending_warnings.append({
+                    'type': 'RSI减仓警戒',
+                    'detail': f"周线RSI={latest_weekly_rsi:.2f}>80，等待SAR死叉触发卖出1/3",
+                    'severity': 'LOW',
+                    'confirmation_date': pd.Timestamp(end_date)
+                })
+                self.logger.info(f"  [待触发提示] 周线RSI>80，等待SAR死叉触发卖出1/3")
+
+        # 检查日线顶背离已生效但还没有SAR死叉
+        # 只显示在最近一次SAR死叉之后生效的背离
+        if daily_divergences_confirmed and len(daily_divergences_confirmed) > 0:
+            for div in daily_divergences_confirmed:
+                if div.confirmation_date is not None:
+                    # 过滤：只显示最近一次SAR死叉之后生效的背离
+                    # 统一时区处理：去掉时区信息进行比较
+                    div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
+                    if last_sar_cross_down_date is None or div_date > last_sar_cross_down_date:
+                        pending_warnings.append({
+                            'type': '日线顶背离',
+                            'detail': f"日线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发卖出1/3",
+                            'severity': 'LOW',
+                            'confirmation_date': div.confirmation_date
+                        })
+                        self.logger.info(f"  [待触发提示] 日线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发卖出1/3")
 
         # 构建备注
         notes = f"SAR趋势={latest_sar_trend}; "
@@ -1269,7 +1445,8 @@ class DailyMonitor:
             judge_buy_ids=stock_config.judge_buy_ids,
             judge_t_ids=stock_config.judge_t_ids,
             judge_sell_ids=stock_config.judge_sell_ids,
-            sar_cross_down_events=sar_cross_down_events
+            sar_cross_down_events=sar_cross_down_events,
+            pending_warnings=pending_warnings
         )
 
         return result
@@ -1365,6 +1542,23 @@ class DailyMonitor:
                         self.logger.info(f"    创业板RSI: {cyb_rsi_str} | 上证RSI: {sh_rsi_str}")
                     self.logger.info(f"    详情: {sig.signal_detail}")
 
+                # 输出待触发告警
+                if len(r.pending_warnings) > 0:
+                    self.logger.info(f"  ⚠️ 待触发卖出信号 ({len(r.pending_warnings)} 个):")
+                    for warning in r.pending_warnings:
+                        severity_str = "🔴" if warning['severity'] == 'HIGH' else "🟡" if warning['severity'] == 'MEDIUM' else "🟢"
+                        self.logger.info(f"    {severity_str} [{warning['type']}] {warning['detail']}")
+
+        # 输出待触发告警汇总（包括无信号的股票）
+        all_warnings = [(r, w) for r in sorted_results for w in r.pending_warnings]
+        if len(all_warnings) > 0:
+            self.logger.info("")
+            self.logger.info("【待触发卖出信号汇总】")
+            self.logger.info("-" * 80)
+            for r, warning in all_warnings:
+                severity_str = "🔴" if warning['severity'] == 'HIGH' else "🟡" if warning['severity'] == 'MEDIUM' else "🟢"
+                self.logger.info(f"  {severity_str} {r.stock_name}({r.symbol}): [{warning['type']}] {warning['detail']}")
+
         # 无信号统计
         no_signals = [r for r in sorted_results if len(r.signals) == 0]
         if len(no_signals) > 0:
@@ -1391,9 +1585,12 @@ class DailyMonitor:
         # 收集有信号的股票
         results_with_signals = [r for r in results if len(r.signals) > 0]
 
-        # 如果没有信号，不发送告警
-        if len(results_with_signals) == 0:
-            self.logger.info("无信号触发，不发送钉钉告警")
+        # 收集有待触发告警的股票
+        results_with_warnings = [r for r in results if len(r.pending_warnings) > 0]
+
+        # 如果没有信号且没有待触发告警，不发送告警
+        if len(results_with_signals) == 0 and len(results_with_warnings) == 0:
+            self.logger.info("无信号且无待触发告警，不发送钉钉告警")
             return
 
         # 构建Markdown消息
@@ -1404,7 +1601,8 @@ class DailyMonitor:
         content_lines.append(f"**监控时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         content_lines.append(f"**监控范围**: 最近 {RECENT_TRADING_DAYS} 个交易日\n")
         content_lines.append(f"**监控股票数**: {len(results)} 只\n")
-        content_lines.append(f"**有信号股票**: {len(results_with_signals)} 只\n\n")
+        content_lines.append(f"**有信号股票**: {len(results_with_signals)} 只\n")
+        content_lines.append(f"**待触发告警**: {len(results_with_warnings)} 只\n\n")
 
         # 按信号类型分组
         sell_signals_by_date: Dict[str, List] = {}
@@ -1457,6 +1655,38 @@ class DailyMonitor:
                     content_lines.append(f"  - 日RSI: {daily_rsi_str} | 周RSI: {weekly_rsi_str}\n")
                     content_lines.append(f"  - 创业板RSI: {cyb_rsi_str} | 上证RSI: {sh_rsi_str}\n")
                     content_lines.append(f"  - {sig.signal_detail}\n\n")
+
+        # 待触发告警（已形成卖点但还没触发死叉）
+        if len(results_with_warnings) > 0:
+            # 按严重程度分组
+            high_warnings = [(r, w) for r in results_with_warnings for w in r.pending_warnings if w['severity'] == 'HIGH']
+            medium_warnings = [(r, w) for r in results_with_warnings for w in r.pending_warnings if w['severity'] == 'MEDIUM']
+            low_warnings = [(r, w) for r in results_with_warnings for w in r.pending_warnings if w['severity'] == 'LOW']
+
+            total_warnings = len(high_warnings) + len(medium_warnings) + len(low_warnings)
+            content_lines.append(f"### ⚠️ 待触发卖出信号 ({total_warnings}条)\n")
+            content_lines.append("---\n")
+
+            # 高严重度告警
+            if len(high_warnings) > 0:
+                content_lines.append(f"**🔴 高警戒 ({len(high_warnings)}条)**\n")
+                for r, warning in high_warnings:
+                    content_lines.append(f"- **{r.stock_name}** ({r.symbol}): [{warning['type']}] {warning['detail']}\n")
+                content_lines.append("\n")
+
+            # 中严重度告警
+            if len(medium_warnings) > 0:
+                content_lines.append(f"**🟡 中警戒 ({len(medium_warnings)}条)**\n")
+                for r, warning in medium_warnings:
+                    content_lines.append(f"- **{r.stock_name}** ({r.symbol}): [{warning['type']}] {warning['detail']}\n")
+                content_lines.append("\n")
+
+            # 低严重度告警
+            if len(low_warnings) > 0:
+                content_lines.append(f"**🟢 低警戒 ({len(low_warnings)}条)**\n")
+                for r, warning in low_warnings:
+                    content_lines.append(f"- **{r.stock_name}** ({r.symbol}): [{warning['type']}] {warning['detail']}\n")
+                content_lines.append("\n")
 
         # 市场概况
         content_lines.append(f"### 📊 市场概况\n")

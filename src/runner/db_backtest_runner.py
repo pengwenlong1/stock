@@ -46,7 +46,7 @@ project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # 导入策略类
-from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag
+from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag, COOLDOWN_DAYS
 
 # ==================== 数据结构 ====================
 
@@ -246,12 +246,15 @@ class DBBacktestRunner:
                 SELECT
                     trade_date,
                     close_price,
+                    low_price,
                     ma5,
                     ma10,
                     ma5_ma10_dead_cross,
                     rsi_daily,
                     rsi_weekly,
                     macd,
+                    dif,
+                    dea,
                     sar,
                     is_sar_dead_cross,
                     is_daily_top_divergence,
@@ -448,11 +451,24 @@ class DBBacktestRunner:
                         return np.nan
                     return float(val)
 
+                # 安全获取字段（处理可能不存在的新字段）
+                def safe_get_float(row, col_name):
+                    """安全获取字段值，不存在则返回np.nan"""
+                    try:
+                        if col_name in row.index:
+                            return safe_float(row[col_name])
+                        return np.nan
+                    except Exception:
+                        return np.nan
+
                 return {
                     'close_price': safe_float(row['close_price']),
+                    'low_price': safe_get_float(row, 'low_price'),  # 最低价（用于MACD跌破死叉判断）
                     'daily_rsi': safe_float(row['rsi_daily']),
                     'weekly_rsi': safe_float(row['rsi_weekly']),
                     'macd': safe_float(row['macd']),
+                    'dif': safe_get_float(row, 'dif'),  # DIF值（用于MACD死叉判断）
+                    'dea': safe_get_float(row, 'dea'),  # DEA值（用于MACD死叉判断）
                     'sar': safe_float(row['sar']),
                     'is_sar_dead_cross': int(row['is_sar_dead_cross']) if pd.notna(row['is_sar_dead_cross']) else 0,
                     'is_daily_top_divergence': int(row['is_daily_top_divergence']) if pd.notna(row['is_daily_top_divergence']) else 0,
@@ -515,7 +531,7 @@ class DBBacktestRunner:
 
     def _execute_fake_sell(self, date: pd.Timestamp, signal: SellSignal) -> None:
         """执行假卖出操作（无持仓时重置状态）"""
-        self.strategy.reset_after_sell(self.state, signal.flag, date)
+        self.strategy.reset_after_sell(self.state, signal.flag, date, is_fake_sell=True)
         self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 假卖出（无持仓）: {signal.reason}")
 
     def _execute_buy(self, date: pd.Timestamp, signal: BuySignal) -> None:
@@ -604,8 +620,37 @@ class DBBacktestRunner:
             # 使用 SAR 死叉（is_sar_dead_cross）替代均线死叉
             sar_cross_down = metrics.get('is_sar_dead_cross', 0) == 1
 
-            # 也可以使用均线死叉
-            ma_cross_down = metrics.get('ma5_ma10_dead_cross', 0) == 1
+            # 判断 MACD 跌破死叉（MACD死叉 + 最低价跌破SAR）
+            # MACD死叉：DIF下穿DEA（DIF从上方穿过DEA下方）
+            # 跌破：最低价低于SAR值
+            macd_cross_down = False
+            current_dif = metrics.get('dif', np.nan)
+            current_dea = metrics.get('dea', np.nan)
+            current_sar = metrics.get('sar', np.nan)
+            current_low = metrics.get('low_price', np.nan)
+
+            if not np.isnan(current_dif) and not np.isnan(current_dea) and not np.isnan(current_sar):
+                # 条件1：最低价跌破SAR（如果最低价不存在，则不触发）
+                if not np.isnan(current_low) and current_low < current_sar:
+                    # 条件2：MACD死叉（DIF下穿DEA）
+                    try:
+                        date_idx = trading_dates.index(date)
+                        if date_idx > 0:
+                            prev_date = trading_dates[date_idx - 1]
+                            prev_metrics = self._get_metrics_at_date(prev_date)
+                            prev_dif = prev_metrics.get('dif', np.nan)
+                            prev_dea = prev_metrics.get('dea', np.nan)
+                            # 死叉：DIF从上方穿过DEA下方
+                            if not np.isnan(prev_dif) and not np.isnan(prev_dea):
+                                if prev_dif >= prev_dea and current_dif < current_dea:
+                                    macd_cross_down = True
+                    except Exception:
+                        pass
+
+            # 根据 judge_sell_ids 选择触发条件
+            # sell_id=1: SAR死叉跌破触发
+            # sell_id=2: MACD跌破死叉触发
+            sell_id = self.judge_sell_ids[0] if self.judge_sell_ids else 1
 
             # 更新RSI警戒级别
             self.strategy.update_rsi_flag(weekly_rsi, self.state, date)
@@ -614,32 +659,50 @@ class DBBacktestRunner:
             daily_top_div = metrics.get('is_daily_top_divergence', 0) == 1
             weekly_top_div = metrics.get('is_weekly_top_divergence', 0) == 1
 
-            if daily_top_div and self.state.daily_divergence_flag == 0:
-                self.state.daily_divergence_flag = 1
-                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离生效（数据库标志）")
-
+            # 【周线顶背离生效】设置标志和背离信息，等待触发条件（死叉）才卖出
             if weekly_top_div and self.state.weekly_divergence_flag == 0:
                 self.state.weekly_divergence_flag = 1
-                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 周线顶背离生效（数据库标志）")
+                # 设置背离信息（使用当前日期作为背离生效日期）
+                divergence_info = {
+                    'date': date,
+                    'prev_high': metrics.get('close_price', 0.0),
+                    'curr_high': metrics.get('close_price', 0.0)
+                }
+                self.state.weekly_divergence_info = divergence_info
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 周线顶背离生效（数据库标志），等待死叉触发清仓")
 
-            # 调用策略检测卖出信号
+            # 【日线顶背离生效】设置标志和背离信息，等待触发条件（死叉）才卖出
+            if daily_top_div and self.state.daily_divergence_flag == 0:
+                self.state.daily_divergence_flag = 1
+                # 设置背离信息（使用当前日期作为背离生效日期）
+                divergence_info = {
+                    'date': date,
+                    'prev_high': metrics.get('close_price', 0.0),
+                    'curr_high': metrics.get('close_price', 0.0)
+                }
+                self.state.daily_divergence_info = divergence_info
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离生效（数据库标志），等待死叉触发卖出1/3")
+
+            # 调用策略检测卖出信号（检查触发条件：SAR死叉或MACD死叉）
             sell_signal = self.strategy.check_sell_signal(
                 date=date,
                 daily_rsi=daily_rsi,
                 weekly_rsi=weekly_rsi,
-                ma_cross_down=sar_cross_down,  # 使用数据库中的SAR死叉标志
+                sar_cross_down=sar_cross_down,
+                macd_cross_down=macd_cross_down,
                 state=self.state,
-                position=self._shares * metrics.get('close_price', 0) / self.initial_capital if self._shares > 0 else 0
+                position=self._shares * metrics.get('close_price', 0) / self.initial_capital if self._shares > 0 else 0,
+                sell_id=sell_id
             )
 
             # 处理卖出信号
             if sell_signal is not None:
                 if self._shares > 0:
                     self._execute_sell(date, sell_signal)
-                    continue
+                    continue  # 实际卖出后，当天不再买入
                 else:
                     self._execute_fake_sell(date, sell_signal)
-                    continue
+                    # 假卖出后不跳过，继续检测买入信号（假卖出只是重置状态，没有实际交易）
 
             # 获取指数ETF的RSI数据
             index_daily_rsi = np.nan
@@ -668,6 +731,16 @@ class DBBacktestRunner:
                             sh_index_daily_rsi = float(rsi_val)
                 except Exception:
                     pass
+
+            # 检查买入冷却期状态（调试）
+            if self.state.last_sell_date is not None:
+                days_since_sell = (date - self.state.last_sell_date).days
+                if days_since_sell < COOLDOWN_DAYS:
+                    self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入冷却期: 距上次卖出{days_since_sell}天 < {COOLDOWN_DAYS}天")
+
+            # 调试：记录买入条件检测前的状态
+            if not np.isnan(index_daily_rsi) and index_daily_rsi < 20:
+                self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入条件可能触发: 创业板RSI={index_daily_rsi:.2f}, last_sell_date={self.state.last_sell_date}")
 
             # 调用策略检测买入信号
             buy_signal = self.strategy.check_buy_signal(
