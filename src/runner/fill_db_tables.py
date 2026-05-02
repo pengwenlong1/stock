@@ -612,10 +612,12 @@ class DatabaseFiller:
             divergence_detector.prepare_data(full_symbol, warmup_start, end_date)
             divergences = divergence_detector.detect_all_divergences()
 
-            # 日线顶背离生效日期（使用confirmation_date，使用日期字符串格式）
-            daily_top_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('daily_top_confirmed', []) if d.confirmation_date is not None)
-            # 周线顶背离生效日期
-            weekly_top_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('weekly_top_confirmed', []) if d.confirmation_date is not None)
+            # 【方案A】存储背离形成日期（峰点B日期，d.date），而不是生效日期
+            # 生效由回测时根据 sell_id 用 SAR死叉或MACD死叉判断
+            # 日线顶背离形成日期
+            daily_top_div_dates = set(d.date.strftime('%Y-%m-%d') for d in divergences.get('daily_top_formed', []) if d.date is not None)
+            # 周线顶背离形成日期
+            weekly_top_div_dates = set(d.date.strftime('%Y-%m-%d') for d in divergences.get('weekly_top_formed', []) if d.date is not None)
 
             # 底背离（目前暂不计算，设为空）
             daily_bottom_div_dates = set()

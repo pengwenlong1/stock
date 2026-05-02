@@ -11,7 +11,7 @@
  Target Server Version : 80046 (8.0.46)
  File Encoding         : 65001
 
- Date: 26/04/2026 13:20:06
+ Date: 30/04/2026 21:42:24
 */
 
 SET NAMES utf8mb4;
@@ -23,15 +23,18 @@ SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS `stock_daily_metrics`;
 CREATE TABLE `stock_daily_metrics`  (
   `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT,
-  `stock_id` varchar(10) UNSIGNED NOT NULL COMMENT '关联 stock_info.stock_id',
+  `stock_id` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '关联 stock_info.stock_id',
   `trade_date` date NOT NULL COMMENT '交易日（工作日）',
   `close_price` decimal(10, 2) NOT NULL COMMENT '收盘价（代表当日股价）',
+  `low_price` decimal(10, 2) NULL DEFAULT NULL COMMENT '最低价',
   `ma5` decimal(10, 2) NULL DEFAULT NULL COMMENT '5日均线',
   `ma10` decimal(10, 2) NULL DEFAULT NULL COMMENT '10日均线',
   `ma5_ma10_dead_cross` tinyint(1) NOT NULL DEFAULT 0 COMMENT '5日与10日均线死叉：0-否, 1-是',
   `rsi_daily` decimal(5, 2) NULL DEFAULT NULL COMMENT '日线RSI（0~100）',
   `rsi_weekly` decimal(5, 2) NULL DEFAULT NULL COMMENT '周线RSI',
   `macd` decimal(10, 4) NULL DEFAULT NULL COMMENT 'MACD值',
+  `dif` decimal(10, 4) NULL DEFAULT NULL COMMENT 'DIF值（MACD快线）',
+  `dea` decimal(10, 4) NULL DEFAULT NULL COMMENT 'DEA值（MACD慢线）',
   `sar` decimal(10, 4) NULL DEFAULT NULL COMMENT 'sar值',
   `is_daily_top_divergence` tinyint(1) NOT NULL DEFAULT 0 COMMENT '是否日线顶背离：0-否, 1-是',
   `is_daily_bottom_divergergence` tinyint(1) NOT NULL DEFAULT 0 COMMENT '是否热线底背离：0-否, 1-是',
@@ -48,7 +51,7 @@ CREATE TABLE `stock_daily_metrics`  (
   INDEX `idx_trade_date`(`trade_date` ASC) USING BTREE,
   INDEX `idx_stock_status`(`stock_id` ASC, `status` ASC) USING BTREE,
   INDEX `idx_date_status`(`trade_date` ASC, `status` ASC) USING BTREE
-) ENGINE = InnoDB AUTO_INCREMENT = 215041 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci ROW_FORMAT = Dynamic;
+) ENGINE = InnoDB AUTO_INCREMENT = 97482 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用来记录个股股票的日交易信息' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for stock_index_daily_metrics
@@ -56,7 +59,7 @@ CREATE TABLE `stock_daily_metrics`  (
 DROP TABLE IF EXISTS `stock_index_daily_metrics`;
 CREATE TABLE `stock_index_daily_metrics`  (
   `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT,
-  `stock_id` varchar(10) UNSIGNED NOT NULL COMMENT '指数的code id',
+  `stock_id` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '指数的code id',
   `trade_date` date NOT NULL COMMENT '交易日（工作日）',
   `close_price` decimal(10, 2) NOT NULL COMMENT '收盘价（代表当日股价）',
   `ma5` decimal(10, 2) NULL DEFAULT NULL COMMENT '5日均线',
@@ -82,7 +85,7 @@ CREATE TABLE `stock_index_daily_metrics`  (
   INDEX `idx_trade_date`(`trade_date` ASC) USING BTREE,
   INDEX `idx_stock_status`(`stock_id` ASC, `status` ASC) USING BTREE,
   INDEX `idx_date_status`(`trade_date` ASC, `status` ASC) USING BTREE
-) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用来记录大盘指数的信息' ROW_FORMAT = Dynamic;
+) ENGINE = InnoDB AUTO_INCREMENT = 18102 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '用来记录大盘指数的信息' ROW_FORMAT = DYNAMIC;
 
 -- ----------------------------
 -- Table structure for stock_info

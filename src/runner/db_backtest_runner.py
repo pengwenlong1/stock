@@ -659,29 +659,27 @@ class DBBacktestRunner:
             daily_top_div = metrics.get('is_daily_top_divergence', 0) == 1
             weekly_top_div = metrics.get('is_weekly_top_divergence', 0) == 1
 
-            # 【周线顶背离生效】设置标志和背离信息，等待触发条件（死叉）才卖出
+            # 【周线顶背离形成】设置标志，等待死叉触发生效后卖出
             if weekly_top_div and self.state.weekly_divergence_flag == 0:
                 self.state.weekly_divergence_flag = 1
-                # 设置背离信息（使用当前日期作为背离生效日期）
                 divergence_info = {
                     'date': date,
                     'prev_high': metrics.get('close_price', 0.0),
                     'curr_high': metrics.get('close_price', 0.0)
                 }
                 self.state.weekly_divergence_info = divergence_info
-                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 周线顶背离生效（数据库标志），等待死叉触发清仓")
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 周线顶背离形成，等待死叉触发生效")
 
-            # 【日线顶背离生效】设置标志和背离信息，等待触发条件（死叉）才卖出
+            # 【日线顶背离形成】设置标志，等待死叉触发生效后卖出
             if daily_top_div and self.state.daily_divergence_flag == 0:
                 self.state.daily_divergence_flag = 1
-                # 设置背离信息（使用当前日期作为背离生效日期）
                 divergence_info = {
                     'date': date,
                     'prev_high': metrics.get('close_price', 0.0),
                     'curr_high': metrics.get('close_price', 0.0)
                 }
                 self.state.daily_divergence_info = divergence_info
-                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离生效（数据库标志），等待死叉触发卖出1/3")
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离形成，等待死叉触发生效")
 
             # 调用策略检测卖出信号（检查触发条件：SAR死叉或MACD死叉）
             sell_signal = self.strategy.check_sell_signal(
