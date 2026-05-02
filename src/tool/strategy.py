@@ -34,6 +34,12 @@ buy_id 条件:
 - buy_id=3: 创业板指数日RSI<25 (指数保护型)
 - buy_id=4: 日RSI<20 且 周RSI<20 (极度保守型)
 - buy_id=5: 创业板指数日RSI<20 (指数保护型)
+- buy_id=6: 上证指数日RSI<20 (上证指数保护型)
+- buy_id=7: 上证指数日RSI<25 (上证指数保护型)
+
+【买入资金逻辑】
+- judge_buy_ids触发: 买入所有可用资金（新资金 + 卖出后待买回资金），无条件限制
+- judge_t_ids触发: 只买回卖出后的资金，不买入新资金
 
 作者：量化交易团队
 创建日期：2024
@@ -68,8 +74,8 @@ RSI_THRESHOLDS = {
     'weekly_sell_level3': 90    # 三级警戒(清仓)
 }
 
-# 卖出后冷却期天数
-COOLDOWN_DAYS = 5
+# 卖出后冷却期天数（已禁用）
+COOLDOWN_DAYS = 0
 
 
 # ==================== 数据结构定义 ====================
@@ -329,42 +335,45 @@ class TradingStrategy:
             BuySignal 或 None（无信号）
 
         买入规则：
-        - judge_buy_ids触发: 一次性买入新资金 + 买回之前卖出的资金
-        - judge_t_ids触发: 只买回之前卖出的资金，不买入新资金
-        """
-        # 检查卖出冷却期
-        if state.last_sell_date is not None:
-            days_since_sell = (date - state.last_sell_date).days
-            if days_since_sell < COOLDOWN_DAYS:
-                return None
+        - judge_buy_ids触发: 买入所有可用资金（新资金 + 卖出后待买回资金），无条件限制
+        - judge_t_ids触发: 只买回卖出后待买回的资金，不买入新资金
 
+        【重要说明】
+        judge_buy_ids 是最高优先级买入信号，只要满足条件且有可用资金（新资金或卖出资金）就触发。
+        """
         # 检查无效值
         if np.isnan(daily_rsi) or np.isnan(weekly_rsi):
             return None
 
-        # 首先检查 judge_buy_ids（优先级更高，买入新资金+买回卖出资金）
-        if has_new_cash or has_sold_cash:
-            for buy_id in self.buy_ids:
-                condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
-                if condition_met:
-                    # judge_buy_ids触发：买入新资金 + 买回卖出资金
-                    return BuySignal(
-                        triggered=True,
-                        is_new_cash=True,  # 包含新资金买入
-                        reason=f"买入信号 [{condition_desc}], 买入新资金+买回卖出资金",
-                        daily_rsi=daily_rsi,
-                        weekly_rsi=weekly_rsi
-                    )
+        # 检查是否有可用资金（新资金或卖出后待买回的资金）
+        has_available_cash = has_new_cash or has_sold_cash
+        if not has_available_cash:
+            return None  # 没有任何可用资金，无法买入
 
-        # 然后检查 judge_t_ids（只买回卖出资金）
-        if has_sold_cash:
+        # 首先检查 judge_buy_ids（最高优先级，买入所有可用资金）
+        for buy_id in self.buy_ids:
+            condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
+            if condition_met:
+                # judge_buy_ids触发：买入所有可用资金（新资金 + 卖出资金）
+                return BuySignal(
+                    triggered=True,
+                    is_new_cash=True,  # 标记为包含新资金，会买入所有可用资金
+                    reason=f"买入信号 [{condition_desc}], 买入所有可用资金",
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi
+                )
+
+        # 然后检查 judge_t_ids（只买回卖出资金，不买入新资金）
+        # 注意：只有在有卖出资金且没有新资金时才检查 t_ids
+        # 如果有新资金，应该等待 judge_buy_ids 触发而不是用 t_ids
+        if has_sold_cash and not has_new_cash:
             for t_id in self.t_ids:
                 condition_met, condition_desc = self._check_single_buy_condition_with_desc(t_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
                 if condition_met:
                     # judge_t_ids触发：只买回卖出资金
                     return BuySignal(
                         triggered=True,
-                        is_new_cash=False,  # 不包含新资金
+                        is_new_cash=False,  # 不包含新资金，只买回卖出资金
                         reason=f"做T买回信号 [{condition_desc}], 只买回卖出资金",
                         daily_rsi=daily_rsi,
                         weekly_rsi=weekly_rsi
@@ -442,7 +451,7 @@ class TradingStrategy:
 
         return False, ""
 
-    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan) -> bool:
+    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan) -> bool:
         """
         检查单个买入ID的条件
 

@@ -97,7 +97,8 @@ class DBBacktestRunner:
                  judge_t_ids: List[int] = [2],
                  judge_sell_ids: List[int] = [1],
                  initial_capital: float = 100000.0,
-                 output_dir: Optional[Path] = None) -> None:
+                 output_dir: Optional[Path] = None,
+                 fully_invested: int = 1) -> None:
         """
         初始化数据库回测执行器
 
@@ -111,6 +112,7 @@ class DBBacktestRunner:
             judge_sell_ids: 卖出策略ID列表
             initial_capital: 初始资金
             output_dir: 输出目录路径
+            fully_invested: 是否默认全仓持有（1=全仓持有，0=空仓等待买入信号）
         """
         self.stock_id = stock_id
         self.stock_name = stock_name
@@ -120,6 +122,7 @@ class DBBacktestRunner:
         self.judge_t_ids = judge_t_ids
         self.judge_sell_ids = judge_sell_ids
         self.initial_capital = initial_capital
+        self.fully_invested = fully_invested
 
         # 加载数据库配置
         self._db_config = self._load_db_config()
@@ -601,6 +604,18 @@ class DBBacktestRunner:
         trading_dates = self._get_trading_dates()
         self.logger.info(f"回测交易日数: {len(trading_dates)}")
 
+        # 如果 fully_invested=1，在第一天全仓买入（基准策略：默认全仓持有）
+        if self.fully_invested == 1 and len(trading_dates) > 0:
+            first_date = trading_dates[0]
+            first_metrics = self._get_metrics_at_date(first_date)
+            first_price = first_metrics.get('close_price', np.nan)
+            if not np.isnan(first_price) and self._cash > 0:
+                # 全仓买入
+                buy_shares = self._cash / first_price
+                self._shares = buy_shares
+                self._cash = 0.0
+                self.logger.info(f"[{first_date.strftime('%Y-%m-%d')}] 初始全仓买入: {int(buy_shares)}股 @ {first_price:.3f} | 金额:{self.initial_capital:.2f} | (基准策略)")
+
         # 逐日遍历
         for date in trading_dates:
             # 获取当日指标值
@@ -700,7 +715,7 @@ class DBBacktestRunner:
             index_daily_rsi = np.nan
             sh_index_daily_rsi = np.nan
 
-            # 获取创业板ETF的RSI
+            # 获取创业板指数的RSI
             if self._index_metrics_df is not None:
                 try:
                     date_str = date.strftime('%Y-%m-%d')
@@ -709,10 +724,17 @@ class DBBacktestRunner:
                         rsi_val = matching.iloc[0]['rsi_daily']
                         if pd.notna(rsi_val):
                             index_daily_rsi = float(rsi_val)
-                except Exception:
-                    pass
+                            # 调试：记录创业板RSI值（当有卖出资金且RSI较低时）
+                            if self._sold_cash > 0 and index_daily_rsi < 30:
+                                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数RSI={index_daily_rsi:.2f}, 待买回资金={self._sold_cash:.2f}")
+                except Exception as e:
+                    self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 获取创业板指数RSI失败: {e}")
+            else:
+                # 调试：记录指数数据缺失
+                if self._sold_cash > 0:
+                    self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 创业板指数数据缺失(_index_metrics_df=None), 无法检查buy_id=5条件")
 
-            # 获取上证指数ETF的RSI
+            # 获取上证指数的RSI
             if self._sh_index_metrics_df is not None:
                 try:
                     date_str = date.strftime('%Y-%m-%d')
@@ -724,15 +746,9 @@ class DBBacktestRunner:
                 except Exception:
                     pass
 
-            # 检查买入冷却期状态（调试）
-            if self.state.last_sell_date is not None:
-                days_since_sell = (date - self.state.last_sell_date).days
-                if days_since_sell < COOLDOWN_DAYS:
-                    self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入冷却期: 距上次卖出{days_since_sell}天 < {COOLDOWN_DAYS}天")
-
             # 调试：记录买入条件检测前的状态
-            if not np.isnan(index_daily_rsi) and index_daily_rsi < 20:
-                self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入条件可能触发: 创业板RSI={index_daily_rsi:.2f}, last_sell_date={self.state.last_sell_date}")
+            if not np.isnan(index_daily_rsi) and index_daily_rsi < 25:
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入条件检测: 创业板RSI={index_daily_rsi:.2f}, 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 新资金={self._cash:.2f}, 待买回={self._sold_cash:.2f}")
 
             # 调用策略检测买入信号
             buy_signal = self.strategy.check_buy_signal(
@@ -745,6 +761,30 @@ class DBBacktestRunner:
                 index_daily_rsi=index_daily_rsi,
                 sh_index_daily_rsi=sh_index_daily_rsi
             )
+
+            # 调试：记录买入信号检测结果
+            if self._sold_cash > 0 or self._cash > 0:
+                if buy_signal is not None:
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入信号触发: {buy_signal.reason}")
+                else:
+                    # 记录为什么没有触发买入
+                    reasons = []
+                    if np.isnan(daily_rsi):
+                        reasons.append("日RSI无效")
+                    if np.isnan(weekly_rsi):
+                        reasons.append("周RSI无效")
+                    if np.isnan(index_daily_rsi):
+                        reasons.append("创业板RSI无效")
+                    # 检查各buy_id条件
+                    for buy_id in self.strategy.buy_ids:
+                        if buy_id == 4 and not (daily_rsi < 20 and weekly_rsi < 20):
+                            reasons.append(f"buy_id=4不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f})")
+                        elif buy_id == 5 and not (index_daily_rsi < 20):
+                            reasons.append(f"buy_id=5不满足(创业板RSI={index_daily_rsi:.2f})")
+                        elif buy_id == 6 and not (sh_index_daily_rsi < 20):
+                            reasons.append(f"buy_id=6不满足(上证RSI={sh_index_daily_rsi:.2f})")
+                    if len(reasons) > 0 and (index_daily_rsi < 30 or daily_rsi < 30):
+                        self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入未触发: {', '.join(reasons)}")
 
             if buy_signal is not None and buy_signal.triggered:
                 self._execute_buy(date, buy_signal)
@@ -1144,7 +1184,8 @@ class BatchDBBacktestRunner:
                 'judge_buy_ids': parse_ids(row.get('judge_buy_ids', '')),
                 'judge_t_ids': parse_ids(row.get('judge_t_ids', '')),
                 'judge_sell_ids': parse_ids(row.get('judge_sell_ids', '')),
-                'initial_capital': float(row.get('initial_capital', 100000))
+                'initial_capital': float(row.get('initial_capital', 100000)),
+                'fully_invested': int(row.get('fully_invested', 1))  # 默认全仓持有
             })
 
         return stock_list
@@ -1177,11 +1218,12 @@ class BatchDBBacktestRunner:
             judge_t_ids = stock.get('judge_t_ids', [2])
             judge_sell_ids = stock.get('judge_sell_ids', [1])
             initial_capital = stock.get('initial_capital', self.initial_capital)
+            fully_invested = stock.get('fully_invested', 1)
 
             self.logger.info("")
             self.logger.info(f"处理股票: {ticker}")
             self.logger.info(f"时间段: {start_date} ~ {end_date}")
-            self.logger.info(f"策略: 买入={judge_buy_ids}, 做T={judge_t_ids}, 卖出={judge_sell_ids}")
+            self.logger.info(f"策略: 买入={judge_buy_ids}, 做T={judge_t_ids}, 卖出={judge_sell_ids}, 全仓={fully_invested}")
 
             try:
                 runner = DBBacktestRunner(
@@ -1193,7 +1235,8 @@ class BatchDBBacktestRunner:
                     judge_t_ids=judge_t_ids,
                     judge_sell_ids=judge_sell_ids,
                     initial_capital=initial_capital,
-                    output_dir=self.output_dir / ticker
+                    output_dir=self.output_dir / ticker,
+                    fully_invested=fully_invested
                 )
 
                 runner.run_backtest()
