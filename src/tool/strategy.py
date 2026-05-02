@@ -7,12 +7,22 @@
 
 【核心逻辑】
 卖出条件 (judge_sell_ids):
-- sell_id=1: 综合卖出策略（周线顶背离、日线顶背离、RSI阶梯减仓）
-  - 周线顶背离 + 均线跌破 → 清仓 (sell_flag=1)
-  - 周线RSI>90 + 均线跌破 → 清仓 (sell_flag=1)
-  - 周线RSI>85 + 均线跌破 → 卖出1/2 (sell_flag=2)
-  - 日线顶背离 + 均线跌破 → 卖出1/3 (sell_flag=3)
-  - 周线RSI>80 + 均线跌破 → 卖出1/3 (sell_flag=3)
+- sell_id=1: 综合卖出策略（基于SAR死叉触发）
+  - 周线顶背离 + SAR死叉 → 清仓 (sell_flag=1)
+  - 周线RSI>90 + SAR死叉 → 清仓 (sell_flag=1)
+  - 周线RSI>85 + SAR死叉 → 卖出1/2 (sell_flag=2)
+  - 日线顶背离 + SAR死叉 → 卖出1/3 (sell_flag=3)
+  - 周线RSI>80 + SAR死叉 → 卖出1/3 (sell_flag=3)
+
+- sell_id=2: 标准卖出策略（基于MACD日线死叉触发）
+  触发条件：MACD日线跌破死叉
+  按优先级判断：
+  1. 周线顶背离 + SAR跌破死叉 → 清仓 (sell_flag=1)
+  2. 日线顶背离 + SAR跌破死叉 → 卖出1/3 (sell_flag=3)
+  3. SAR跌破死叉 + 周线RSI阶梯：
+     - 周线RSI > 90 → 清仓 (sell_flag=1)
+     - 周线RSI > 85 → 卖出1/2 (sell_flag=2)
+     - 周线RSI > 80 → 卖出1/3 (sell_flag=3)
 
 买入条件:
 - judge_buy_ids: 新资金买入策略ID（触发时买入新资金+买回卖出资金）
@@ -151,9 +161,11 @@ class TradingStrategy:
         date: pd.Timestamp,
         daily_rsi: float,
         weekly_rsi: float,
-        ma_cross_down: bool,
+        sar_cross_down: bool,
+        macd_cross_down: bool,
         state: StrategyState,
-        position: float
+        position: float,
+        sell_id: int = 1
     ) -> Optional[SellSignal]:
         """
         检查卖出信号
@@ -162,12 +174,18 @@ class TradingStrategy:
             date: 当前日期
             daily_rsi: 当日RSI值
             weekly_rsi: 当日周线RSI值
-            ma_cross_down: 是否发生均线死叉(5日跌破10日)
+            sar_cross_down: 是否发生SAR死叉跌破（收盘价跌破SAR）
+            macd_cross_down: 是否发生MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）
             state: 当前策略状态
             position: 当前持仓比例
+            sell_id: 卖出策略ID（1=SAR死叉触发，2=MACD跌破死叉触发）
 
         Returns:
             SellSignal 或 None（无信号）
+
+        sell_id 说明:
+        - sell_id=1: 触发条件为SAR死叉跌破（收盘价跌破SAR）
+        - sell_id=2: 触发条件为MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）
         """
         # 检查卖出冷却期（只在有持仓时检查）
         if position > 0 and state.last_sell_date is not None:
@@ -175,8 +193,22 @@ class TradingStrategy:
             if days_since_sell < COOLDOWN_DAYS:
                 return None
 
-        # 必须有均线跌破才触发卖出
-        if not ma_cross_down:
+        # 根据sell_id选择触发条件
+        if sell_id == 1:
+            # sell_id=1: SAR死叉跌破（收盘价跌破SAR）作为触发条件
+            trigger_condition = sar_cross_down
+            trigger_name = "SAR死叉跌破"
+        elif sell_id == 2:
+            # sell_id=2: MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）作为触发条件
+            trigger_condition = macd_cross_down
+            trigger_name = "MACD跌破死叉"
+        else:
+            # 默认使用SAR死叉跌破
+            trigger_condition = sar_cross_down
+            trigger_name = "SAR死叉跌破"
+
+        # 必须满足触发条件才继续检查
+        if not trigger_condition:
             return None
 
         # 按优先级检查卖出信号
@@ -187,13 +219,15 @@ class TradingStrategy:
         divergence_date = None
         divergence_prev_high = 0.0
 
-        # 优先级1：周线顶背离生效 → 清仓
-        if state.weekly_divergence_flag == 1:
+        # 优先级1：周线顶背离 + 死叉触发生效 → 清仓
+        # 根据 sell_id 选择触发条件：sell_id=1 用 SAR死叉，sell_id=2 用 MACD死叉
+        divergence_trigger = sar_cross_down if sell_id == 1 else macd_cross_down
+        if state.weekly_divergence_flag == 1 and divergence_trigger:
             sell_flag = SellFlag.CLEAR_ALL
             div_info = state.weekly_divergence_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
-            reason = f"周线顶背离生效 (策略-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高={divergence_prev_high:.3f}, 建议清仓"
+            reason = f"清仓信号 (sell_id={sell_id}-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议清仓"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -208,7 +242,7 @@ class TradingStrategy:
             sell_flag = SellFlag.CLEAR_ALL
             rsi_peak_date = state.rsi_peak_date or date
             rsi_peak_value = state.rsi_peak_value or weekly_rsi
-            reason = f"清仓信号 (策略-清仓): 周线RSI>90 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), 建议清仓"
+            reason = f"清仓信号 (sell_id={sell_id}-清仓): 周线RSI>90 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议清仓"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -223,7 +257,7 @@ class TradingStrategy:
             sell_flag = SellFlag.SELL_HALF
             rsi_peak_date = state.rsi_peak_date or date
             rsi_peak_value = state.rsi_peak_value or weekly_rsi
-            reason = f"卖出信号 (策略-阶梯): 周线RSI>85 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), 建议卖出1/2"
+            reason = f"卖出信号 (sell_id={sell_id}-阶梯): 周线RSI>85 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/2"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -233,13 +267,14 @@ class TradingStrategy:
                 rsi_peak_value=rsi_peak_value
             )
 
-        # 优先级4：日线顶背离生效 → 卖出1/3
-        if state.daily_divergence_flag == 1:
+        # 优先级4：日线顶背离 + 死叉触发生效 → 卖出1/3
+        # 根据 sell_id 选择触发条件：sell_id=1 用 SAR死叉，sell_id=2 用 MACD死叉
+        if state.daily_divergence_flag == 1 and divergence_trigger:
             sell_flag = SellFlag.SELL_ONE_THIRD
             div_info = state.daily_divergence_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
-            reason = f"卖出信号 (策略-顶背离均线): 日线顶背离 ({divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}) + SAR死叉确认, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
+            reason = f"卖出信号 (sell_id={sell_id}-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -254,7 +289,7 @@ class TradingStrategy:
             sell_flag = SellFlag.SELL_ONE_THIRD
             rsi_peak_date = state.rsi_peak_date or date
             rsi_peak_value = state.rsi_peak_value or weekly_rsi
-            reason = f"卖出信号 (策略-阶梯): 周线RSI>80 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), 建议卖出1/3"
+            reason = f"卖出信号 (sell_id={sell_id}-阶梯): 周线RSI>80 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/3"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -460,7 +495,8 @@ class TradingStrategy:
         self,
         state: StrategyState,
         sell_flag: SellFlag,
-        date: pd.Timestamp
+        date: pd.Timestamp,
+        is_fake_sell: bool = False
     ) -> None:
         """
         卖出后重置状态
@@ -469,26 +505,28 @@ class TradingStrategy:
             state: 当前策略状态
             sell_flag: 卖出级别
             date: 卖出日期
+            is_fake_sell: 是否为假卖出（无实际交易）
+
+        注意：
+        - 假卖出不设置 last_sell_date，因为没有实际交易，不应触发买入冷却期
+        - 假卖出也要重置所有背离标志，避免信号残留
         """
         # 重置RSI相关标志
         state.rsi_flag = 0
         state.rsi_peak_value = 0.0
         state.rsi_peak_date = None
 
-        # 根据卖出级别重置背离标志
-        if sell_flag == SellFlag.CLEAR_ALL:
-            # 清仓时重置所有标志
-            state.weekly_divergence_flag = 0
-            state.weekly_divergence_info = None
-            state.daily_divergence_flag = 0
-            state.daily_divergence_info = None
-        else:
-            # 部分卖出时只重置日线背离标志
-            state.daily_divergence_flag = 0
-            state.daily_divergence_info = None
+        # 重置所有背离标志（不管是什么级别的卖出，都要重置）
+        # 避免背离信号长期残留导致后续误触发
+        state.weekly_divergence_flag = 0
+        state.weekly_divergence_info = None
+        state.daily_divergence_flag = 0
+        state.daily_divergence_info = None
 
-        # 记录卖出日期
-        state.last_sell_date = date
+        # 记录卖出日期（用于买入冷却期）
+        # 假卖出不设置 last_sell_date，因为没有实际交易
+        if not is_fake_sell:
+            state.last_sell_date = date
 
     def reset_after_buy(self, state: StrategyState) -> None:
         """
