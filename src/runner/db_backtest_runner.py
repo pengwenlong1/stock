@@ -617,35 +617,29 @@ class DBBacktestRunner:
                 weekly_rsi = np.nan
 
             # 从数据库获取的卖出信号标志
-            # 使用 SAR 死叉（is_sar_dead_cross）替代均线死叉
+            # 使用 SAR 死叉（is_sar_dead_cross）作为 sell_id=1 的触发条件
             sar_cross_down = metrics.get('is_sar_dead_cross', 0) == 1
 
-            # 判断 MACD 跌破死叉（MACD死叉 + 最低价跌破SAR）
-            # MACD死叉：DIF下穿DEA（DIF从上方穿过DEA下方）
-            # 跌破：最低价低于SAR值
+            # 判断 MACD 死叉（DIF下穿DEA）作为 sell_id=2 的触发条件
+            # 不需要额外条件，只要MACD死叉就触发
             macd_cross_down = False
             current_dif = metrics.get('dif', np.nan)
             current_dea = metrics.get('dea', np.nan)
-            current_sar = metrics.get('sar', np.nan)
-            current_low = metrics.get('low_price', np.nan)
 
-            if not np.isnan(current_dif) and not np.isnan(current_dea) and not np.isnan(current_sar):
-                # 条件1：最低价跌破SAR（如果最低价不存在，则不触发）
-                if not np.isnan(current_low) and current_low < current_sar:
-                    # 条件2：MACD死叉（DIF下穿DEA）
-                    try:
-                        date_idx = trading_dates.index(date)
-                        if date_idx > 0:
-                            prev_date = trading_dates[date_idx - 1]
-                            prev_metrics = self._get_metrics_at_date(prev_date)
-                            prev_dif = prev_metrics.get('dif', np.nan)
-                            prev_dea = prev_metrics.get('dea', np.nan)
-                            # 死叉：DIF从上方穿过DEA下方
-                            if not np.isnan(prev_dif) and not np.isnan(prev_dea):
-                                if prev_dif >= prev_dea and current_dif < current_dea:
-                                    macd_cross_down = True
-                    except Exception:
-                        pass
+            if not np.isnan(current_dif) and not np.isnan(current_dea):
+                try:
+                    date_idx = trading_dates.index(date)
+                    if date_idx > 0:
+                        prev_date = trading_dates[date_idx - 1]
+                        prev_metrics = self._get_metrics_at_date(prev_date)
+                        prev_dif = prev_metrics.get('dif', np.nan)
+                        prev_dea = prev_metrics.get('dea', np.nan)
+                        # 死叉：DIF从上方穿过DEA下方
+                        if not np.isnan(prev_dif) and not np.isnan(prev_dea):
+                            if prev_dif >= prev_dea and current_dif < current_dea:
+                                macd_cross_down = True
+                except Exception:
+                    pass
 
             # 根据 judge_sell_ids 选择触发条件
             # sell_id=1: SAR死叉跌破触发

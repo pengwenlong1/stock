@@ -497,11 +497,14 @@ class DatabaseFiller:
         # 添加交易所前缀
         full_symbol = self._add_exchange_prefix(ticker)
 
-        # 预热数据起始日期：使用传入的start_date，但往前推一年用于计算指标
-        # 如果start_date早于股票上市日期，则从上市日期开始
-        warmup_start = start_date  # 直接使用配置的开始日期
+        # 预热数据起始日期：从 start_date 往前推五年，用于计算技术指标
+        # 这样可以确保 MACD、RSI、均线、峰点检测等有足够的历史数据
+        from datetime import datetime
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        warmup_year = start_dt.year - 5
+        warmup_start = f"{warmup_year}-{start_dt.month:02d}-{start_dt.day:02d}"
 
-        logger.info(f"获取历史数据: {full_symbol}, {warmup_start} ~ {end_date}")
+        logger.info(f"获取历史数据: {full_symbol}, 预热起始={warmup_start}, 实际起始={start_date}, 结束={end_date}")
 
         # 获取日线数据（前复权）
         daily_data = history(
