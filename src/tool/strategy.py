@@ -217,7 +217,29 @@ class TradingStrategy:
         if not trigger_condition:
             return None
 
-        # 按优先级检查卖出信号
+        # 【关键逻辑】触发条件满足（死叉发生），立即重置flag
+        # 保存当前flag值用于判断卖出级别，然后重置
+        current_rsi_flag = state.rsi_flag
+        current_rsi_peak_date = state.rsi_peak_date
+        current_rsi_peak_value = state.rsi_peak_value
+        current_weekly_div_flag = state.weekly_divergence_flag
+        current_daily_div_flag = state.daily_divergence_flag
+        current_weekly_div_info = state.weekly_divergence_info
+        current_daily_div_info = state.daily_divergence_info
+
+        # 用于背离判断的触发条件
+        divergence_trigger = sar_cross_down if sell_id == 1 else macd_cross_down
+
+        # 立即重置所有flag（死叉触发后清空历史信号）
+        state.rsi_flag = 0
+        state.rsi_peak_value = 0.0
+        state.rsi_peak_date = None
+        state.weekly_divergence_flag = 0
+        state.weekly_divergence_info = None
+        state.daily_divergence_flag = 0
+        state.daily_divergence_info = None
+
+        # 按优先级检查卖出信号（使用保存的flag值判断）
         sell_flag = SellFlag.NO_SIGNAL
         reason = ""
         rsi_peak_date = None
@@ -226,11 +248,9 @@ class TradingStrategy:
         divergence_prev_high = 0.0
 
         # 优先级1：周线顶背离 + 死叉触发生效 → 清仓
-        # 根据 sell_id 选择触发条件：sell_id=1 用 SAR死叉，sell_id=2 用 MACD死叉
-        divergence_trigger = sar_cross_down if sell_id == 1 else macd_cross_down
-        if state.weekly_divergence_flag == 1 and divergence_trigger:
+        if current_weekly_div_flag == 1 and divergence_trigger:
             sell_flag = SellFlag.CLEAR_ALL
-            div_info = state.weekly_divergence_info or {}
+            div_info = current_weekly_div_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
             reason = f"清仓信号 (sell_id={sell_id}-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议清仓"
@@ -243,11 +263,11 @@ class TradingStrategy:
                 divergence_prev_high=divergence_prev_high
             )
 
-        # 优先级2：周线RSI>90 → 清仓
-        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level3'] or state.rsi_flag == 3:
+        # 优先级2：周线RSI>90 或 rsi_flag=3 → 清仓
+        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level3'] or current_rsi_flag == 3:
             sell_flag = SellFlag.CLEAR_ALL
-            rsi_peak_date = state.rsi_peak_date or date
-            rsi_peak_value = state.rsi_peak_value or weekly_rsi
+            rsi_peak_date = current_rsi_peak_date or date
+            rsi_peak_value = current_rsi_peak_value or weekly_rsi
             reason = f"清仓信号 (sell_id={sell_id}-清仓): 周线RSI>90 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议清仓"
             return SellSignal(
                 flag=sell_flag,
@@ -258,11 +278,11 @@ class TradingStrategy:
                 rsi_peak_value=rsi_peak_value
             )
 
-        # 优先级3：周线RSI>85 → 卖出1/2
-        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level2'] or state.rsi_flag == 2:
+        # 优先级3：周线RSI>85 或 rsi_flag=2 → 卖出1/2
+        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level2'] or current_rsi_flag == 2:
             sell_flag = SellFlag.SELL_HALF
-            rsi_peak_date = state.rsi_peak_date or date
-            rsi_peak_value = state.rsi_peak_value or weekly_rsi
+            rsi_peak_date = current_rsi_peak_date or date
+            rsi_peak_value = current_rsi_peak_value or weekly_rsi
             reason = f"卖出信号 (sell_id={sell_id}-阶梯): 周线RSI>85 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/2"
             return SellSignal(
                 flag=sell_flag,
@@ -274,10 +294,9 @@ class TradingStrategy:
             )
 
         # 优先级4：日线顶背离 + 死叉触发生效 → 卖出1/3
-        # 根据 sell_id 选择触发条件：sell_id=1 用 SAR死叉，sell_id=2 用 MACD死叉
-        if state.daily_divergence_flag == 1 and divergence_trigger:
+        if current_daily_div_flag == 1 and divergence_trigger:
             sell_flag = SellFlag.SELL_ONE_THIRD
-            div_info = state.daily_divergence_info or {}
+            div_info = current_daily_div_info or {}
             divergence_date = div_info.get('date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
             reason = f"卖出信号 (sell_id={sell_id}-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
@@ -290,11 +309,11 @@ class TradingStrategy:
                 divergence_prev_high=divergence_prev_high
             )
 
-        # 优先级5：周线RSI>80 → 卖出1/3
-        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level1'] or state.rsi_flag == 1:
+        # 优先级5：周线RSI>80 或 rsi_flag=1 → 卖出1/3
+        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level1'] or current_rsi_flag == 1:
             sell_flag = SellFlag.SELL_ONE_THIRD
-            rsi_peak_date = state.rsi_peak_date or date
-            rsi_peak_value = state.rsi_peak_value or weekly_rsi
+            rsi_peak_date = current_rsi_peak_date or date
+            rsi_peak_value = current_rsi_peak_value or weekly_rsi
             reason = f"卖出信号 (sell_id={sell_id}-阶梯): 周线RSI>80 (RSI峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/3"
             return SellSignal(
                 flag=sell_flag,
@@ -472,7 +491,9 @@ class TradingStrategy:
         self,
         weekly_rsi: float,
         state: StrategyState,
-        date: pd.Timestamp
+        date: pd.Timestamp,
+        macd_dif: float = np.nan,
+        macd_dea: float = np.nan
     ) -> None:
         """
         更新RSI警戒级别
@@ -481,16 +502,30 @@ class TradingStrategy:
             weekly_rsi: 当日周线RSI值
             state: 当前策略状态
             date: 当前日期
+            macd_dif: MACD DIF线（黄线）值
+            macd_dea: MACD DEA线（黑线）值
+
+        【关键逻辑】
+        当MACD处于下跌趋势（DIF < DEA，即黄线在黑线下方）时，
+        RSI峰值和flag不更新，避免在下跌趋势中产生无效的卖出信号。
         """
         if np.isnan(weekly_rsi):
             return
 
-        # 更新RSI峰值记录
-        if weekly_rsi > state.rsi_peak_value:
-            state.rsi_peak_date = date
-            state.rsi_peak_value = weekly_rsi
+        # 【核心逻辑】MACD下跌趋势判断
+        # 如果黄线(DIF)在黑线(DEA)下面，说明处于下跌趋势，此时RSI峰值和flag不生效
+        if not np.isnan(macd_dif) and not np.isnan(macd_dea):
+            if macd_dif < macd_dea:
+                # 下跌趋势中，不更新RSI峰值和flag
+                return
 
-        # 更新flag（取最高级别）
+        # 更新峰值记录（只在警戒区域内更新峰值）
+        if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level1']:
+            if weekly_rsi > state.rsi_peak_value:
+                state.rsi_peak_date = date
+                state.rsi_peak_value = weekly_rsi
+
+        # 更新flag（取最高级别，只在警戒区域内设置）
         if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level3']:
             state.rsi_flag = 3
         elif weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level2']:
@@ -547,7 +582,9 @@ class TradingStrategy:
     def set_daily_divergence(
         self,
         state: StrategyState,
-        divergence_info: Dict
+        divergence_info: Dict,
+        macd_dif: float = np.nan,
+        macd_dea: float = np.nan
     ) -> None:
         """
         设置日线顶背离状态
@@ -555,14 +592,28 @@ class TradingStrategy:
         Args:
             state: 当前策略状态
             divergence_info: 背离信息字典
+            macd_dif: MACD DIF线（黄线）值
+            macd_dea: MACD DEA线（黑线）值
+
+        【关键逻辑】
+        如果MACD处于下跌趋势（DIF < DEA，即黄线在黑线下方），
+        则背离信号不生效，不设置背离标志。
         """
+        # MACD下跌趋势判断：黄线在黑线下方，背离不生效
+        if not np.isnan(macd_dif) and not np.isnan(macd_dea):
+            if macd_dif < macd_dea:
+                # 下跌趋势中，不设置背离标志
+                return
+
         state.daily_divergence_flag = 1
         state.daily_divergence_info = divergence_info
 
     def set_weekly_divergence(
         self,
         state: StrategyState,
-        divergence_info: Dict
+        divergence_info: Dict,
+        macd_dif: float = np.nan,
+        macd_dea: float = np.nan
     ) -> None:
         """
         设置周线顶背离状态
@@ -570,7 +621,19 @@ class TradingStrategy:
         Args:
             state: 当前策略状态
             divergence_info: 背离信息字典
+            macd_dif: MACD DIF线（黄线）值
+            macd_dea: MACD DEA线（黑线）值
+
+        【关键逻辑】
+        如果MACD处于下跌趋势（DIF < DEA，即黄线在黑线下方），
+        则背离信号不生效，不设置背离标志。
         """
+        # MACD下跌趋势判断：黄线在黑线下方，背离不生效
+        if not np.isnan(macd_dif) and not np.isnan(macd_dea):
+            if macd_dif < macd_dea:
+                # 下跌趋势中，不设置背离标志
+                return
+
         state.weekly_divergence_flag = 1
         state.weekly_divergence_info = divergence_info
 
