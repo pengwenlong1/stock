@@ -191,8 +191,8 @@ class SARStrategy:
         self._low_series = low_series
         self._close_series = close_series
 
-        # 计算SAR
-        self._sar_series = self._calculate_sar(high_series, low_series, close_series)
+        # 计算SAR - 使用东方财富风格算法（收盘价判断反转）
+        self._sar_series = self._calculate_sar_eastmoney_fixed(high_series, low_series, close_series)
 
         logger.info(f"SAR策略数据准备完成: {len(close_series)} 天数据")
 
@@ -234,12 +234,12 @@ class SARStrategy:
 
     def _calculate_sar_eastmoney_fixed(self, high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
         """
-        修正版：分离内部递推SAR和输出SAR
+        东方财富风格SAR计算
 
         【核心逻辑】
-        1. internal_sar：用于递推计算，不做clamp限制
-        2. output_sar：用于最终输出，应用clamp限制
-        3. raw_sar使用internal_sar计算，确保递推逻辑不被clamp干扰
+        1. 标准SAR递推公式
+        2. 【东方财富特色】使用不同的clamp逻辑
+        3. 使用收盘价判断反转
 
         Args:
             high: 最高价序列
@@ -256,74 +256,57 @@ class SARStrategy:
         af_step = self.acceleration  # 0.02
         af_max = self.maximum        # 0.20
 
-        # 内部递推用的 SAR（不 clamp）
-        internal_sar = np.full(n, np.nan)
-        # 最终输出的 SAR（clamp 后）
-        output_sar = np.full(n, np.nan)
+        # SAR值数组
+        sar = np.full(n, np.nan)
 
-        # 初始化：第一天为多头，SAR=最低价
-        internal_sar[0] = low.iloc[0]
-        output_sar[0] = low.iloc[0]
+        # 初始为多头，SAR=第一天的最低价，EP=第一天的最高价
         is_long = True
+        sar[0] = low.iloc[0]
         ep = high.iloc[0]
         af = af_step
 
         for i in range(1, n):
-            # Step 1: 用 internal_sar 计算 raw_sar（不受clamp影响）
-            raw_sar = internal_sar[i - 1] + af * (ep - internal_sar[i - 1])
-
-            reverse = False
-            new_is_long = is_long
-            new_ep = ep
-            new_af = af
+            # Step 1: 计算原始SAR
+            raw_sar = sar[i - 1] + af * (ep - sar[i - 1])
 
             if is_long:
-                # 多头：检查是否跌破 SAR（用最低价）
-                if low.iloc[i] <= raw_sar:
-                    reverse = True
-                    new_is_long = False
-                    # 反转 SAR = 上一多头趋势的 EP（最高价）
-                    internal_sar[i] = ep
-                    output_sar[i] = ep
-                    new_ep = low.iloc[i]      # 新 EP 为空头最低
-                    new_af = af_step
+                # 多头趋势
+                # 【东方财富特色】使用反转点的EP作为新SAR基准
+                # 然后逐步追踪，但不使用标准clamp
+
+                # Step 2: 使用收盘价判断反转
+                if close.iloc[i] <= raw_sar:
+                    # 反转：多头 -> 空头
+                    is_long = False
+                    sar[i] = ep  # 反转时SAR = 前一趋势的EP
+                    ep = low.iloc[i]
+                    af = af_step
                 else:
-                    internal_sar[i] = raw_sar
-                    output_sar[i] = raw_sar
+                    # 继续多头
+                    # 【修改】东方财富可能不使用clamp或使用反向限制
+                    # 测试：让SAR自然上涨，不使用clamp
+                    sar[i] = raw_sar
                     if high.iloc[i] > ep:
-                        new_ep = high.iloc[i]
-                        new_af = min(af + af_step, af_max)
+                        ep = high.iloc[i]
+                        af = min(af + af_step, af_max)
             else:
-                # 空头：检查是否突破 SAR（用最高价）
-                if high.iloc[i] >= raw_sar:
-                    reverse = True
-                    new_is_long = True
-                    # 反转 SAR = 上一空头趋势的 EP（最低价）
-                    internal_sar[i] = ep
-                    output_sar[i] = ep
-                    new_ep = high.iloc[i]     # 新 EP 为多头最高
-                    new_af = af_step
+                # 空头趋势
+                # Step 2: 使用收盘价判断反转
+                if close.iloc[i] >= raw_sar:
+                    # 反转：空头 -> 多头
+                    is_long = True
+                    sar[i] = ep  # 反转时SAR = 前一趋势的EP
+                    ep = high.iloc[i]
+                    af = af_step
                 else:
-                    internal_sar[i] = raw_sar
-                    output_sar[i] = raw_sar
+                    # 继续空头
+                    # 【修改】不使用clamp
+                    sar[i] = raw_sar
                     if low.iloc[i] < ep:
-                        new_ep = low.iloc[i]
-                        new_af = min(af + af_step, af_max)
+                        ep = low.iloc[i]
+                        af = min(af + af_step, af_max)
 
-            # Step 2: 仅对 output_sar 做 clamp（不影响 internal_sar 递推）
-            if not reverse:
-                if new_is_long:
-                    # 多头：SAR 不能高于前两日最低价
-                    output_sar[i] = min(output_sar[i], low.iloc[i - 1], low.iloc[i])
-                else:
-                    # 空头：SAR 不能低于前两日最高价
-                    output_sar[i] = max(output_sar[i], high.iloc[i - 1], high.iloc[i])
-
-            is_long = new_is_long
-            ep = new_ep
-            af = new_af
-
-        return pd.Series(output_sar, index=close.index, name='SAR')
+        return pd.Series(sar, index=close.index, name='SAR')
 
     def _get_position(self, sar: float, close: float) -> str:
         """

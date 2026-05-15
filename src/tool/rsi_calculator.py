@@ -4,7 +4,7 @@ RSI 指标计算模块 (rsi_calculator.py)
 
 【功能说明】
 提供 RSI（Relative Strength Index，相对强弱指标）的计算功能。
-支持日线和周线两种周期类型。
+支持日线、周线和月线三种周期类型。
 
 【国内算法说明】
 国内行情软件（同花顺、东方财富）使用 SMA 方式计算 RSI：
@@ -22,6 +22,10 @@ RSI 指标计算模块 (rsi_calculator.py)
     # 周线 RSI(6)
     rsi_weekly = RSI(period=6, freq='weekly')
     result_weekly = rsi_weekly.calculate(close_series)
+
+    # 月线 RSI(6)
+    rsi_monthly = RSI(period=6, freq='monthly')
+    result_monthly = rsi_monthly.calculate(close_series)
 
 作者：量化交易团队
 创建日期：2024
@@ -42,21 +46,23 @@ class RSI:
     【周期类型】
     - daily: 日线 RSI，直接使用日线收盘价计算
     - weekly: 周线 RSI，先将日线数据转换为周线再计算
+    - monthly: 月线 RSI，先将日线数据转换为月线再计算
 
     【重要提示 - 预热数据】
     为了与东方财富结果一致，需要提供足够长的历史预热数据：
     - 日线RSI: 建议提供测试日期前30天以上的数据
     - 周线RSI: 建议提供测试日期前1年以上的数据（约50周）
+    - 月线RSI: 建议提供测试日期前2年以上的数据（约24个月）
 
     【参数说明】
     - period: 计算周期，国内常用值为 6（短期）、12（中期）、24（长期）
-    - freq: 周期类型，'daily'（日线）或 'weekly'（周线）
+    - freq: 周期类型，'daily'（日线）、'weekly'（周线）或 'monthly'（月线）
     - RSI > 70: 超买区域
     - RSI < 30: 超卖区域
 
     Attributes:
         period: RSI 计算周期
-        freq: 周期类型（'daily' 或 'weekly'）
+        freq: 周期类型（'daily', 'weekly' 或 'monthly'）
     """
 
     # 超买超卖阈值常量
@@ -71,11 +77,11 @@ class RSI:
     }
 
     # 支持的周期类型
-    VALID_FREQS = ('daily', 'weekly')
+    VALID_FREQS = ('daily', 'weekly', 'monthly')
 
     def __init__(self,
                  period: int = 6,
-                 freq: Literal['daily', 'weekly'] = 'daily') -> None:
+                 freq: Literal['daily', 'weekly', 'monthly'] = 'daily') -> None:
         """
         初始化 RSI 计算器
 
@@ -83,9 +89,11 @@ class RSI:
             period: RSI 计算周期，默认 6
                    日线常用: 6（短期）、12（中期）、24（长期）
                    周线常用: 6（约6周）
+                   月线常用: 6（约6个月）
             freq: 周期类型，默认 'daily'
                   'daily': 日线 RSI
                   'weekly': 周线 RSI
+                  'monthly': 月线 RSI
 
         Raises:
             ValueError: 当参数无效时抛出
@@ -94,7 +102,7 @@ class RSI:
             raise ValueError(f"RSI 周期必须为正整数，当前值: {period}")
 
         if freq not in self.VALID_FREQS:
-            raise ValueError(f"周期类型必须为 'daily' 或 'weekly'，当前值: {freq}")
+            raise ValueError(f"周期类型必须为 'daily', 'weekly' 或 'monthly'，当前值: {freq}")
 
         self.period = period
         self.freq = freq
@@ -120,6 +128,135 @@ class RSI:
         weekly_close = weekly_close.dropna()
         weekly_close.name = 'Weekly_Close'
         return weekly_close
+
+    def _convert_to_monthly(self, close: pd.Series) -> pd.Series:
+        """
+        将日线数据转换为月线数据
+
+        【转换逻辑】
+        使用 pandas 的 resample 功能，按月末进行聚合。
+        取每月最后一个交易日的收盘价作为月收盘价。
+
+        Args:
+            close: 日线收盘价序列
+
+        Returns:
+            pd.Series: 月线收盘价序列
+        """
+        monthly_close = close.resample('M').last()
+        monthly_close = monthly_close.dropna()
+        monthly_close.name = 'Monthly_Close'
+        return monthly_close
+
+    def _get_month_number(self, date: pd.Timestamp) -> int:
+        """
+        获取日期对应的月份编号
+
+        Args:
+            date: 日期时间戳
+
+        Returns:
+            int: 月份编号（1-12）
+        """
+        return date.month
+
+    def _calculate_monthly_rsi_for_each_day(self, close: pd.Series) -> pd.Series:
+        """
+        计算每个交易日的月线RSI值（东方财富标准算法）
+
+        【算法说明】
+        东方财富月线RSI计算方式：
+        1. 对所有历史完整月线数据累积计算EMA状态
+        2. 对于当前月的每个交易日T：
+           - 用历史EMA状态（基于完整月线）
+           - 用T的收盘价与上月末收盘价计算当月变化
+           - 用EMA公式更新AU/AD并计算RSI
+
+        Args:
+            close: 日线收盘价序列
+
+        Returns:
+            pd.Series: 月线RSI值序列
+        """
+        # 转换为月线数据（仅完整月）
+        monthly_close = self._convert_to_monthly(close)
+
+        if len(monthly_close) < self.period + 1:
+            # 数据不足，返回NaN
+            return pd.Series([np.nan] * len(close), index=close.index, name=f'RSI{self.period}_monthly')
+
+        # 计算完整月线的差值
+        monthly_delta = monthly_close.diff().dropna()
+
+        # 分离上涨和下跌
+        monthly_up = monthly_delta.clip(lower=0)
+        monthly_down = (-monthly_delta).clip(lower=0)
+
+        # 【东方财富标准EMA累积】
+        N = self.period
+        # 前6个差值用SMA初始化（对应第7个月的EMA状态）
+        monthly_au = pd.Series(index=monthly_delta.index, dtype=float)
+        monthly_ad = pd.Series(index=monthly_delta.index, dtype=float)
+
+        # 初始化第N个位置的EMA（使用前N个差值的SMA）
+        monthly_au.iloc[N - 1] = monthly_up.iloc[:N].mean()
+        monthly_ad.iloc[N - 1] = monthly_down.iloc[:N].mean()
+
+        # EMA累积（东方财富公式: EMA_new = (新值 + (N-1) * EMA_old) / N）
+        for i in range(N, len(monthly_delta)):
+            monthly_au.iloc[i] = (monthly_up.iloc[i] + (N - 1) * monthly_au.iloc[i - 1]) / N
+            monthly_ad.iloc[i] = (monthly_down.iloc[i] + (N - 1) * monthly_ad.iloc[i - 1]) / N
+
+        # 为每个交易日计算月线RSI
+        rsi_values = pd.Series(index=close.index, dtype=float, name=f'RSI{self.period}_monthly')
+
+        for date in close.index:
+            # 使用月份字符串比较，找到当前日期之前的完整月
+            current_month_str = date.strftime('%Y-%m')
+            prev_complete_months = monthly_close[
+                monthly_close.index.strftime('%Y-%m') < current_month_str
+            ]
+
+            if len(prev_complete_months) < 1:
+                rsi_values.loc[date] = np.nan
+                continue
+
+            # 获取上月末收盘价
+            prev_month_close = prev_complete_months.iloc[-1]
+            current_close = close.loc[date]
+
+            # 获取上月末对应的EMA状态
+            last_complete_month_end = prev_complete_months.index[-1]
+
+            # monthly_au/ad的索引是月末日期（表示该月的变化已累积）
+            if last_complete_month_end in monthly_au.index:
+                prev_au = monthly_au.loc[last_complete_month_end]
+                prev_ad = monthly_ad.loc[last_complete_month_end]
+            else:
+                # 上月是第一个月（没有差值），数据不足
+                rsi_values.loc[date] = np.nan
+                continue
+
+            if pd.isna(prev_au) or pd.isna(prev_ad):
+                rsi_values.loc[date] = np.nan
+                continue
+
+            # 计算当前月的变化（当前价格 - 上月末价格）
+            current_delta = current_close - prev_month_close
+            current_up = max(current_delta, 0)
+            current_down = abs(min(current_delta, 0))
+
+            # 用东方财富EMA公式更新AU和AD
+            new_au = (current_up + (N - 1) * prev_au) / N
+            new_ad = (current_down + (N - 1) * prev_ad) / N
+
+            # 计算RSI
+            if new_au + new_ad > 0:
+                rsi_values.loc[date] = new_au / (new_au + new_ad) * 100
+            else:
+                rsi_values.loc[date] = np.nan
+
+        return rsi_values
 
     def _get_week_number(self, date: pd.Timestamp) -> int:
         """
@@ -318,6 +455,12 @@ class RSI:
         - 加上当天收盘价作为当前周的收盘价
         - 每天的周线RSI都不同
 
+        【月线RSI特殊说明】
+        月线RSI每天计算一个值：
+        - 使用过去N-1个完整月的收盘价
+        - 加上当天收盘价作为当前月的收盘价
+        - 每天的月线RSI都不同
+
         Args:
             close: 收盘价序列（日线数据）
 
@@ -337,6 +480,10 @@ class RSI:
         # 周线模式：每天计算一个周线RSI值
         if self.freq == 'weekly':
             return self._calculate_weekly_rsi_for_each_day(close)
+
+        # 月线模式：每天计算一个月线RSI值
+        if self.freq == 'monthly':
+            return self._calculate_monthly_rsi_for_each_day(close)
 
         if len(close) < 2:
             return pd.Series([np.nan], index=close.index, name=f'RSI{self.period}_{self.freq}')

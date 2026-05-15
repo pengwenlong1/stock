@@ -155,6 +155,7 @@ class DBBacktestRunner:
         # 指数数据（用于大盘参照）
         self._index_metrics_df: Optional[pd.DataFrame] = None  # 创业板指 (399006)
         self._sh_index_metrics_df: Optional[pd.DataFrame] = None  # 上证指数 (000001)
+        self._kc_index_metrics_df: Optional[pd.DataFrame] = None  # 科创综指 (000680)
 
         # 持仓状态（使用金额追踪）
         self._shares: float = 0.0         # 持有股票数量
@@ -388,6 +389,28 @@ class DBBacktestRunner:
                 self.logger.info(f"获取上证指数(000001) RSI数据: {len(rows)} 条")
             else:
                 self.logger.warning("数据库中未找到上证指数(000001)的RSI数据")
+
+            # 科创综指 (000680) - stock_id为字符串格式
+            sql = """
+                SELECT trade_date, rsi_daily
+                FROM stock_index_daily_metrics
+                WHERE stock_id = '000680'
+                  AND trade_date >= %s
+                  AND trade_date <= %s
+                ORDER BY trade_date ASC
+            """
+            with self._connection.cursor() as cursor:
+                cursor.execute(sql, (self.start_date, self.end_date))
+                rows = cursor.fetchall()
+
+            if rows:
+                df = pd.DataFrame(rows)
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+                df = df.set_index('trade_date').sort_index()
+                self._kc_index_metrics_df = df
+                self.logger.info(f"获取科创综指(000680) RSI数据: {len(rows)} 条")
+            else:
+                self.logger.warning("数据库中未找到科创综指(000680)的RSI数据")
 
             return True
 
@@ -746,6 +769,19 @@ class DBBacktestRunner:
                 except Exception:
                     pass
 
+            # 获取科创综指的RSI
+            kc_index_daily_rsi = np.nan
+            if self._kc_index_metrics_df is not None:
+                try:
+                    date_str = date.strftime('%Y-%m-%d')
+                    matching = self._kc_index_metrics_df[self._kc_index_metrics_df.index.strftime('%Y-%m-%d') == date_str]
+                    if len(matching) > 0:
+                        rsi_val = matching.iloc[0]['rsi_daily']
+                        if pd.notna(rsi_val):
+                            kc_index_daily_rsi = float(rsi_val)
+                except Exception:
+                    pass
+
             # 调试：记录买入条件检测前的状态
             if not np.isnan(index_daily_rsi) and index_daily_rsi < 25:
                 self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入条件检测: 创业板RSI={index_daily_rsi:.2f}, 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 新资金={self._cash:.2f}, 待买回={self._sold_cash:.2f}")
@@ -759,7 +795,8 @@ class DBBacktestRunner:
                 has_new_cash=self._cash > 0,
                 has_sold_cash=self._sold_cash > 0,
                 index_daily_rsi=index_daily_rsi,
-                sh_index_daily_rsi=sh_index_daily_rsi
+                sh_index_daily_rsi=sh_index_daily_rsi,
+                kc_index_daily_rsi=kc_index_daily_rsi
             )
 
             # 调试：记录买入信号检测结果
@@ -1179,6 +1216,7 @@ class BatchDBBacktestRunner:
 
             stock_list.append({
                 'ticker': ticker,
+                'stock_name': str(row.get('name', '')),  # 从CSV获取股票名称
                 'start_date': str(row['start_date']),
                 'end_date': str(row['end_date']),
                 'judge_buy_ids': parse_ids(row.get('judge_buy_ids', '')),
@@ -1214,6 +1252,7 @@ class BatchDBBacktestRunner:
             ticker = stock.get('ticker', '')
             start_date = stock.get('start_date', self.start_date)
             end_date = stock.get('end_date', self.end_date)
+            stock_name = stock.get('stock_name', '')  # 从CSV获取股票名称
             judge_buy_ids = stock.get('judge_buy_ids', [1])
             judge_t_ids = stock.get('judge_t_ids', [2])
             judge_sell_ids = stock.get('judge_sell_ids', [1])
@@ -1221,7 +1260,7 @@ class BatchDBBacktestRunner:
             fully_invested = stock.get('fully_invested', 1)
 
             self.logger.info("")
-            self.logger.info(f"处理股票: {ticker}")
+            self.logger.info(f"处理股票: {ticker} ({stock_name})")
             self.logger.info(f"时间段: {start_date} ~ {end_date}")
             self.logger.info(f"策略: 买入={judge_buy_ids}, 做T={judge_t_ids}, 卖出={judge_sell_ids}, 全仓={fully_invested}")
 
@@ -1230,7 +1269,7 @@ class BatchDBBacktestRunner:
                     stock_id=ticker,
                     start_date=start_date,
                     end_date=end_date,
-                    stock_name='',  # 名称从数据库获取
+                    stock_name=stock_name,  # 使用CSV中的名称，数据库获取时会补充
                     judge_buy_ids=judge_buy_ids,
                     judge_t_ids=judge_t_ids,
                     judge_sell_ids=judge_sell_ids,

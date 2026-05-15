@@ -174,6 +174,10 @@ class BacktestRunner:
         self._sh_index_daily_rsi: Optional[pd.Series] = None
         self._sh_index_symbol = 'SHSE.000001'  # 上证指数
 
+        # 科创综指数据（用于buy_id=8）
+        self._kc_index_daily_rsi: Optional[pd.Series] = None
+        self._kc_index_symbol = 'SHSE.000680'  # 科创综指
+
         # 背离检测器
         self._divergence_detector: Optional[DivergenceDetector] = None
         self._daily_divergences: List[DivergenceSignal] = []
@@ -386,6 +390,18 @@ class BacktestRunner:
         else:
             self.logger.info("不需要上证指数数据（无buy_id=6或7）")
 
+        # 检查是否需要科创综指（buy_id=8）
+        need_kc_index = any(id in [8] for id in self.judge_buy_ids + self.judge_t_ids)
+        if need_kc_index:
+            self._calculate_single_index_rsi(
+                symbol=self._kc_index_symbol,
+                index_name='科创综指',
+                rsi_attr='_kc_index_daily_rsi',
+                warmup_start=warmup_start
+            )
+        else:
+            self.logger.info("不需要科创综指数据（无buy_id=8）")
+
     def _calculate_single_index_rsi(self, symbol: str, index_name: str, rsi_attr: str, warmup_start: str) -> None:
         """
         计算单个指数的日线RSI
@@ -485,6 +501,12 @@ class BacktestRunner:
         if self._sh_index_daily_rsi is None:
             return np.nan
         return self._get_value_at_date(date, self._sh_index_daily_rsi)
+
+    def _get_kc_index_rsi_at_date(self, date: pd.Timestamp) -> float:
+        """获取指定日期的科创综指RSI值"""
+        if self._kc_index_daily_rsi is None:
+            return np.nan
+        return self._get_value_at_date(date, self._kc_index_daily_rsi)
 
     def _detect_sar_cross_down(self, date: pd.Timestamp) -> bool:
         """
@@ -781,6 +803,9 @@ class BacktestRunner:
             # 获取上证指数RSI值
             sh_index_daily_rsi = self._get_sh_index_rsi_at_date(date)
 
+            # 获取科创综指RSI值
+            kc_index_daily_rsi = self._get_kc_index_rsi_at_date(date)
+
             # 调用策略检测买入信号
             buy_signal = self.strategy.check_buy_signal(
                 date=date,
@@ -790,7 +815,8 @@ class BacktestRunner:
                 has_new_cash=self._cash > 0,
                 has_sold_cash=self._sold_cash > 0,
                 index_daily_rsi=index_daily_rsi,
-                sh_index_daily_rsi=sh_index_daily_rsi
+                sh_index_daily_rsi=sh_index_daily_rsi,
+                kc_index_daily_rsi=kc_index_daily_rsi
             )
 
             if buy_signal is not None and buy_signal.triggered:

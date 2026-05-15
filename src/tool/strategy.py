@@ -36,6 +36,8 @@ buy_id 条件:
 - buy_id=5: 创业板指数日RSI<20 (指数保护型)
 - buy_id=6: 上证指数日RSI<20 (上证指数保护型)
 - buy_id=7: 上证指数日RSI<25 (上证指数保护型)
+- buy_id=8: 科创综指日RSI<20 (科创板买入)
+- buy_id=9: 日线底背离形成 (个股底背离买入)
 
 【买入资金逻辑】
 - judge_buy_ids触发: 买入所有可用资金（新资金 + 卖出后待买回资金），无条件限制
@@ -90,7 +92,28 @@ class StrategyState:
     weekly_divergence_flag: int = 0                 # 周线顶背离标志
     daily_divergence_info: Optional[Dict] = None    # 日线顶背离详情
     weekly_divergence_info: Optional[Dict] = None   # 周线顶背离详情
+    daily_bottom_divergence_flag: int = 0           # 日线底背离标志
+    daily_bottom_divergence_info: Optional[Dict] = None  # 日线底背离详情
     last_sell_date: Optional[pd.Timestamp] = None   # 上次卖出日期
+
+    # 指数顶背离状态（用于 sell_id=4,5,6）
+    # 上证指数顶背离
+    sh_index_daily_divergence_flag: int = 0         # 上证指数日线顶背离标志
+    sh_index_weekly_divergence_flag: int = 0        # 上证指数周线顶背离标志
+    sh_index_daily_divergence_info: Optional[Dict] = None   # 上证指数日线顶背离详情
+    sh_index_weekly_divergence_info: Optional[Dict] = None  # 上证指数周线顶背离详情
+
+    # 创业板指数顶背离
+    cyb_index_daily_divergence_flag: int = 0        # 创业板指数日线顶背离标志
+    cyb_index_weekly_divergence_flag: int = 0       # 创业板指数周线顶背离标志
+    cyb_index_daily_divergence_info: Optional[Dict] = None  # 创业板指数日线顶背离详情
+    cyb_index_weekly_divergence_info: Optional[Dict] = None # 创业板指数周线顶背离详情
+
+    # 科创板指数顶背离
+    kc_index_daily_divergence_flag: int = 0         # 科创板指数日线顶背离标志
+    kc_index_weekly_divergence_flag: int = 0        # 科创板指数周线顶背离标志
+    kc_index_daily_divergence_info: Optional[Dict] = None   # 科创板指数日线顶背离详情
+    kc_index_weekly_divergence_info: Optional[Dict] = None  # 科创板指数周线顶背离详情
 
 
 @dataclass
@@ -154,11 +177,11 @@ class TradingStrategy:
 
         # 验证ID范围
         for buy_id in buy_ids:
-            if buy_id not in [1, 2, 3, 4, 5, 6, 7]:
-                raise ValueError(f"buy_id 必须为 1-7，当前值: {buy_id}")
+            if buy_id not in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]:
+                raise ValueError(f"buy_id 必须为 1-14，当前值: {buy_id}")
         for t_id in t_ids:
-            if t_id not in [1, 2, 3, 4, 5, 6, 7]:
-                raise ValueError(f"t_id 必须为 1-7，当前值: {t_id}")
+            if t_id not in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]:
+                raise ValueError(f"t_id 必须为 1-14，当前值: {t_id}")
 
         logger.info(f"策略初始化: buy_ids={buy_ids}, t_ids={t_ids}, sell_ids={sell_ids}")
 
@@ -184,14 +207,18 @@ class TradingStrategy:
             macd_cross_down: 是否发生MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）
             state: 当前策略状态
             position: 当前持仓比例
-            sell_id: 卖出策略ID（1=SAR死叉触发，2=MACD跌破死叉触发）
+            sell_id: 卖出策略ID（1=SAR死叉触发，2=MACD跌破死叉触发+RSI阶梯，3=MACD跌破死叉触发+仅背离）
 
         Returns:
             SellSignal 或 None（无信号）
 
         sell_id 说明:
-        - sell_id=1: 触发条件为SAR死叉跌破（收盘价跌破SAR）
-        - sell_id=2: 触发条件为MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）
+        - sell_id=1: 触发条件为SAR死叉跌破（收盘价跌破SAR），含RSI阶梯判断
+        - sell_id=2: 触发条件为MACD日线跌破死叉，含RSI阶梯判断
+        - sell_id=3: 触发条件为MACD日线跌破死叉，仅背离判断（不含RSI阶梯）
+        - sell_id=4: 触发条件为MACD日线跌破死叉，上证指数顶背离 + 个股周线RSI阶梯
+        - sell_id=5: 触发条件为MACD日线跌破死叉，创业板指数顶背离 + 个股周线RSI阶梯
+        - sell_id=6: 触发条件为MACD日线跌破死叉，科创板指数顶背离 + 个股周线RSI阶梯
         """
         # 检查卖出冷却期（只在有持仓时检查）
         if position > 0 and state.last_sell_date is not None:
@@ -206,6 +233,22 @@ class TradingStrategy:
             trigger_name = "SAR死叉跌破"
         elif sell_id == 2:
             # sell_id=2: MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）作为触发条件
+            trigger_condition = macd_cross_down
+            trigger_name = "MACD跌破死叉"
+        elif sell_id == 3:
+            # sell_id=3: MACD日线跌破死叉作为触发条件，仅背离判断
+            trigger_condition = macd_cross_down
+            trigger_name = "MACD跌破死叉"
+        elif sell_id == 4:
+            # sell_id=4: MACD日线跌破死叉 + 上证指数顶背离 + 个股周线RSI阶梯
+            trigger_condition = macd_cross_down
+            trigger_name = "MACD跌破死叉"
+        elif sell_id == 5:
+            # sell_id=5: MACD日线跌破死叉 + 创业板指数顶背离 + 个股周线RSI阶梯
+            trigger_condition = macd_cross_down
+            trigger_name = "MACD跌破死叉"
+        elif sell_id == 6:
+            # sell_id=6: MACD日线跌破死叉 + 科创板指数顶背离 + 个股周线RSI阶梯
             trigger_condition = macd_cross_down
             trigger_name = "MACD跌破死叉"
         else:
@@ -227,6 +270,20 @@ class TradingStrategy:
         current_weekly_div_info = state.weekly_divergence_info
         current_daily_div_info = state.daily_divergence_info
 
+        # 保存指数顶背离状态（用于 sell_id=4,5,6）
+        current_sh_daily_div_flag = state.sh_index_daily_divergence_flag
+        current_sh_weekly_div_flag = state.sh_index_weekly_divergence_flag
+        current_sh_daily_div_info = state.sh_index_daily_divergence_info
+        current_sh_weekly_div_info = state.sh_index_weekly_divergence_info
+        current_cyb_daily_div_flag = state.cyb_index_daily_divergence_flag
+        current_cyb_weekly_div_flag = state.cyb_index_weekly_divergence_flag
+        current_cyb_daily_div_info = state.cyb_index_daily_divergence_info
+        current_cyb_weekly_div_info = state.cyb_index_weekly_divergence_info
+        current_kc_daily_div_flag = state.kc_index_daily_divergence_flag
+        current_kc_weekly_div_flag = state.kc_index_weekly_divergence_flag
+        current_kc_daily_div_info = state.kc_index_daily_divergence_info
+        current_kc_weekly_div_info = state.kc_index_weekly_divergence_info
+
         # 用于背离判断的触发条件
         divergence_trigger = sar_cross_down if sell_id == 1 else macd_cross_down
 
@@ -239,6 +296,139 @@ class TradingStrategy:
         state.daily_divergence_flag = 0
         state.daily_divergence_info = None
 
+        # 重置指数背离状态（用于 sell_id=4,5,6）
+        state.sh_index_daily_divergence_flag = 0
+        state.sh_index_weekly_divergence_flag = 0
+        state.sh_index_daily_divergence_info = None
+        state.sh_index_weekly_divergence_info = None
+        state.cyb_index_daily_divergence_flag = 0
+        state.cyb_index_weekly_divergence_flag = 0
+        state.cyb_index_daily_divergence_info = None
+        state.cyb_index_weekly_divergence_info = None
+        state.kc_index_daily_divergence_flag = 0
+        state.kc_index_weekly_divergence_flag = 0
+        state.kc_index_daily_divergence_info = None
+        state.kc_index_weekly_divergence_info = None
+
+        # 【sell_id=3 特殊处理】仅背离判断，不含RSI阶梯
+        if sell_id == 3:
+            # 优先级1：周线顶背离 → 清仓
+            if current_weekly_div_flag == 1:
+                div_info = current_weekly_div_info or {}
+                divergence_date = div_info.get('date')
+                divergence_prev_high = div_info.get('prev_high', 0.0)
+                reason = f"清仓信号 (sell_id=3-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议清仓"
+                return SellSignal(
+                    flag=SellFlag.CLEAR_ALL,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    divergence_date=divergence_date,
+                    divergence_prev_high=divergence_prev_high
+                )
+
+            # 优先级2：日线顶背离 → 卖出1/3
+            if current_daily_div_flag == 1:
+                div_info = current_daily_div_info or {}
+                divergence_date = div_info.get('date')
+                divergence_prev_high = div_info.get('prev_high', 0.0)
+                reason = f"卖出信号 (sell_id=3-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
+                return SellSignal(
+                    flag=SellFlag.SELL_ONE_THIRD,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    divergence_date=divergence_date,
+                    divergence_prev_high=divergence_prev_high
+                )
+
+            # sell_id=3 仅背离判断，无其他信号
+            return None
+
+        # 【sell_id=4, 5, 6】指数顶背离 + 个股周线RSI阶梯判断
+        if sell_id in [4, 5, 6]:
+            # 确定检查哪个指数的背离状态
+            if sell_id == 4:
+                # 上证指数顶背离
+                index_name = "上证指数"
+                has_index_daily_div = current_sh_daily_div_flag == 1
+                has_index_weekly_div = current_sh_weekly_div_flag == 1
+                index_daily_div_info = current_sh_daily_div_info
+                index_weekly_div_info = current_sh_weekly_div_info
+            elif sell_id == 5:
+                # 创业板指数顶背离
+                index_name = "创业板指数"
+                has_index_daily_div = current_cyb_daily_div_flag == 1
+                has_index_weekly_div = current_cyb_weekly_div_flag == 1
+                index_daily_div_info = current_cyb_daily_div_info
+                index_weekly_div_info = current_cyb_weekly_div_info
+            elif sell_id == 6:
+                # 科创板指数顶背离
+                index_name = "科创板指数"
+                has_index_daily_div = current_kc_daily_div_flag == 1
+                has_index_weekly_div = current_kc_weekly_div_flag == 1
+                index_daily_div_info = current_kc_daily_div_info
+                index_weekly_div_info = current_kc_weekly_div_info
+            else:
+                return None
+
+            # 检查指数是否出现顶背离（日线或周线）
+            has_index_div = has_index_daily_div or has_index_weekly_div
+
+            # 如果没有指数顶背离，则不触发卖出
+            if not has_index_div:
+                return None
+
+            # 指数有顶背离，检查个股周线RSI决定卖出比例
+            # 优先级：RSI>90 清仓 > RSI>85 卖出1/2 > RSI>80 卖出1/3
+            rsi_peak_date = current_rsi_peak_date or date
+            rsi_peak_value = current_rsi_peak_value or weekly_rsi
+
+            # 获取指数背离详情
+            index_div_type = "日线顶背离" if has_index_daily_div else "周线顶背离"
+            index_div_info = index_daily_div_info if has_index_daily_div else index_weekly_div_info
+            index_div_date = index_div_info.get('date') if index_div_info else None
+
+            # 优先级1：周线RSI>90 或 rsi_flag=3 → 清仓
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level3'] or current_rsi_flag == 3:
+                reason = f"清仓信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>90 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议清仓"
+                return SellSignal(
+                    flag=SellFlag.CLEAR_ALL,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 优先级2：周线RSI>85 或 rsi_flag=2 → 卖出1/2
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level2'] or current_rsi_flag == 2:
+                reason = f"卖出信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>85 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/2"
+                return SellSignal(
+                    flag=SellFlag.SELL_HALF,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 优先级3：周线RSI>80 或 rsi_flag=1 → 卖出1/3
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level1'] or current_rsi_flag == 1:
+                reason = f"卖出信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>80 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/3"
+                return SellSignal(
+                    flag=SellFlag.SELL_ONE_THIRD,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 指数有顶背离但个股周线RSI未达到阈值，不触发卖出
+            return None
+
+        # 【sell_id=1 和 sell_id=2】含RSI阶梯判断的完整逻辑
         # 按优先级检查卖出信号（使用保存的flag值判断）
         sell_flag = SellFlag.NO_SIGNAL
         reason = ""
@@ -335,7 +525,12 @@ class TradingStrategy:
         has_new_cash: bool,
         has_sold_cash: bool,
         index_daily_rsi: float = np.nan,
-        sh_index_daily_rsi: float = np.nan
+        sh_index_daily_rsi: float = np.nan,
+        kc_index_daily_rsi: float = np.nan,
+        monthly_rsi: float = np.nan,
+        bj_index_daily_rsi: float = np.nan,
+        hsTech_index_daily_rsi: float = np.nan,
+        hsIndex_index_daily_rsi: float = np.nan
     ) -> Optional[BuySignal]:
         """
         检查买入信号
@@ -344,11 +539,23 @@ class TradingStrategy:
             date: 当前日期
             daily_rsi: 当日RSI值
             weekly_rsi: 当日周线RSI值
+            monthly_rsi: 当日月线RSI值（用于buy_id=10和buy_id=11）
             state: 当前策略状态
             has_new_cash: 是否有新资金（未进入市场的资金）
             has_sold_cash: 是否有卖出后待买回的资金
             index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
-            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和buy_id=7）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）
+            kc_index_daily_rsi: 科创综指日线RSI值（用于buy_id=8）
+            bj_index_daily_rsi: 北证板块日线RSI值（用于buy_id=12）
+            hsTech_index_daily_rsi: 恒生科技ETF日线RSI值（用于buy_id=13）
+            hsIndex_index_daily_rsi: 恒生指数ETF日线RSI值（用于buy_id=14）
+            monthly_rsi: 当日月线RSI值（用于buy_id=10和buy_id=11）
+            state: 当前策略状态
+            has_new_cash: 是否有新资金（未进入市场的资金）
+            has_sold_cash: 是否有卖出后待买回的资金
+            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）
+            kc_index_daily_rsi: 科创综指日线RSI值（用于buy_id=8）
 
         Returns:
             BuySignal 或 None（无信号）
@@ -371,7 +578,7 @@ class TradingStrategy:
 
         # 首先检查 judge_buy_ids（最高优先级，买入所有可用资金）
         for buy_id in self.buy_ids:
-            condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
+            condition_met, condition_desc = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, state, index_daily_rsi, sh_index_daily_rsi, kc_index_daily_rsi, monthly_rsi, bj_index_daily_rsi, hsTech_index_daily_rsi, hsIndex_index_daily_rsi)
             if condition_met:
                 # judge_buy_ids触发：买入所有可用资金（新资金 + 卖出资金）
                 return BuySignal(
@@ -387,7 +594,7 @@ class TradingStrategy:
         # 如果有新资金，应该等待 judge_buy_ids 触发而不是用 t_ids
         if has_sold_cash and not has_new_cash:
             for t_id in self.t_ids:
-                condition_met, condition_desc = self._check_single_buy_condition_with_desc(t_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
+                condition_met, condition_desc = self._check_single_buy_condition_with_desc(t_id, daily_rsi, weekly_rsi, state, index_daily_rsi, sh_index_daily_rsi, kc_index_daily_rsi, monthly_rsi, bj_index_daily_rsi, hsTech_index_daily_rsi, hsIndex_index_daily_rsi)
                 if condition_met:
                     # judge_t_ids触发：只买回卖出资金
                     return BuySignal(
@@ -400,7 +607,7 @@ class TradingStrategy:
 
         return None
 
-    def _check_single_buy_condition_with_desc(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan) -> Tuple[bool, str]:
+    def _check_single_buy_condition_with_desc(self, buy_id: int, daily_rsi: float, weekly_rsi: float, state: StrategyState, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan, kc_index_daily_rsi: float = np.nan, monthly_rsi: float = np.nan, bj_index_daily_rsi: float = np.nan, hsTech_index_daily_rsi: float = np.nan, hsIndex_index_daily_rsi: float = np.nan) -> Tuple[bool, str]:
         """
         检查单个买入ID的条件并返回条件描述
 
@@ -408,8 +615,14 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
-            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和5）
-            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和7）
+            monthly_rsi: 月线RSI值（用于buy_id=10和buy_id=11）
+            state: 当前策略状态（用于buy_id=9底背离判断）
+            index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）
+            kc_index_daily_rsi: 科创综指日线RSI值（用于buy_id=8）
+            bj_index_daily_rsi: 北证板块日线RSI值（用于buy_id=12）
+            hsTech_index_daily_rsi: 恒生科技ETF日线RSI值（用于buy_id=13）
+            hsIndex_index_daily_rsi: 恒生指数ETF日线RSI值（用于buy_id=14）
 
         Returns:
             Tuple[bool, str]: (是否满足条件, 条件描述)
@@ -468,9 +681,75 @@ class TradingStrategy:
                 return True, f"buy_id=7(上证指数保护型): 上证指数日RSI={sh_index_daily_rsi:.2f}<25"
             return False, ""
 
+        elif buy_id == 8:
+            # 科创板买入：科创综指(000680)日RSI<20
+            if np.isnan(kc_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少科创综指RSI数据")
+                return False, ""
+            if kc_index_daily_rsi < 20:
+                return True, f"buy_id=8(科创板买入): 科创综指日RSI={kc_index_daily_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 9:
+            # 个股底背离买入：日线底背离形成
+            if state.daily_bottom_divergence_flag == 1:
+                div_info = state.daily_bottom_divergence_info or {}
+                div_date = div_info.get('date')
+                div_prev_low = div_info.get('prev_low', 0.0)
+                return True, f"buy_id=9(底背离买入): 日线底背离形成于 {div_date.strftime('%Y-%m-%d') if div_date else 'N/A'}, 前低={div_prev_low:.3f}"
+            return False, ""
+
+        elif buy_id == 10:
+            # 红利股买点：上证指数日线RSI<20，且个股月线RSI<30
+            if np.isnan(sh_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少上证指数RSI数据")
+                return False, ""
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if sh_index_daily_rsi < 20 and monthly_rsi < 30:
+                return True, f"buy_id=10(红利股买点): 上证指数日RSI={sh_index_daily_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<30"
+            return False, ""
+
+        elif buy_id == 11:
+            # 个股底背离买入加强版：日RSI<20 且 周RSI<20，且月线RSI<30
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 30:
+                return True, f"buy_id=11(底背离加强): 日RSI={daily_rsi:.2f}<20 且 周RSI={weekly_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<30"
+            return False, ""
+
+        elif buy_id == 12:
+            # 北证板块买入：北证板块(899050)日RSI<20
+            if np.isnan(bj_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少北证板块RSI数据")
+                return False, ""
+            if bj_index_daily_rsi < 20:
+                return True, f"buy_id=12(北证板块买入): 北证板块日RSI={bj_index_daily_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 13:
+            # 恒生科技板块买入：恒生科技ETF(513180)日RSI<20
+            if np.isnan(hsTech_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少恒生科技板块RSI数据")
+                return False, ""
+            if hsTech_index_daily_rsi < 20:
+                return True, f"buy_id=13(恒生科技买入): 恒生科技ETF日RSI={hsTech_index_daily_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 14:
+            # 恒生指数板块买入：恒生指数ETF(159920)日RSI<20
+            if np.isnan(hsIndex_index_daily_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少恒生指数板块RSI数据")
+                return False, ""
+            if hsIndex_index_daily_rsi < 20:
+                return True, f"buy_id=14(恒生指数买入): 恒生指数ETF日RSI={hsIndex_index_daily_rsi:.2f}<20"
+            return False, ""
+
         return False, ""
 
-    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan) -> bool:
+    def _check_single_buy_condition(self, buy_id: int, daily_rsi: float, weekly_rsi: float, state: StrategyState, index_daily_rsi: float = np.nan, sh_index_daily_rsi: float = np.nan, kc_index_daily_rsi: float = np.nan, monthly_rsi: float = np.nan, bj_index_daily_rsi: float = np.nan, hsTech_index_daily_rsi: float = np.nan, hsIndex_index_daily_rsi: float = np.nan) -> bool:
         """
         检查单个买入ID的条件
 
@@ -478,13 +757,19 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
+            monthly_rsi: 月线RSI值（用于buy_id=10和buy_id=11）
+            state: 当前策略状态（用于buy_id=9底背离判断）
             index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和5）
-            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6和7）
+            sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）
+            kc_index_daily_rsi: 科创综指日线RSI值（用于buy_id=8）
+            bj_index_daily_rsi: 北证板块日线RSI值（用于buy_id=12）
+            hsTech_index_daily_rsi: 恒生科技ETF日线RSI值（用于buy_id=13）
+            hsIndex_index_daily_rsi: 恒生指数ETF日线RSI值（用于buy_id=14）
 
         Returns:
             bool: 是否满足买入条件
         """
-        condition_met, _ = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, index_daily_rsi, sh_index_daily_rsi)
+        condition_met, _ = self._check_single_buy_condition_with_desc(buy_id, daily_rsi, weekly_rsi, state, index_daily_rsi, sh_index_daily_rsi, kc_index_daily_rsi, monthly_rsi, bj_index_daily_rsi)
         return condition_met
 
     def update_rsi_flag(
@@ -566,6 +851,22 @@ class TradingStrategy:
         state.weekly_divergence_info = None
         state.daily_divergence_flag = 0
         state.daily_divergence_info = None
+        state.daily_bottom_divergence_flag = 0
+        state.daily_bottom_divergence_info = None
+
+        # 重置指数背离状态（用于 sell_id=4,5,6）
+        state.sh_index_daily_divergence_flag = 0
+        state.sh_index_weekly_divergence_flag = 0
+        state.sh_index_daily_divergence_info = None
+        state.sh_index_weekly_divergence_info = None
+        state.cyb_index_daily_divergence_flag = 0
+        state.cyb_index_weekly_divergence_flag = 0
+        state.cyb_index_daily_divergence_info = None
+        state.cyb_index_weekly_divergence_info = None
+        state.kc_index_daily_divergence_flag = 0
+        state.kc_index_weekly_divergence_flag = 0
+        state.kc_index_daily_divergence_info = None
+        state.kc_index_weekly_divergence_info = None
 
         # 记录卖出日期（用于买入冷却期）
         # 假卖出不设置 last_sell_date，因为没有实际交易
@@ -574,10 +875,14 @@ class TradingStrategy:
 
     def reset_after_buy(self, state: StrategyState) -> None:
         """
-        买入后重置状态（可选，视策略而定）
+        买入后重置状态
+
+        【关键逻辑】
+        买入后清除底背离标志，避免重复触发买入信号。
         """
-        # 买入不重置其他状态，保持RSI和背离监控
-        pass
+        # 清除底背离标志
+        state.daily_bottom_divergence_flag = 0
+        state.daily_bottom_divergence_info = None
 
     def set_daily_divergence(
         self,
@@ -636,6 +941,150 @@ class TradingStrategy:
 
         state.weekly_divergence_flag = 1
         state.weekly_divergence_info = divergence_info
+
+    def set_daily_bottom_divergence(
+        self,
+        state: StrategyState,
+        divergence_info: Dict
+    ) -> None:
+        """
+        设置日线底背离状态
+
+        Args:
+            state: 当前策略状态
+            divergence_info: 背离信息字典
+
+        【关键逻辑】
+        底背离用于买入信号判断，当个股形成日线级别底背离时触发买入。
+        """
+        state.daily_bottom_divergence_flag = 1
+        state.daily_bottom_divergence_info = divergence_info
+
+    def clear_daily_bottom_divergence(self, state: StrategyState) -> None:
+        """
+        清除日线底背离状态
+
+        Args:
+            state: 当前策略状态
+
+        【使用场景】
+        当买入信号触发后，清除底背离标志，避免重复触发。
+        """
+        state.daily_bottom_divergence_flag = 0
+        state.daily_bottom_divergence_info = None
+
+    # ==================== 指数顶背离设置方法（用于 sell_id=4,5,6）====================
+
+    def set_sh_index_divergence(
+        self,
+        state: StrategyState,
+        daily_info: Optional[Dict] = None,
+        weekly_info: Optional[Dict] = None
+    ) -> None:
+        """
+        设置上证指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+            daily_info: 日线顶背离信息字典（可选）
+            weekly_info: 周线顶背离信息字典（可选）
+
+        【使用场景】
+        用于 sell_id=4 策略，当上证指数出现顶背离时设置状态，
+        后续在 MACD 日线跌破死叉时触发卖出判断。
+        """
+        if daily_info is not None:
+            state.sh_index_daily_divergence_flag = 1
+            state.sh_index_daily_divergence_info = daily_info
+        if weekly_info is not None:
+            state.sh_index_weekly_divergence_flag = 1
+            state.sh_index_weekly_divergence_info = weekly_info
+
+    def set_cyb_index_divergence(
+        self,
+        state: StrategyState,
+        daily_info: Optional[Dict] = None,
+        weekly_info: Optional[Dict] = None
+    ) -> None:
+        """
+        设置创业板指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+            daily_info: 日线顶背离信息字典（可选）
+            weekly_info: 周线顶背离信息字典（可选）
+
+        【使用场景】
+        用于 sell_id=5 策略，当创业板指数出现顶背离时设置状态，
+        后续在 MACD 日线跌破死叉时触发卖出判断。
+        """
+        if daily_info is not None:
+            state.cyb_index_daily_divergence_flag = 1
+            state.cyb_index_daily_divergence_info = daily_info
+        if weekly_info is not None:
+            state.cyb_index_weekly_divergence_flag = 1
+            state.cyb_index_weekly_divergence_info = weekly_info
+
+    def set_kc_index_divergence(
+        self,
+        state: StrategyState,
+        daily_info: Optional[Dict] = None,
+        weekly_info: Optional[Dict] = None
+    ) -> None:
+        """
+        设置科创板指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+            daily_info: 日线顶背离信息字典（可选）
+            weekly_info: 周线顶背离信息字典（可选）
+
+        【使用场景】
+        用于 sell_id=6 策略，当科创板指数出现顶背离时设置状态，
+        后续在 MACD 日线跌破死叉时触发卖出判断。
+        """
+        if daily_info is not None:
+            state.kc_index_daily_divergence_flag = 1
+            state.kc_index_daily_divergence_info = daily_info
+        if weekly_info is not None:
+            state.kc_index_weekly_divergence_flag = 1
+            state.kc_index_weekly_divergence_info = weekly_info
+
+    def clear_sh_index_divergence(self, state: StrategyState) -> None:
+        """
+        清除上证指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+        """
+        state.sh_index_daily_divergence_flag = 0
+        state.sh_index_weekly_divergence_flag = 0
+        state.sh_index_daily_divergence_info = None
+        state.sh_index_weekly_divergence_info = None
+
+    def clear_cyb_index_divergence(self, state: StrategyState) -> None:
+        """
+        清除创业板指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+        """
+        state.cyb_index_daily_divergence_flag = 0
+        state.cyb_index_weekly_divergence_flag = 0
+        state.cyb_index_daily_divergence_info = None
+        state.cyb_index_weekly_divergence_info = None
+
+    def clear_kc_index_divergence(self, state: StrategyState) -> None:
+        """
+        清除科创板指数顶背离状态
+
+        Args:
+            state: 当前策略状态
+        """
+        state.kc_index_daily_divergence_flag = 0
+        state.kc_index_weekly_divergence_flag = 0
+        state.kc_index_daily_divergence_info = None
+        state.kc_index_weekly_divergence_info = None
 
     def __repr__(self) -> str:
         """类实例的字符串表示"""

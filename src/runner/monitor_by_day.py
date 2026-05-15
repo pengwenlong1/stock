@@ -50,7 +50,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, project_root)
 
 # 导入策略类和工具类
-from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag
+from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag, RSI_THRESHOLDS
 from src.tool.rsi_calculator import RSI
 from src.tool.sar_strategy import SARStrategy, SARSignal  # 导入SAR策略类
 from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal  # 导入背离检测器
@@ -68,15 +68,28 @@ except ImportError:
 
 # ==================== 监控配置 ====================
 
-# 监控时间点（小时:分钟）
-MONITOR_TIMES = ['12:00', '14:30', '20:00']
+# 监控时间点（交易时间内每30分钟执行）
+# 上午：9:30, 10:00, 10:30, 11:00, 11:30
+# 下午：13:00, 13:30, 14:00, 14:30, 15:00
+MORNING_MONITOR_TIMES = ['09:30', '10:00', '10:30', '11:00', '11:30']
+AFTERNOON_MONITOR_TIMES = ['13:00', '13:30', '14:00', '14:30', '15:00']
+MONITOR_TIMES = MORNING_MONITOR_TIMES + AFTERNOON_MONITOR_TIMES
+
+# 监控间隔（秒）
+MONITOR_INTERVAL = 30 * 60  # 30分钟
 
 # 创业板指数和上证指数代码
 INDEX_CYB = 'SZSE.399006'   # 创业板指数
 INDEX_SH = 'SHSE.000001'    # 上证指数
+INDEX_KC = 'SHSE.000680'    # 科创综指
+INDEX_BJ = 'BJSE.899050'    # 北证板块
+INDEX_HS_TECH = 'SHSE.513180'  # 恒生科技ETF（替代港股恒生科技）
+INDEX_HS_INDEX = 'SZSE.159920'  # 恒生指数ETF（替代港股恒生指数）
 
 # 预热天数（用于指标计算）
-WARMUP_DAYS = 365
+# 【重要】月线RSI计算需要足够长的历史数据让EMA状态稳定
+# 至少需要24个月线数据（约2年），所以预热天数设置为730天
+WARMUP_DAYS = 730
 
 # SAR参数：SAR(10,2,20)
 SAR_ACCELERATION = 0.02
@@ -84,6 +97,10 @@ SAR_MAXIMUM = 0.20
 
 # 监控最近几个交易日
 RECENT_TRADING_DAYS = 2
+
+# RSI历史高点回溯天数（用于检测曾经触发RSI高点但当前RSI已降低的情况）
+# 延长回溯天数以覆盖更多历史高点
+RSI_HIGH_LOOKBACK_DAYS = 30
 
 
 # ==================== 数据结构 ====================
@@ -110,6 +127,16 @@ class LocalHighInfo:
     high_price: float                  # 局部高点价格（最高价）
     high_macd: float                   # 局部高点MACD柱值
     weekly_rsi: float                  # 局部高点周线RSI
+
+
+@dataclass
+class RSIHighInfo:
+    """历史RSI高点信息（用于持续告警）"""
+    high_date: str                     # RSI高点日期
+    high_rsi: float                    # RSI高点值
+    rsi_type: str                      # RSI类型: '日线' 或 '周线'
+    current_rsi: float                 # 当前RSI值
+    days_elapsed: int                  # 距离高点的天数
 
 
 @dataclass
@@ -157,8 +184,12 @@ class MonitorResult:
     latest_weekly_rsi: float
     latest_sar: float                      # 最新SAR值
     latest_sar_trend: str                  # 最新SAR趋势（多头/空头）
-    latest_index_daily_rsi_cyb: float
-    latest_index_daily_rsi_sh: float
+    latest_index_daily_rsi_cyb: float      # 创业板指数RSI
+    latest_index_daily_rsi_sh: float       # 上证指数RSI
+    latest_index_daily_rsi_kc: float       # 科创综指RSI
+    latest_index_daily_rsi_bj: float       # 北证板块RSI
+    latest_index_daily_rsi_hsTech: float   # 恒生科技ETF RSI
+    latest_index_daily_rsi_hsIndex: float  # 恒生指数ETF RSI
     signals: List[SignalInfo]
     notes: str
     judge_buy_ids: List[int]
@@ -166,6 +197,7 @@ class MonitorResult:
     judge_sell_ids: List[int]
     sar_cross_down_events: List[SARCrossDownInfo]  # SAR死叉跌破事件列表
     pending_warnings: List[Dict] = field(default_factory=list)  # 待触发卖出信号告警
+    rsi_high_warnings: List[RSIHighInfo] = field(default_factory=list)  # 历史RSI高点告警
 
 
 # ==================== 钉钉告警类 ====================
@@ -543,8 +575,11 @@ class DailyMonitor:
 
         for _, row in df.iterrows():
             # 只加载active=1的股票
-            active = int(row['active']) if not pd.isna(row['active']) else 0
-            if active != 1:
+            # active字段支持分号分隔（如"1;2"），只要包含1就监控
+            active_str = str(row['active']) if not pd.isna(row['active']) else '0'
+            active_values = [int(x.strip()) for x in active_str.replace(';', ',').split(',') if x.strip().isdigit()]
+            is_active = 1 in active_values
+            if not is_active:
                 continue
 
             symbol = self._add_exchange_prefix(str(row['symbol']))
@@ -704,6 +739,29 @@ class DailyMonitor:
 
         return False
 
+    def is_market_day(self) -> bool:
+        """
+        判断当前是否是交易日（包括盘前盘后时间）
+
+        用于判断是否应该获取实时行情，只要当天是交易日就可以获取。
+
+        Returns:
+            bool: 是否是交易日
+        """
+        now = datetime.now()
+
+        # 检查是否是工作日
+        if now.weekday() >= 5:  # 周六、周日
+            return False
+
+        current_time = now.strftime('%H:%M')
+
+        # 在工作日的 08:00 - 16:00 之间认为是交易日相关时间
+        if '08:00' <= current_time <= '16:00':
+            return True
+
+        return False
+
     def get_historical_data_with_realtime(self,
                                            symbol: str,
                                            end_date: str) -> Optional[pd.DataFrame]:
@@ -722,8 +780,8 @@ class DailyMonitor:
         if df is None or df.empty:
             return None
 
-        # 如果当前是交易时段，尝试获取实时行情补充当天数据
-        if self.is_trading_time():
+        # 如果当前是交易日相关时间（08:00-16:00），尝试获取实时行情补充当天数据
+        if self.is_market_day():
             realtime_quote = self.get_realtime_quote(symbol)
             if realtime_quote is not None:
                 # 检查历史数据的最后一条是否是今天
@@ -769,7 +827,7 @@ class DailyMonitor:
             df: 历史数据DataFrame
 
         Returns:
-            Tuple: (日线RSI, 周线RSI, SAR策略实例, SAR序列, MACD柱序列)
+            Tuple: (日线RSI, 周线RSI, 月线RSI, SAR策略实例, SAR序列, MACD柱序列)
         """
         close_series = pd.Series(df['close'].values, index=df.index, name='Close')
         high_series = pd.Series(df['high'].values, index=df.index, name='High')
@@ -783,6 +841,10 @@ class DailyMonitor:
         rsi_weekly = RSI(period=6, freq='weekly')
         weekly_rsi = rsi_weekly.calculate(close_series)
 
+        # 计算月线RSI(6)（用于buy_id=10和buy_id=11）
+        rsi_monthly = RSI(period=6, freq='monthly')
+        monthly_rsi = rsi_monthly.calculate(close_series)
+
         # 计算SAR指标（替代MA均线）
         sar_strategy = SARStrategy(
             acceleration=SAR_ACCELERATION,
@@ -791,17 +853,19 @@ class DailyMonitor:
         sar_strategy.prepare_data(high_series, low_series, close_series)
         sar_series = sar_strategy._sar_series
 
-        # 计算MACD柱（用于背离检测）
+        # 计算MACD（用于背离检测和死叉检测）
         from src.tool.macd_calculator import MACDCalculator
         macd_calc = MACDCalculator(fast_period=12, slow_period=26, signal_period=9)
         macd_calc.prepare_data(close_series)
         macd_series = macd_calc._macd_series
+        dif_series = macd_calc._dif_series
+        dea_series = macd_calc._dea_series
 
-        return daily_rsi, weekly_rsi, sar_strategy, sar_series, macd_series
+        return daily_rsi, weekly_rsi, monthly_rsi, sar_strategy, sar_series, macd_series, dif_series, dea_series, macd_calc
 
     def get_index_rsi(self, index_symbol: str, end_date: str) -> float:
         """
-        获取指数RSI值
+        获取指数RSI值（包含当天实时数据）
 
         Args:
             index_symbol: 指数代码
@@ -832,6 +896,27 @@ class DailyMonitor:
             index_data['eob'] = pd.to_datetime(index_data['eob'])
             close_series = pd.Series(index_data['close'].values, index=index_data['eob'])
 
+            # 【关键修改】如果是交易时段，尝试获取实时行情补充当天数据
+            if self.is_trading_time():
+                realtime_quote = self.get_realtime_quote(index_symbol)
+                if realtime_quote is not None:
+                    today_str = end_date
+                    if len(close_series) > 0:
+                        # 安全获取最后一条数据的日期字符串
+                        last_idx = close_series.index[-1]
+                        last_date_str = last_idx.strftime('%Y-%m-%d') if hasattr(last_idx, 'strftime') else str(last_idx)[:10]
+                        if last_date_str != today_str:
+                            new_datetime = realtime_quote['datetime']
+                            # 处理timezone问题：如果index有时区，给新datetime也加上
+                            if hasattr(close_series.index, 'tz') and close_series.index.tz is not None:
+                                if new_datetime.tz is None:
+                                    new_datetime = new_datetime.tz_localize(close_series.index.tz)
+                            close_series.loc[new_datetime] = realtime_quote['close']
+                            self.logger.info(f"指数实时行情补充: {index_symbol} | 日期={today_str} | 价格={realtime_quote['close']:.3f}")
+                        else:
+                            # 如果最后一条是今天，用实时数据更新
+                            close_series.iloc[-1] = realtime_quote['close']
+
             rsi_calculator = RSI(period=6, freq='daily')
             rsi_series = rsi_calculator.calculate(close_series)
 
@@ -845,7 +930,7 @@ class DailyMonitor:
 
     def get_index_rsi_at_date(self, index_symbol: str, target_date: str) -> float:
         """
-        获取指数在指定日期的RSI值
+        获取指数在指定日期的RSI值（包含当天实时数据）
 
         Args:
             index_symbol: 指数代码
@@ -876,14 +961,44 @@ class DailyMonitor:
             index_data['eob'] = pd.to_datetime(index_data['eob'])
             close_series = pd.Series(index_data['close'].values, index=index_data['eob'])
 
+            # 【关键修改】如果目标日期是今天且是交易时段，尝试获取实时行情
+            target_date_str = target_date.strftime('%Y-%m-%d') if hasattr(target_date, 'strftime') else str(target_date)
+            today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+            if target_date_str == today_str and self.is_trading_time():
+                realtime_quote = self.get_realtime_quote(index_symbol)
+                if realtime_quote is not None:
+                    # 如果最后一条数据不是今天，添加实时数据
+                    if len(close_series) > 0:
+                        # 安全获取最后一条数据的日期字符串
+                        last_idx = close_series.index[-1]
+                        last_date_str = last_idx.strftime('%Y-%m-%d') if hasattr(last_idx, 'strftime') else str(last_idx)[:10]
+                        if last_date_str != today_str:
+                            new_datetime = realtime_quote['datetime']
+                            # 处理timezone问题：如果index有时区，给新datetime也加上
+                            if hasattr(close_series.index, 'tz') and close_series.index.tz is not None:
+                                if new_datetime.tz is None:
+                                    new_datetime = new_datetime.tz_localize(close_series.index.tz)
+                            close_series.loc[new_datetime] = realtime_quote['close']
+                        else:
+                            # 如果最后一条是今天，用实时数据更新
+                            close_series.iloc[-1] = realtime_quote['close']
+
             rsi_calculator = RSI(period=6, freq='daily')
             rsi_series = rsi_calculator.calculate(close_series)
 
-            # 找到目标日期的RSI值
-            target_date_str = target_date.strftime('%Y-%m-%d') if hasattr(target_date, 'strftime') else str(target_date)
-            matching = rsi_series[rsi_series.index.strftime('%Y-%m-%d') == target_date_str]
+            # 找到目标日期的RSI值（安全处理日期格式）
+            # 如果目标日期是非交易日，返回最近一个交易日的RSI
+            matching = rsi_series[rsi_series.index.to_series().apply(lambda x: x.strftime('%Y-%m-%d') if hasattr(x, 'strftime') else str(x)[:10]) == target_date_str]
             if len(matching) > 0:
                 return matching.iloc[-1]
+
+            # 如果目标日期没有数据（可能是非交易日），返回最后一个有效RSI值
+            if len(rsi_series) > 0:
+                last_valid_rsi = rsi_series.dropna()
+                if len(last_valid_rsi) > 0:
+                    # 返回最近的交易日的RSI
+                    return last_valid_rsi.iloc[-1]
+
             return np.nan
 
         except Exception as e:
@@ -990,6 +1105,29 @@ class DailyMonitor:
         self.logger.info(f"监控股票: {symbol} ({stock_config.stock_name}) "
                         f"策略: buy={stock_config.judge_buy_ids}, t={stock_config.judge_t_ids}, sell={stock_config.judge_sell_ids}")
 
+        # 【关键】先获取历史数据（不包括今天），计算昨天的SAR值
+        # 这是今天判断SAR死叉的基准值
+        df_history = self.get_historical_data(symbol, end_date)
+        if df_history is None or df_history.empty:
+            self.logger.warning(f"无法获取历史数据: {symbol}")
+            return None
+
+        # 计算历史数据的SAR（不包括今天），获取昨天的SAR值作为今天的判断基准
+        close_series_history = pd.Series(df_history['close'].values, index=df_history.index, name='Close')
+        high_series_history = pd.Series(df_history['high'].values, index=df_history.index, name='High')
+        low_series_history = pd.Series(df_history['low'].values, index=df_history.index, name='Low')
+
+        sar_strategy_history = SARStrategy(
+            acceleration=SAR_ACCELERATION,
+            maximum=SAR_MAXIMUM
+        )
+        sar_strategy_history.prepare_data(high_series_history, low_series_history, close_series_history)
+        sar_series_history = sar_strategy_history._sar_series
+
+        # 获取昨天的SAR值（作为今天判断基准）
+        yesterday_sar_baseline = sar_series_history.iloc[-1] if len(sar_series_history) > 0 else np.nan
+        self.logger.info(f"  [SAR基准值] 昨天SAR={yesterday_sar_baseline:.3f}（基于历史数据计算，不包含今天）")
+
         # 获取历史数据（如果是交易时段，会补充实时行情）
         df = self.get_historical_data_with_realtime(symbol, end_date)
         if df is None or df.empty:
@@ -999,7 +1137,7 @@ class DailyMonitor:
         # 计算指标（使用SAR替代MA，增加MACD）
         close_series = pd.Series(df['close'].values, index=df.index, name='Close')
         high_series = pd.Series(df['high'].values, index=df.index, name='High')
-        daily_rsi, weekly_rsi, sar_strategy, sar_series, macd_series = self.calculate_indicators(df)
+        daily_rsi, weekly_rsi, monthly_rsi, sar_strategy, sar_series, macd_series, dif_series, dea_series, macd_calc = self.calculate_indicators(df)
 
         # 获取SAR转折信号（检测整个历史数据的信号）
         sar_signals = sar_strategy.detect_signals(
@@ -1011,6 +1149,15 @@ class DailyMonitor:
         # 只关注绿转红信号（死叉跌破）
         cross_down_signals = [s for s in sar_signals if s.signal_type == '绿转红']
         self.logger.info(f"  SAR死叉跌破信号: {len(cross_down_signals)} 个")
+
+        # 【新增】检测MACD死叉信号（用于sell_id=2或3的触发条件）
+        # MACD日线跌破死叉 = MACD死叉（DIF下穿DEA）+ 价格跌破SAR
+        macd_cross_signals = macd_calc.detect_cross_signals(
+            df.index[0].strftime('%Y-%m-%d'),
+            end_date
+        )
+        macd_cross_down_signals = [s for s in macd_cross_signals if s.signal_type == '死叉']
+        self.logger.info(f"  MACD死叉信号: {len(macd_cross_down_signals)} 个")
 
         # 创建策略实例
         strategy = TradingStrategy(
@@ -1107,6 +1254,35 @@ class DailyMonitor:
                 # 创建策略状态（关键：需要从上一次SAR死叉跌破后重新累积rsi_flag）
                 state = StrategyState()
 
+                # 【关键修改】追踪中间是否发生过卖出，用于确定背离检测的起始点
+                last_sell_date_in_range = None  # 上一次卖出日期（如果有）
+
+                # 【关键新增】先检查上一次SAR死叉是否实际触发卖出
+                # 如果上一次SAR死叉之前有背离确认，那次SAR死叉应该触发卖出
+                if prev_cross_down_date is not None:
+                    # 检查上一次SAR死叉之前是否有背离确认
+                    div_search_start = df.index[0]  # 从数据开始
+                    if i > 1:
+                        # 更早的上一次SAR死叉
+                        prev_prev_cross_down = cross_down_signals[i-2].date if i >= 2 else None
+                        if prev_prev_cross_down is not None:
+                            div_search_start = prev_prev_cross_down + pd.Timedelta(days=1)
+                    div_search_end = prev_cross_down_date
+
+                    temp_has_daily_div = False
+                    for div in daily_divergences_confirmed:
+                        if div.confirmation_date is not None:
+                            if div_search_start <= div.confirmation_date <= div_search_end:
+                                temp_has_daily_div = True
+                                self.logger.info(f"    上一次SAR死叉({prev_cross_down_date.strftime('%Y-%m-%d')})前有背离确认({div.confirmation_date.strftime('%Y-%m-%d')})")
+                                break
+
+                    if temp_has_daily_div:
+                        # 上一次SAR死叉应该触发卖出
+                        last_sell_date_in_range = prev_cross_down_date
+                        state.daily_divergence_flag = 0  # 已卖出，重置
+                        self.logger.info(f"    上一次SAR死叉实际卖出: {prev_cross_down_date.strftime('%Y-%m-%d')}")
+
                 # 【关键修改】从上一次SAR死叉跌破之后，遍历更新rsi_flag
                 # 上一次SAR死叉跌破后，rsi_flag被重置为0，需要重新累积
                 if prev_cross_down_date is not None:
@@ -1131,11 +1307,14 @@ class DailyMonitor:
                     end_idx = len(df) - 1
 
                 # 遍历区间，更新rsi_flag（模拟回测的逐日更新逻辑）
+                # 【关键新增】同时追踪中间是否有卖出发生，卖出后重置state
                 rsi_peak_value = 0.0
                 rsi_peak_date = None
                 for idx in range(start_idx, end_idx + 1):
                     date = df.index[idx]
                     weekly_rsi_value = weekly_rsi.iloc[idx] if idx < len(weekly_rsi) else np.nan
+                    daily_rsi_value = daily_rsi.iloc[idx] if idx < len(daily_rsi) else np.nan
+
                     if not np.isnan(weekly_rsi_value):
                         # 更新rsi_flag（与回测逻辑一致）
                         strategy.update_rsi_flag(weekly_rsi_value, state, date)
@@ -1143,6 +1322,54 @@ class DailyMonitor:
                         if weekly_rsi_value > rsi_peak_value:
                             rsi_peak_value = weekly_rsi_value
                             rsi_peak_date = date
+
+                    # 【关键新增】检查这一天是否有SAR死叉且触发了卖出
+                    # 如果中间有卖出，要重置state，并记录卖出日期
+                    if idx > start_idx:  # 不检查起始点（上一次SAR死叉当天）
+                        # 检查这一天是否是某次SAR死叉
+                        for prev_signal in cross_down_signals[:i]:  # 只检查当前之前的SAR死叉
+                            if prev_signal.date.strftime('%Y-%m-%d') == date.strftime('%Y-%m-%d'):
+                                # 这一天有SAR死叉，检查是否触发了卖出
+                                # 【关键】先检测当时的背离状态（如果有的话）
+                                # 检查在prev_cross_down_date到当前日期之间是否有背离生效
+                                if prev_cross_down_date is not None:
+                                    div_search_start = prev_cross_down_date + pd.Timedelta(days=1)
+                                else:
+                                    div_search_start = df.index[0]
+                                div_search_end = date
+
+                                # 检查是否有背离在那时候生效
+                                temp_has_daily_div = False
+                                for div in daily_divergences_confirmed:
+                                    if div.confirmation_date is not None:
+                                        if div_search_start <= div.confirmation_date <= div_search_end:
+                                            temp_has_daily_div = True
+                                            break
+
+                                # 如果有背离生效，设置背离标志
+                                if temp_has_daily_div:
+                                    state.daily_divergence_flag = 1
+
+                                # 使用当时的state检查卖出信号
+                                temp_sell = strategy.check_sell_signal(
+                                    date=date,
+                                    daily_rsi=daily_rsi_value,
+                                    weekly_rsi=weekly_rsi_value,
+                                    sar_cross_down=True,
+                                    macd_cross_down=False,
+                                    state=state,
+                                    position=1.0,
+                                    sell_id=stock_config.judge_sell_ids[0] if stock_config.judge_sell_ids else 1
+                                )
+                                if temp_sell is not None:
+                                    # 有卖出，重置state并记录卖出日期
+                                    strategy.reset_after_sell(state, temp_sell.flag, date)
+                                    last_sell_date_in_range = date
+                                    rsi_peak_value = 0.0
+                                    rsi_peak_date = None
+                                    self.logger.info(f"    中间卖出: {date.strftime('%Y-%m-%d')}, "
+                                                   f"重置state, 背离={state.daily_divergence_flag}")
+                                break
 
                 # 设置rsi峰值信息（如果有的话）
                 if rsi_peak_date is not None and rsi_peak_value > 0:
@@ -1154,13 +1381,18 @@ class DailyMonitor:
 
                 # 【关键修改】背离检测逻辑：检查在上一次SAR死叉之后是否有背离生效
                 # 与回测逻辑一致：背离在confirmation_date时触发，持续保持直到卖出后重置
+                # 【关键新增】如果有中间卖出，背离检测从最后一次卖出后开始
                 has_daily_div = False
                 has_weekly_div = False
                 daily_div_info = None
                 weekly_div_info = None
 
-                # 确定搜索区间：上一次SAR死叉之后到当前SAR死叉
-                if prev_cross_down_date is not None:
+                # 确定搜索区间：如果有中间卖出，从最后一次卖出后开始；否则从上一次SAR死叉后开始
+                if last_sell_date_in_range is not None:
+                    # 有中间卖出，背离检测从卖出后开始（因为卖出后背离已重置）
+                    search_start = last_sell_date_in_range + pd.Timedelta(days=1)
+                    self.logger.info(f"    背离检测起始点（中间卖出后）: {search_start.strftime('%Y-%m-%d')}")
+                elif prev_cross_down_date is not None:
                     search_start = prev_cross_down_date + pd.Timedelta(days=1)
                 else:
                     search_start = df.index[0]
@@ -1200,6 +1432,14 @@ class DailyMonitor:
 
                 self.logger.info(f"    背离状态: 日线顶背离={has_daily_div}, 周线顶背离={has_weekly_div}")
 
+                # 更新state的背离状态（关键：check_sell_signal需要读取state中的背离标志）
+                if has_daily_div:
+                    state.daily_divergence_flag = 1
+                    state.daily_divergence_info = daily_div_info
+                if has_weekly_div:
+                    state.weekly_divergence_flag = 1
+                    state.weekly_divergence_info = weekly_div_info
+
                 # 更新cross_down_info的背离状态
                 cross_down_info.has_daily_divergence = has_daily_div
                 cross_down_info.has_weekly_divergence = has_weekly_div
@@ -1213,24 +1453,78 @@ class DailyMonitor:
                 # 获取指数RSI
                 index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, current_cross_down_date.strftime('%Y-%m-%d'))
                 index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_kc = self.get_index_rsi_at_date(INDEX_KC, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_bj = self.get_index_rsi_at_date(INDEX_BJ, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_hsTech = self.get_index_rsi_at_date(INDEX_HS_TECH, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_hsIndex = self.get_index_rsi_at_date(INDEX_HS_INDEX, current_cross_down_date.strftime('%Y-%m-%d'))
 
-                # 检测卖出信号（SAR死叉跌破作为卖出触发条件）
-                sell_signal_obj = strategy.check_sell_signal(
-                    date=current_cross_down_date,
-                    daily_rsi=daily_rsi_at_signal,
-                    weekly_rsi=weekly_rsi_at_signal,
-                    sar_cross_down=True,  # SAR死叉跌破触发卖出
-                    macd_cross_down=False,  # 暂不支持MACD死叉触发
-                    state=state,
-                    position=1.0,
-                    sell_id=1  # 默认使用sell_id=1
-                )
+                # 获取当前日期在DataFrame中的索引位置（用于获取月线RSI）
+                current_idx = df.index.get_loc(current_cross_down_date) if current_cross_down_date in df.index else -1
+
+                # 获取月线RSI
+                monthly_rsi_at_signal = monthly_rsi.iloc[current_idx] if current_idx >= 0 and current_idx < len(monthly_rsi) else np.nan
+
+                # 检测卖出信号
+                # 根据配置的sell_ids和当前日期的触发条件检测
+                # sell_id=1: SAR死叉触发
+                # sell_id=2或3: MACD日线跌破死叉触发（MACD死叉 + 价格跌破SAR)
+                sell_signal_obj = None
+                for sell_id in stock_config.judge_sell_ids:
+                    # 根据sell_id选择触发条件
+                    if sell_id == 1:
+                        # sell_id=1: SAR死叉跌破作为触发条件
+                        trigger_sar = True
+                        trigger_macd = False
+                        trigger_name = "SAR死叉跌破"
+                    elif sell_id in [2, 3]:
+                        # sell_id=2或3: 需要检测MACD死叉 + 价格跌破SAR的组合
+                        # 检查当前日期是否发生了MACD死叉（DIF下穿DEA）
+                        current_idx = df.index.get_loc(current_cross_down_date) if current_cross_down_date in df.index else -1
+                        if current_idx >= 1:
+                            prev_dif = dif_series.iloc[current_idx - 1]
+                            curr_dif = dif_series.iloc[current_idx]
+                            prev_dea = dea_series.iloc[current_idx - 1]
+                            curr_dea = dea_series.iloc[current_idx]
+                            # MACD死叉判断: 前一天DIF>=DEA，当天DIF<DEA
+                            is_macd_cross_down = (prev_dif >= prev_dea) and (curr_dif < curr_dea)
+                            # 价格跌破SAR判断: 当天最低价低于昨天SAR
+                            yesterday_sar = sar_series.iloc[current_idx - 1]
+                            today_low = df['low'].iloc[current_idx]
+                            is_price_break_sar = today_low < yesterday_sar
+                            # 组合条件: MACD死叉 + 价格跌破SAR
+                            trigger_macd = is_macd_cross_down and is_price_break_sar
+                            trigger_sar = False
+                            trigger_name = "MACD日线跌破死叉"
+                            if trigger_macd:
+                                self.logger.info(f"    MACD日线跌破死叉触发: DIF={curr_dif:.4f}<DEA={curr_dea:.4f}, "
+                                               f"最低价={today_low:.3f}<SAR={yesterday_sar:.3f}")
+                        else:
+                            trigger_macd = False
+                            trigger_sar = False
+                            trigger_name = "MACD日线跌破死叉(条件不满足)"
+                    else:
+                        # 未知的sell_id，跳过
+                        continue
+
+                    # 调用check_sell_signal检测卖出信号
+                    sell_signal_obj = strategy.check_sell_signal(
+                        date=current_cross_down_date,
+                        daily_rsi=daily_rsi_at_signal,
+                        weekly_rsi=weekly_rsi_at_signal,
+                        sar_cross_down=trigger_sar,
+                        macd_cross_down=trigger_macd,
+                        state=state,
+                        position=1.0,
+                        sell_id=sell_id
+                    )
+                    if sell_signal_obj is not None:
+                        break  # 找到一个卖出信号就停止
 
                 if sell_signal_obj is not None:
                     signal_info = SignalInfo(
                         signal_date=current_cross_down_date.strftime('%Y-%m-%d'),
                         signal_type='sell',
-                        signal_detail=f"[{sell_signal_obj.flag.name}] {sell_signal_obj.reason} (SAR死叉跌破触发)",
+                        signal_detail=f"[{sell_signal_obj.flag.name}] {sell_signal_obj.reason} ({trigger_name}触发)",
                         current_price=signal.close_price,
                         daily_rsi=daily_rsi_at_signal,
                         weekly_rsi=weekly_rsi_at_signal,
@@ -1250,7 +1544,12 @@ class DailyMonitor:
                     has_new_cash=True,
                     has_sold_cash=True,
                     index_daily_rsi=index_rsi_cyb,
-                    sh_index_daily_rsi=index_rsi_sh
+                    sh_index_daily_rsi=index_rsi_sh,
+                    kc_index_daily_rsi=index_rsi_kc,
+                    monthly_rsi=monthly_rsi_at_signal,
+                    bj_index_daily_rsi=index_rsi_bj,
+                    hsTech_index_daily_rsi=index_rsi_hsTech,
+                    hsIndex_index_daily_rsi=index_rsi_hsIndex
                 )
 
                 if buy_signal_obj is not None and buy_signal_obj.triggered:
@@ -1268,11 +1567,459 @@ class DailyMonitor:
                     signals.append(signal_info)
                     self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
 
+        # ==================== MACD死叉卖出信号检测（sell_id=2或3）====================
+        # 对于配置了sell_id=2或3的情况，需要在MACD死叉事件时检测卖出条件
+        # 而不是在SAR死叉时检测
+        macd_trigger_ids = [sid for sid in stock_config.judge_sell_ids if sid in [2, 3]]
+        if len(macd_trigger_ids) > 0 and len(macd_cross_down_signals) > 0:
+            self.logger.info(f"  开始MACD死叉卖出检测（sell_ids={macd_trigger_ids})")
+
+            # 遍历每个MACD死叉信号
+            for macd_sig in macd_cross_down_signals:
+                macd_cross_down_date = macd_sig.date
+
+                # 只分析最近两个交易日的信号
+                recent_dates = self.get_recent_trading_dates(end_date, 2)
+                if macd_cross_down_date.strftime('%Y-%m-%d') not in recent_dates:
+                    continue
+
+                self.logger.info(f"  [MACD死叉检测] {macd_cross_down_date.strftime('%Y-%m-%d')}: "
+                               f"DIF={macd_sig.dif:.4f}, DEA={macd_sig.dea:.4f}")
+
+                # 获取当天的数据索引
+                try:
+                    current_idx = df.index.get_loc(macd_cross_down_date)
+                except KeyError:
+                    continue
+
+                # 检查价格跌破SAR条件
+                yesterday_sar = sar_series.iloc[current_idx - 1] if current_idx >= 1 else np.nan
+                today_low = df['low'].iloc[current_idx]
+                today_close = df['close'].iloc[current_idx]
+                is_price_break_sar = today_low < yesterday_sar if not np.isnan(yesterday_sar) else False
+
+                if not is_price_break_sar:
+                    self.logger.info(f"    跌破SAR条件不满足: 最低价={today_low:.3f} >= SAR={yesterday_sar:.3f}")
+                    continue
+
+                self.logger.info(f"    跌破SAR条件满足: 最低价={today_low:.3f} < SAR={yesterday_sar:.3f}")
+
+                # 创建策略状态
+                state = StrategyState()
+
+                # 从上一次SAR买入信号（红转绿）之后累积rsi_flag
+                cross_up_signals = [s for s in sar_signals if s.signal_type == '红转绿']
+                last_cross_up_date = None
+                if len(cross_up_signals) > 0:
+                    for sig in reversed(cross_up_signals):
+                        if sig.date < macd_cross_down_date:
+                            last_cross_up_date = sig.date
+                            break
+
+                # 累积rsi_flag
+                if last_cross_up_date is not None:
+                    start_idx = df.index.get_loc(last_cross_up_date) + 1
+                else:
+                    start_idx = 0
+
+                rsi_peak_value = 0.0
+                rsi_peak_date = None
+                for idx in range(start_idx, current_idx + 1):
+                    weekly_rsi_val = weekly_rsi.iloc[idx] if idx < len(weekly_rsi) else np.nan
+                    if not np.isnan(weekly_rsi_val):
+                        strategy.update_rsi_flag(weekly_rsi_val, state, df.index[idx])
+                        if weekly_rsi_val > rsi_peak_value:
+                            rsi_peak_value = weekly_rsi_val
+                            rsi_peak_date = df.index[idx]
+
+                if rsi_peak_date is not None:
+                    state.rsi_peak_date = rsi_peak_date
+                    state.rsi_peak_value = rsi_peak_value
+
+                # 检查背离状态
+                if last_cross_up_date is not None:
+                    search_start = last_cross_up_date + pd.Timedelta(days=1)
+                else:
+                    search_start = df.index[0]
+
+                for div in daily_divergences_confirmed:
+                    if div.confirmation_date is not None:
+                        if search_start <= div.confirmation_date <= macd_cross_down_date:
+                            state.daily_divergence_flag = 1
+                            state.daily_divergence_info = {
+                                'date': div.date,
+                                'prev_high': div.peak_a_price,
+                                'curr_high': div.peak_b_price,
+                                'prev_macd': div.peak_a_macd,
+                                'curr_macd': div.peak_b_macd
+                            }
+                            self.logger.info(f"    日线顶背离生效: 彌离形成于{div.date.strftime('%Y-%m-%d')}, "
+                                           f"生效于{div.confirmation_date.strftime('%Y-%m-%d')}")
+                            break
+
+                for div in weekly_divergences_confirmed:
+                    if div.confirmation_date is not None:
+                        if search_start <= div.confirmation_date <= macd_cross_down_date:
+                            state.weekly_divergence_flag = 1
+                            state.weekly_divergence_info = {
+                                'date': div.date,
+                                'prev_high': div.peak_a_price,
+                                'curr_high': div.peak_b_price,
+                                'prev_macd': div.peak_a_macd,
+                                'curr_macd': div.peak_b_macd
+                            }
+                            self.logger.info(f"    周线顶背离生效: 弥离形成于{div.date.strftime('%Y-%m-%d')}, "
+                                           f"生效于{div.confirmation_date.strftime('%Y-%m-%d')}")
+                            break
+
+                self.logger.info(f"    RSI状态累积: rsi_flag={state.rsi_flag}, "
+                               f"峰值={state.rsi_peak_value:.2f}, "
+                               f"日线顶背离={state.daily_divergence_flag}, "
+                               f"周线顶背离={state.weekly_divergence_flag}")
+
+                # 检测卖出信号
+                daily_rsi_at_signal = daily_rsi.iloc[current_idx] if current_idx < len(daily_rsi) else np.nan
+                weekly_rsi_at_signal = weekly_rsi.iloc[current_idx] if current_idx < len(weekly_rsi) else np.nan
+
+                sell_signal_obj = None
+                for sell_id in macd_trigger_ids:
+                    sell_signal_obj = strategy.check_sell_signal(
+                        date=macd_cross_down_date,
+                        daily_rsi=daily_rsi_at_signal,
+                        weekly_rsi=weekly_rsi_at_signal,
+                        sar_cross_down=False,
+                        macd_cross_down=True,  # MACD死叉触发
+                        state=state,
+                        position=1.0,
+                        sell_id=sell_id
+                    )
+                    if sell_signal_obj is not None:
+                        break
+
+                if sell_signal_obj is not None:
+                    # 创建SAR死叉跌破信息（用于记录，虽然触发条件是MACD死叉）
+                    cross_down_info = SARCrossDownInfo(
+                        signal_date=macd_cross_down_date.strftime('%Y-%m-%d'),
+                        sar_value=yesterday_sar,
+                        close_price=today_close,
+                        local_high_date=state.rsi_peak_date.strftime('%Y-%m-%d') if state.rsi_peak_date else None,
+                        local_high_price=0.0,
+                        local_high_weekly_rsi=state.rsi_peak_value,
+                        has_daily_divergence=state.daily_divergence_flag == 1,
+                        has_weekly_divergence=state.weekly_divergence_flag == 1,
+                        daily_rsi_at_signal=daily_rsi_at_signal,
+                        weekly_rsi_at_signal=weekly_rsi_at_signal
+                    )
+
+                    signal_info = SignalInfo(
+                        signal_date=macd_cross_down_date.strftime('%Y-%m-%d'),
+                        signal_type='sell',
+                        signal_detail=f"[{sell_signal_obj.flag.name}] {sell_signal_obj.reason} (MACD日线跌破死叉触发)",
+                        current_price=today_close,
+                        daily_rsi=daily_rsi_at_signal,
+                        weekly_rsi=weekly_rsi_at_signal,
+                        sar_cross_down_info=cross_down_info
+                    )
+                    signals.append(signal_info)
+                    self.logger.info(f"    >>> 卖险信号: {sell_signal_obj.reason}")
+
+        # ==================== 独立卖出信号检测 ====================
+        # 获取最新日期信息
+        last_date = df.index[-1]
+        last_date_str = last_date.strftime('%Y-%m-%d')
+
+        # 【关键】独立检测部分只对sell_id=1进行SAR死叉实时检测
+        # 对于sell_id=2或3，触发条件是MACD日线跌破死叉，盘中无法准确判断MACD死叉
+        # （MACD是基于收盘价计算的DIF和DEA关系）
+        sar_trigger_ids = [sid for sid in stock_config.judge_sell_ids if sid == 1]
+        do_sar_cross_down_check = len(sar_trigger_ids) > 0
+
+        # 检测当天是否发生SAR死叉（实时盘中检测）
+        # SAR死叉条件：当天最低价跌破SAR价位
+        # 【关键】使用历史数据计算的SAR值作为判断基准（不包含今天的实时数据）
+        if do_sar_cross_down_check and not np.isnan(yesterday_sar_baseline) and len(df) >= 1:
+            today_low = df['low'].iloc[-1]
+            today_close = df['close'].iloc[-1]
+            yesterday_close = df_history['close'].iloc[-1] if len(df_history) > 0 else 0
+
+            # 输出SAR值用于调试（显示正确的SAR基准值）
+            self.logger.info(f"  [SAR值检查] {last_date_str}: 昨天SAR={yesterday_sar_baseline:.3f}（历史数据计算，不含今天）, "
+                           f"今天最低价={today_low:.3f}, 昨天收盘价={yesterday_close:.3f}, "
+                           f"最低价<SAR? {today_low < yesterday_sar_baseline}")
+
+            # 判断是否发生SAR死叉（最低价跌破昨天的SAR值）
+            is_sar_cross_down_today = today_low < yesterday_sar_baseline
+
+            if is_sar_cross_down_today:
+                self.logger.info(f"  [盘中SAR死叉检测] {last_date_str}: "
+                               f"今天最低价={today_low:.3f} < 昨天SAR={yesterday_sar_baseline:.3f}，发生死叉")
+
+                # 获取当天的RSI值
+                today_daily_rsi = daily_rsi.iloc[-1] if len(daily_rsi) > 0 else np.nan
+                today_weekly_rsi = weekly_rsi.iloc[-1] if len(weekly_rsi) > 0 else np.nan
+
+                if not np.isnan(today_weekly_rsi):
+                    # 创建策略实例和状态
+                    strategy = TradingStrategy(
+                        buy_ids=stock_config.judge_buy_ids,
+                        t_ids=stock_config.judge_t_ids,
+                        sell_ids=stock_config.judge_sell_ids
+                    )
+
+                    # 需要从上一次SAR买入信号（红转绿）之后累积rsi_flag
+                    # 同时检查是否已经发生过卖出信号（如果卖出信号在买入信号之后，则不再触发）
+                    state = StrategyState()
+
+                    # 找到最近一次SAR买入信号（红转绿）日期
+                    cross_up_signals = [s for s in sar_signals if s.signal_type == '红转绿']
+                    last_cross_up_date = None
+                    if len(cross_up_signals) > 0:
+                        # 找到最后一个在昨天之前的买入信号
+                        for sig in reversed(cross_up_signals):
+                            if sig.date < last_date:
+                                last_cross_up_date = sig.date
+                                break
+
+                    # 找到最近一次SAR卖出信号（绿转红）日期（在买入信号之后）
+                    last_cross_down_date_before_today = None
+                    if last_cross_up_date is not None:
+                        for sig in reversed(cross_down_signals):
+                            # 只找买入信号之后、今天之前的卖出信号
+                            if sig.date > last_cross_up_date and sig.date < last_date:
+                                last_cross_down_date_before_today = sig.date
+                                break
+
+                    # 【关键修改】检查买入后是否实际触发过卖出（不只是SAR卖出信号）
+                    # 需要同时满足：1) 有SAR卖出信号，2) 有卖出触发条件（背离或RSI阈值）
+                    # 【新增】卖出后有2个交易日的冷却期，超过冷却期后不再告警
+                    has_actual_sell_after_buy = False
+                    last_actual_sell_date = None  # 记录最后一次实际卖出日期
+                    SELL_COOLDOWN_DAYS = 2  # 卖出后冷却期（交易日）
+
+                    if last_cross_up_date is not None:
+                        # 检查买入后所有卖出信号，看是否有任何一个触发过实际卖出
+                        for sig in cross_down_signals:
+                            # 只检查买入后、今天之前的卖出信号
+                            if sig.date > last_cross_up_date and sig.date < last_date:
+                                sar_sell_date = sig.date
+
+                                # 检查这个卖出信号时是否有背离生效
+                                for div in daily_divergences_confirmed:
+                                    if div.confirmation_date is not None:
+                                        if last_cross_up_date < div.confirmation_date <= sar_sell_date:
+                                            has_actual_sell_after_buy = True
+                                            last_actual_sell_date = sar_sell_date
+                                            break
+                                if has_actual_sell_after_buy:
+                                    break
+
+                                # 也检查周线背离
+                                for div in weekly_divergences_confirmed:
+                                    if div.confirmation_date is not None:
+                                        if last_cross_up_date < div.confirmation_date <= sar_sell_date:
+                                            has_actual_sell_after_buy = True
+                                            last_actual_sell_date = sar_sell_date
+                                            break
+                                if has_actual_sell_after_buy:
+                                    break
+
+                                # 【新增】也检查RSI阈值触发：周线RSI峰值>=85
+                                # 需要从买入后到卖出信号日期间累积rsi_flag和峰值
+                                if not has_actual_sell_after_buy:
+                                    # 计算当时的周线RSI峰值
+                                    temp_peak_value = 0.0
+                                    temp_peak_date = None
+                                    temp_rsi_flag = 0
+                                    buy_idx = df.index.get_loc(last_cross_up_date)
+                                    sell_idx = df.index.get_loc(sar_sell_date)
+                                    for idx in range(buy_idx + 1, sell_idx + 1):
+                                        weekly_rsi_val = weekly_rsi.iloc[idx] if idx < len(weekly_rsi) else np.nan
+                                        if not np.isnan(weekly_rsi_val):
+                                            if weekly_rsi_val > temp_peak_value:
+                                                temp_peak_value = weekly_rsi_val
+                                                temp_peak_date = df.index[idx]
+                                            # 更新rsi_flag
+                                            if weekly_rsi_val >= RSI_THRESHOLDS['weekly_sell_level1']:
+                                                temp_rsi_flag = 1
+                                            if weekly_rsi_val >= RSI_THRESHOLDS['weekly_sell_level2']:
+                                                temp_rsi_flag = 2
+                                            if weekly_rsi_val >= RSI_THRESHOLDS['weekly_sell_level3']:
+                                                temp_rsi_flag = 3
+
+                                    # 检查是否触发卖出（周线RSI峰值>=85 + SAR死叉）
+                                    # 使用配置的阈值而不是硬编码值
+                                    threshold_85 = RSI_THRESHOLDS['weekly_sell_level2']
+                                    if temp_peak_value >= threshold_85:
+                                        has_actual_sell_after_buy = True
+                                        last_actual_sell_date = sar_sell_date
+                                        self.logger.info(f"    买入后RSI阈值触发卖出: SAR卖出={sar_sell_date.strftime('%Y-%m-%d')}, "
+                                                       f"周线RSI峰值={temp_peak_value:.2f}")
+                                        break
+
+                    # 如果买入后已经实际卖出，检查是否在冷却期内
+                    should_check_sell = True
+                    if has_actual_sell_after_buy and last_actual_sell_date is not None:
+                        # 计算卖出日期距今的交易日数
+                        trading_days_since_sell = 0
+                        for idx in range(len(df.index)):
+                            if df.index[idx] > last_actual_sell_date and df.index[idx] <= last_date:
+                                trading_days_since_sell += 1
+
+                        if trading_days_since_sell > SELL_COOLDOWN_DAYS:
+                            should_check_sell = False
+                            self.logger.info(f"    卖出冷却期已过: 卖出日期={last_actual_sell_date.strftime('%Y-%m-%d')}, "
+                                           f"距今{trading_days_since_sell}个交易日 > 冷却期{SELL_COOLDOWN_DAYS}天，跳过告警")
+                        else:
+                            self.logger.info(f"    卖出冷却期内: 卖出日期={last_actual_sell_date.strftime('%Y-%m-%d')}, "
+                                           f"距今{trading_days_since_sell}个交易日 <= 冷却期{SELL_COOLDOWN_DAYS}天，继续告警")
+
+                    if should_check_sell:
+                        # 从最近一次买入信号后累积rsi_flag
+                        if last_cross_up_date is not None:
+                            start_idx = df.index.get_loc(last_cross_up_date) + 1
+                        else:
+                            start_idx = 0
+
+                        # 遍历更新rsi_flag和背离状态
+                        rsi_peak_value = 0.0
+                        rsi_peak_date = None
+                        for idx in range(start_idx, len(df)):
+                            date = df.index[idx]
+                            weekly_rsi_value = weekly_rsi.iloc[idx] if idx < len(weekly_rsi) else np.nan
+                            if not np.isnan(weekly_rsi_value):
+                                strategy.update_rsi_flag(weekly_rsi_value, state, date)
+                                if weekly_rsi_value > rsi_peak_value:
+                                    rsi_peak_value = weekly_rsi_value
+                                    rsi_peak_date = date
+
+                        if rsi_peak_date is not None and rsi_peak_value > 0:
+                            state.rsi_peak_date = rsi_peak_date
+                            state.rsi_peak_value = rsi_peak_value
+
+                        # 检查背离状态
+                        if last_cross_up_date is not None:
+                            search_start = last_cross_up_date + pd.Timedelta(days=1)
+                        else:
+                            search_start = df.index[0]
+
+                        for div in daily_divergences_confirmed:
+                            if div.confirmation_date is not None:
+                                if search_start <= div.confirmation_date <= last_date:
+                                    state.daily_divergence_flag = 1
+                                    state.daily_divergence_info = {
+                                        'date': div.date,
+                                        'prev_high': div.peak_a_price,
+                                        'curr_high': div.peak_b_price,
+                                        'prev_macd': div.peak_a_macd,
+                                        'curr_macd': div.peak_b_macd
+                                    }
+                                    break
+
+                        for div in weekly_divergences_confirmed:
+                            if div.confirmation_date is not None:
+                                if search_start <= div.confirmation_date <= last_date:
+                                    state.weekly_divergence_flag = 1
+                                    state.weekly_divergence_info = {
+                                        'date': div.date,
+                                        'prev_high': div.peak_a_price,
+                                        'curr_high': div.peak_b_price,
+                                        'prev_macd': div.peak_a_macd,
+                                        'curr_macd': div.peak_b_macd
+                                    }
+                                    break
+
+                        self.logger.info(f"    RSI状态累积: rsi_flag={state.rsi_flag}, "
+                                       f"峰值={state.rsi_peak_value:.2f}, "
+                                       f"日线顶背离={state.daily_divergence_flag}, "
+                                       f"周线顶背离={state.weekly_divergence_flag}")
+
+                        # 【关键】根据历史RSI峰值和背离状态判断卖出信号
+                        # 不使用check_sell_signal（它检查当前RSI值），而是直接根据历史峰值判断
+                        # 根据 judge_sell_ids 决定是否使用RSI阈值：
+                        # - sell_id=1 或 2：使用RSI阈值判断
+                        # - sell_id=3：仅背离判断，不使用RSI阈值
+                        index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, last_date_str)
+                        index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, last_date_str)
+
+                        # 判断是否使用RSI阈值
+                        use_rsi_threshold = any(sid in [1, 2] for sid in stock_config.judge_sell_ids)
+
+                        # 获取阈值
+                        threshold_90 = RSI_THRESHOLDS['weekly_sell_level3']  # 90
+                        threshold_85 = RSI_THRESHOLDS['weekly_sell_level2']  # 85
+                        threshold_80 = RSI_THRESHOLDS['weekly_sell_level1']  # 80
+
+                        sell_flag = SellFlag.NO_SIGNAL
+                        sell_reason = ""
+
+                        # 判断卖出级别（按优先级）
+                        # 优先级1：周线顶背离 + SAR死叉 → 清仓（所有sell_id都支持）
+                        if state.weekly_divergence_flag == 1:
+                            div_info = state.weekly_divergence_info or {}
+                            div_date = div_info.get('date')
+                            sell_flag = SellFlag.CLEAR_ALL
+                            sell_reason = f"清仓信号: 周线顶背离生效 + SAR死叉触发, 建议清仓"
+                            self.logger.info(f"    >>> 周线顶背离+SAR死叉触发清仓")
+
+                        # 优先级2：历史RSI峰值>=90 + SAR死叉 → 清仓（仅sell_id=1或2）
+                        elif use_rsi_threshold and state.rsi_peak_value >= threshold_90:
+                            sell_flag = SellFlag.CLEAR_ALL
+                            peak_date_str = state.rsi_peak_date.strftime('%Y-%m-%d') if state.rsi_peak_date else 'N/A'
+                            sell_reason = f"清仓信号: 周线RSI峰值{peak_date_str}={state.rsi_peak_value:.2f}>90 + SAR死叉触发, 建议清仓"
+                            self.logger.info(f"    >>> RSI峰值{state.rsi_peak_value:.2f}>90+SAR死叉触发清仓")
+
+                        # 优先级3：历史RSI峰值>=85 + SAR死叉 → 卖出1/2（仅sell_id=1或2）
+                        elif use_rsi_threshold and state.rsi_peak_value >= threshold_85:
+                            sell_flag = SellFlag.SELL_HALF
+                            peak_date_str = state.rsi_peak_date.strftime('%Y-%m-%d') if state.rsi_peak_date else 'N/A'
+                            sell_reason = f"卖出信号: 周线RSI峰值{peak_date_str}={state.rsi_peak_value:.2f}>85 + SAR死叉触发, 建议卖出1/2"
+                            self.logger.info(f"    >>> RSI峰值{state.rsi_peak_value:.2f}>85+SAR死叉触发卖出1/2")
+
+                        # 优先级4：日线顶背离 + SAR死叉 → 卖出1/3（所有sell_id都支持）
+                        elif state.daily_divergence_flag == 1:
+                            sell_flag = SellFlag.SELL_ONE_THIRD
+                            sell_reason = f"卖出信号: 日线顶背离生效 + SAR死叉触发, 建议卖出1/3"
+                            self.logger.info(f"    >>> 日线顶背离+SAR死叉触发卖出1/3")
+
+                        # 优先级5：历史RSI峰值>=80 + SAR死叉 → 卖出1/3（仅sell_id=1或2）
+                        elif use_rsi_threshold and state.rsi_peak_value >= threshold_80:
+                            sell_flag = SellFlag.SELL_ONE_THIRD
+                            peak_date_str = state.rsi_peak_date.strftime('%Y-%m-%d') if state.rsi_peak_date else 'N/A'
+                            sell_reason = f"卖出信号: 周线RSI峰值{peak_date_str}={state.rsi_peak_value:.2f}>80 + SAR死叉触发, 建议卖出1/3"
+                            self.logger.info(f"    >>> RSI峰值{state.rsi_peak_value:.2f}>80+SAR死叉触发卖出1/3")
+
+                        # 如果有卖出信号，添加到signals列表
+                        if sell_flag != SellFlag.NO_SIGNAL:
+                            cross_down_info = SARCrossDownInfo(
+                                signal_date=last_date_str,
+                                sar_value=yesterday_sar_baseline,
+                                close_price=today_close,
+                                local_high_date=state.rsi_peak_date.strftime('%Y-%m-%d') if state.rsi_peak_date else None,
+                                local_high_price=0.0,
+                                local_high_weekly_rsi=state.rsi_peak_value,
+                                has_daily_divergence=state.daily_divergence_flag == 1,
+                                has_weekly_divergence=state.weekly_divergence_flag == 1,
+                                daily_rsi_at_signal=today_daily_rsi,
+                                weekly_rsi_at_signal=today_weekly_rsi
+                            )
+
+                            signal_info = SignalInfo(
+                                signal_date=last_date_str,
+                                signal_type='sell',
+                                signal_detail=f"[{sell_flag.name}] {sell_reason} (盘中SAR死叉触发)",
+                                current_price=today_close,
+                                daily_rsi=today_daily_rsi,
+                                weekly_rsi=today_weekly_rsi,
+                                index_daily_rsi_cyb=index_rsi_cyb,
+                                index_daily_rsi_sh=index_rsi_sh,
+                                sar_cross_down_info=cross_down_info
+                            )
+                            signals.append(signal_info)
+                            self.logger.info(f"    >>> 卖出信号: {sell_reason}")
+
         # ==================== 独立买入信号检测 ====================
         # 买入条件只依赖RSI，不应该依赖SAR死叉事件
         # 如果最近交易日没有通过SAR循环触发买入信号，则独立检测买入条件
-        last_date = df.index[-1]
-        last_date_str = last_date.strftime('%Y-%m-%d')
         recent_dates = self.get_recent_trading_dates(end_date, RECENT_TRADING_DAYS)
 
         # 检查最新日期是否在最近交易日范围内，且当天没有买入信号
@@ -1286,8 +2033,13 @@ class DailyMonitor:
             if not has_buy_signal_today:
                 latest_daily_rsi = daily_rsi.iloc[-1] if len(daily_rsi) > 0 else np.nan
                 latest_weekly_rsi = weekly_rsi.iloc[-1] if len(weekly_rsi) > 0 else np.nan
+                latest_monthly_rsi = monthly_rsi.iloc[-1] if len(monthly_rsi) > 0 else np.nan
                 latest_index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, last_date_str)
                 latest_index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, last_date_str)
+                latest_index_rsi_kc = self.get_index_rsi_at_date(INDEX_KC, last_date_str)
+                latest_index_rsi_bj = self.get_index_rsi_at_date(INDEX_BJ, last_date_str)
+                latest_index_rsi_hsTech = self.get_index_rsi_at_date(INDEX_HS_TECH, last_date_str)
+                latest_index_rsi_hsIndex = self.get_index_rsi_at_date(INDEX_HS_INDEX, last_date_str)
 
                 if not np.isnan(latest_daily_rsi) and not np.isnan(latest_weekly_rsi):
                     # 创建策略实例和状态（用于独立买入检测）
@@ -1307,7 +2059,12 @@ class DailyMonitor:
                         has_new_cash=True,
                         has_sold_cash=True,
                         index_daily_rsi=latest_index_rsi_cyb,
-                        sh_index_daily_rsi=latest_index_rsi_sh
+                        sh_index_daily_rsi=latest_index_rsi_sh,
+                        kc_index_daily_rsi=latest_index_rsi_kc,
+                        monthly_rsi=latest_monthly_rsi,
+                        bj_index_daily_rsi=latest_index_rsi_bj,
+                        hsTech_index_daily_rsi=latest_index_rsi_hsTech,
+                        hsIndex_index_daily_rsi=latest_index_rsi_hsIndex
                     )
 
                     if buy_signal_obj is not None and buy_signal_obj.triggered:
@@ -1333,22 +2090,31 @@ class DailyMonitor:
         latest_weekly_rsi = weekly_rsi.iloc[-1] if len(weekly_rsi) > 0 else np.nan
         latest_sar = sar_series.iloc[-1] if len(sar_series) > 0 else np.nan
         latest_price = df['close'].iloc[-1]
-        latest_index_rsi_cyb = self.get_index_rsi(INDEX_CYB, end_date)
-        latest_index_rsi_sh = self.get_index_rsi(INDEX_SH, end_date)
+        # 【关键修改】使用今天的日期获取最新RSI，而不是配置的end_date
+        today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+        latest_index_rsi_cyb = self.get_index_rsi(INDEX_CYB, today_str)
+        latest_index_rsi_sh = self.get_index_rsi(INDEX_SH, today_str)
+        latest_index_rsi_kc = self.get_index_rsi(INDEX_KC, today_str)
+        latest_index_rsi_bj = self.get_index_rsi(INDEX_BJ, today_str)
+        latest_index_rsi_hsTech = self.get_index_rsi(INDEX_HS_TECH, today_str)
+        latest_index_rsi_hsIndex = self.get_index_rsi(INDEX_HS_INDEX, today_str)
 
         # 判断当前SAR趋势
         latest_sar_trend = '多头' if latest_sar < latest_price else '空头'
 
         # ==================== 待触发卖出信号告警 ====================
-        # 只显示最近一次SAR死叉之后至今的告警
-        # 如果从未发生过SAR死叉，则显示所有告警
+        # 只显示最近一次买入机会（红转绿）之后的告警
+        # 如果已经发生卖出（绿转红），之前的告警就消失
         pending_warnings = []
 
-        # 获取最近一次SAR死叉日期（通过SAR值和收盘价判断）
-        # SAR死叉（绿转红）= SAR从价格下方转到上方：SAR(t) > Close(t) 且 SAR(t-1) <= Close(t-1)
-        last_sar_cross_down_date = None
+        # 获取最近一次SAR买入信号日期（红转绿）和卖出信号日期（绿转红）
+        # SAR买入（红转绿）= SAR从价格上方转到下方：SAR(t) < Close(t) 且 SAR(t-1) >= Close(t-1)
+        # SAR卖出（绿转红）= SAR从价格下方转到上方：SAR(t) > Close(t) 且 SAR(t-1) <= Close(t-1)
+        last_sar_cross_up_date = None   # 最近一次买入信号（红转绿）
+        last_sar_cross_down_date = None  # 最近一次卖出信号（绿转红）
+
         if sar_series is not None and len(sar_series) > 1 and df is not None:
-            # 从最新日期往前查找最近一次死叉
+            # 从最新日期往前查找最近一次买入和卖出信号
             for i in range(len(sar_series) - 1, 0, -1):
                 curr_sar = sar_series.iloc[i]
                 prev_sar = sar_series.iloc[i - 1]
@@ -1356,20 +2122,32 @@ class DailyMonitor:
                 prev_close = df['close'].iloc[i - 1]
                 curr_date = sar_series.index[i]
 
-                # 判断是否发生SAR死叉（绿转红）
+                # 判断是否发生SAR买入信号（红转绿）
+                if curr_sar < curr_close and prev_sar >= prev_close:
+                    if last_sar_cross_up_date is None:
+                        last_sar_cross_up_date = pd.Timestamp(curr_date.strftime('%Y-%m-%d'))
+
+                # 判断是否发生SAR卖出信号（绿转红）
                 if curr_sar > curr_close and prev_sar <= prev_close:
-                    last_sar_cross_down_date = pd.Timestamp(curr_date.strftime('%Y-%m-%d'))
+                    if last_sar_cross_down_date is None:
+                        last_sar_cross_down_date = pd.Timestamp(curr_date.strftime('%Y-%m-%d'))
+
+                # 如果两个都找到了，停止查找
+                if last_sar_cross_up_date is not None and last_sar_cross_down_date is not None:
                     break
 
         # 检查周线顶背离已生效但还没有SAR死叉
-        # 只显示在最近一次SAR死叉之后生效的背离
+        # 只显示在最近一次买入信号（红转绿）之后生效的背离，且当前还没卖出（绿转红）
         if weekly_divergences_confirmed and len(weekly_divergences_confirmed) > 0:
             for div in weekly_divergences_confirmed:
                 if div.confirmation_date is not None:
-                    # 过滤：只显示最近一次SAR死叉之后生效的背离
+                    # 过滤条件：
+                    # 1. 背离生效日期 > 最近一次买入信号日期（在买入后触发）
+                    # 2. 当前SAR趋势是多头（还没收到卖出信号）
                     # 统一时区处理：去掉时区信息进行比较
                     div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
-                    if last_sar_cross_down_date is None or div_date > last_sar_cross_down_date:
+                    # 如果买入信号存在，背离必须在买入后生效；如果不存在，则始终显示
+                    if (last_sar_cross_up_date is None or div_date > last_sar_cross_up_date) and latest_sar_trend == '多头':
                         pending_warnings.append({
                             'type': '周线顶背离',
                             'detail': f"周线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发清仓",
@@ -1379,9 +2157,14 @@ class DailyMonitor:
                         self.logger.warning(f"  [待触发告警] 周线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发清仓")
 
         # 检查周线RSI已达警戒级别但还没有SAR死叉
-        # RSI警戒是当前状态，始终显示（如果当前SAR趋势是多头，即还没死叉）
-        if not np.isnan(latest_weekly_rsi) and latest_sar_trend == '多头':
-            if latest_weekly_rsi >= 90:
+        # 只有 sell_id=1 或 2 才检查RSI阈值（sell_id=3不含RSI阶梯）
+        check_weekly_rsi_threshold = any(sid in [1, 2] for sid in stock_config.judge_sell_ids)
+        if check_weekly_rsi_threshold and not np.isnan(latest_weekly_rsi) and latest_sar_trend == '多头':
+            threshold_90 = RSI_THRESHOLDS['weekly_sell_level3']  # 90
+            threshold_85 = RSI_THRESHOLDS['weekly_sell_level2']  # 85
+            threshold_80 = RSI_THRESHOLDS['weekly_sell_level1']  # 80
+
+            if latest_weekly_rsi >= threshold_90:
                 pending_warnings.append({
                     'type': 'RSI清仓警戒',
                     'detail': f"周线RSI={latest_weekly_rsi:.2f}>90，等待SAR死叉触发清仓",
@@ -1389,7 +2172,7 @@ class DailyMonitor:
                     'confirmation_date': pd.Timestamp(end_date)
                 })
                 self.logger.warning(f"  [待触发告警] 周线RSI>90，等待SAR死叉触发清仓")
-            elif latest_weekly_rsi >= 85:
+            elif latest_weekly_rsi >= threshold_85:
                 pending_warnings.append({
                     'type': 'RSI减仓警戒',
                     'detail': f"周线RSI={latest_weekly_rsi:.2f}>85，等待SAR死叉触发卖出1/2",
@@ -1397,7 +2180,7 @@ class DailyMonitor:
                     'confirmation_date': pd.Timestamp(end_date)
                 })
                 self.logger.warning(f"  [待触发告警] 周线RSI>85，等待SAR死叉触发卖出1/2")
-            elif latest_weekly_rsi >= 80:
+            elif latest_weekly_rsi >= threshold_80:
                 pending_warnings.append({
                     'type': 'RSI减仓警戒',
                     'detail': f"周线RSI={latest_weekly_rsi:.2f}>80，等待SAR死叉触发卖出1/3",
@@ -1407,14 +2190,17 @@ class DailyMonitor:
                 self.logger.info(f"  [待触发提示] 周线RSI>80，等待SAR死叉触发卖出1/3")
 
         # 检查日线顶背离已生效但还没有SAR死叉
-        # 只显示在最近一次SAR死叉之后生效的背离
+        # 只显示在最近一次买入信号（红转绿）之后生效的背离，且当前还没卖出（绿转红）
         if daily_divergences_confirmed and len(daily_divergences_confirmed) > 0:
             for div in daily_divergences_confirmed:
                 if div.confirmation_date is not None:
-                    # 过滤：只显示最近一次SAR死叉之后生效的背离
+                    # 过滤条件：
+                    # 1. 背离生效日期 > 最近一次买入信号日期（在买入后触发）
+                    # 2. 当前SAR趋势是多头（还没收到卖出信号）
                     # 统一时区处理：去掉时区信息进行比较
                     div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
-                    if last_sar_cross_down_date is None or div_date > last_sar_cross_down_date:
+                    # 如果买入信号存在，背离必须在买入后生效；如果不存在，则始终显示
+                    if (last_sar_cross_up_date is None or div_date > last_sar_cross_up_date) and latest_sar_trend == '多头':
                         pending_warnings.append({
                             'type': '日线顶背离',
                             'detail': f"日线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发卖出1/3",
@@ -1422,6 +2208,75 @@ class DailyMonitor:
                             'confirmation_date': div.confirmation_date
                         })
                         self.logger.info(f"  [待触发提示] 日线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发卖出1/3")
+
+        # ==================== 历史RSI高点告警 ====================
+        # 检查最近一次买入信号（红转绿）之后的历史RSI高点，即使当前RSI已降低也要告警
+        # 如果已经卖出（绿转红），告警就消失
+        # 告警条件根据 judge_sell_ids 配置确定：
+        # - sell_id=1 或 2：检查周线RSI阈值（80/85/90）
+        # - sell_id=3：不检查RSI阈值（仅背离判断）
+        rsi_high_warnings = []
+
+        # 判断是否需要检查周线RSI阈值
+        check_weekly_rsi_threshold = any(sid in [1, 2] for sid in stock_config.judge_sell_ids)
+
+        if latest_sar_trend == '多头' and check_weekly_rsi_threshold:
+            # 计算回溯起始日期（从最近一次买入信号日期开始，或从配置的回溯天数开始）
+            if last_sar_cross_up_date is not None:
+                # 从最近一次买入信号（红转绿）日期开始查找
+                lookback_start_date = last_sar_cross_up_date
+            else:
+                # 从未发生过买入信号，使用配置的回溯天数
+                lookback_start_date = pd.Timestamp(end_date) - pd.Timedelta(days=RSI_HIGH_LOOKBACK_DAYS)
+
+            # 检查周线RSI历史高点
+            if weekly_rsi is not None and len(weekly_rsi) > 0:
+                # 处理时区问题：确保比较时时区一致
+                rsi_index = weekly_rsi.index
+                if rsi_index.tz is not None:
+                    # 如果index是tz-aware，将lookback_start_date转为相同时区
+                    lookback_start_date_tz = lookback_start_date.tz_localize(rsi_index.tz)
+                else:
+                    # 如果index是tz-naive，保持lookback_start_date也是tz-naive
+                    lookback_start_date_tz = lookback_start_date
+
+                # 筛选最近一次买入信号之后的数据
+                recent_weekly_rsi = weekly_rsi[rsi_index >= lookback_start_date_tz]
+                if len(recent_weekly_rsi) > 0:
+                    # 找到最高点
+                    max_weekly_rsi = recent_weekly_rsi.max()
+                    max_weekly_rsi_idx = recent_weekly_rsi.idxmax()
+
+                    # 使用策略类定义的阈值
+                    threshold_90 = RSI_THRESHOLDS['weekly_sell_level3']  # 90
+                    threshold_85 = RSI_THRESHOLDS['weekly_sell_level2']  # 85
+                    threshold_80 = RSI_THRESHOLDS['weekly_sell_level1']  # 80
+
+                    # 如果历史高点>=80，且当前RSI低于历史高点，说明RSI已经降下来了
+                    if max_weekly_rsi >= threshold_80 and latest_weekly_rsi < max_weekly_rsi:
+                        # 计算距离高点的天数（处理时区）
+                        max_idx_naive = max_weekly_rsi_idx.tz_localize(None) if max_weekly_rsi_idx.tz is not None else max_weekly_rsi_idx
+                        days_elapsed = (pd.Timestamp(end_date) - max_idx_naive).days
+
+                        # 只显示最近30天内的高点（防止太久的历史数据）
+                        if days_elapsed <= RSI_HIGH_LOOKBACK_DAYS and days_elapsed > 0:
+                            rsi_high_warnings.append(RSIHighInfo(
+                                high_date=max_weekly_rsi_idx.strftime('%Y-%m-%d'),
+                                high_rsi=max_weekly_rsi,
+                                rsi_type='周线',
+                                current_rsi=latest_weekly_rsi,
+                                days_elapsed=days_elapsed
+                            ))
+
+                            # 根据高点值确定告警级别描述
+                            if max_weekly_rsi >= threshold_90:
+                                level_desc = "清仓警戒(RSI>90)"
+                            elif max_weekly_rsi >= threshold_85:
+                                level_desc = "卖出1/2警戒(RSI>85)"
+                            else:
+                                level_desc = "卖出1/3警戒(RSI>80)"
+
+                            self.logger.warning(f"  [历史RSI高点] {days_elapsed}天前周线RSI达{max_weekly_rsi:.2f}({level_desc})，当前已降至{latest_weekly_rsi:.2f}，等待SAR死叉触发")
 
         # 构建备注
         notes = f"SAR趋势={latest_sar_trend}; "
@@ -1440,13 +2295,18 @@ class DailyMonitor:
             latest_sar_trend=latest_sar_trend,
             latest_index_daily_rsi_cyb=latest_index_rsi_cyb,
             latest_index_daily_rsi_sh=latest_index_rsi_sh,
+            latest_index_daily_rsi_kc=latest_index_rsi_kc,
+            latest_index_daily_rsi_bj=latest_index_rsi_bj,
+            latest_index_daily_rsi_hsTech=latest_index_rsi_hsTech,
+            latest_index_daily_rsi_hsIndex=latest_index_rsi_hsIndex,
             signals=signals,
             notes=notes,
             judge_buy_ids=stock_config.judge_buy_ids,
             judge_t_ids=stock_config.judge_t_ids,
             judge_sell_ids=stock_config.judge_sell_ids,
             sar_cross_down_events=sar_cross_down_events,
-            pending_warnings=pending_warnings
+            pending_warnings=pending_warnings,
+            rsi_high_warnings=rsi_high_warnings
         )
 
         return result
@@ -1559,6 +2419,15 @@ class DailyMonitor:
                 severity_str = "🔴" if warning['severity'] == 'HIGH' else "🟡" if warning['severity'] == 'MEDIUM' else "🟢"
                 self.logger.info(f"  {severity_str} {r.stock_name}({r.symbol}): [{warning['type']}] {warning['detail']}")
 
+        # 输出历史RSI高点告警汇总
+        all_rsi_high_warnings = [(r, w) for r in sorted_results for w in r.rsi_high_warnings]
+        if len(all_rsi_high_warnings) > 0:
+            self.logger.info("")
+            self.logger.info("【历史RSI高点告警汇总】（RSI已降但未触发死叉）")
+            self.logger.info("-" * 80)
+            for r, warning in all_rsi_high_warnings:
+                self.logger.info(f"  ⚠️ {r.stock_name}({r.symbol}): {warning.days_elapsed}天前{warning.rsi_type}RSI达{warning.high_rsi:.2f}，当前已降至{warning.current_rsi:.2f}")
+
         # 无信号统计
         no_signals = [r for r in sorted_results if len(r.signals) == 0]
         if len(no_signals) > 0:
@@ -1588,9 +2457,12 @@ class DailyMonitor:
         # 收集有待触发告警的股票
         results_with_warnings = [r for r in results if len(r.pending_warnings) > 0]
 
-        # 如果没有信号且没有待触发告警，不发送告警
-        if len(results_with_signals) == 0 and len(results_with_warnings) == 0:
-            self.logger.info("无信号且无待触发告警，不发送钉钉告警")
+        # 收集有历史RSI高点告警的股票
+        results_with_rsi_high = [r for r in results if len(r.rsi_high_warnings) > 0]
+
+        # 如果没有信号且没有待触发告警且没有历史RSI高点告警，不发送告警
+        if len(results_with_signals) == 0 and len(results_with_warnings) == 0 and len(results_with_rsi_high) == 0:
+            self.logger.info("无信号且无待触发告警且无历史RSI高点告警，不发送钉钉告警")
             return
 
         # 构建Markdown消息
@@ -1602,7 +2474,8 @@ class DailyMonitor:
         content_lines.append(f"**监控范围**: 最近 {RECENT_TRADING_DAYS} 个交易日\n")
         content_lines.append(f"**监控股票数**: {len(results)} 只\n")
         content_lines.append(f"**有信号股票**: {len(results_with_signals)} 只\n")
-        content_lines.append(f"**待触发告警**: {len(results_with_warnings)} 只\n\n")
+        content_lines.append(f"**待触发告警**: {len(results_with_warnings)} 只\n")
+        content_lines.append(f"**历史RSI高点**: {len(results_with_rsi_high)} 只\n\n")
 
         # 按信号类型分组
         sell_signals_by_date: Dict[str, List] = {}
@@ -1688,16 +2561,40 @@ class DailyMonitor:
                     content_lines.append(f"- **{r.stock_name}** ({r.symbol}): [{warning['type']}] {warning['detail']}\n")
                 content_lines.append("\n")
 
+        # 历史RSI高点告警（RSI已降但未触发死叉）
+        if len(results_with_rsi_high) > 0:
+            all_rsi_high_warnings = [(r, w) for r in results_with_rsi_high for w in r.rsi_high_warnings]
+            content_lines.append(f"### 📉 历史RSI高点告警 ({len(all_rsi_high_warnings)}条)\n")
+            content_lines.append("---\n")
+            content_lines.append("*RSI已降但未触发SAR死叉，需持续关注*\n\n")
+            for r, warning in all_rsi_high_warnings:
+                content_lines.append(f"- **{r.stock_name}** ({r.symbol}): {warning.days_elapsed}天前{warning.rsi_type}RSI达**{warning.high_rsi:.2f}**，当前已降至{warning.current_rsi:.2f}\n")
+            content_lines.append("\n")
+
         # 市场概况
         content_lines.append(f"### 📊 市场概况\n")
         content_lines.append("---\n")
         if len(results) > 0:
             cyb_rsi = results[0].latest_index_daily_rsi_cyb
             sh_rsi = results[0].latest_index_daily_rsi_sh
+            kc_rsi = results[0].latest_index_daily_rsi_kc
+            bj_rsi = results[0].latest_index_daily_rsi_bj
+            hsTech_rsi = results[0].latest_index_daily_rsi_hsTech
+            hsIndex_rsi = results[0].latest_index_daily_rsi_hsIndex
+
             cyb_rsi_str = f"{cyb_rsi:.2f}" if not np.isnan(cyb_rsi) else "N/A"
             sh_rsi_str = f"{sh_rsi:.2f}" if not np.isnan(sh_rsi) else "N/A"
+            kc_rsi_str = f"{kc_rsi:.2f}" if not np.isnan(kc_rsi) else "N/A"
+            bj_rsi_str = f"{bj_rsi:.2f}" if not np.isnan(bj_rsi) else "N/A"
+            hsTech_rsi_str = f"{hsTech_rsi:.2f}" if not np.isnan(hsTech_rsi) else "N/A"
+            hsIndex_rsi_str = f"{hsIndex_rsi:.2f}" if not np.isnan(hsIndex_rsi) else "N/A"
+
             content_lines.append(f"- 创业板指数(399006) RSI: {cyb_rsi_str}\n")
             content_lines.append(f"- 上证指数(000001) RSI: {sh_rsi_str}\n")
+            content_lines.append(f"- 科创综指(000680) RSI: {kc_rsi_str}\n")
+            content_lines.append(f"- 北证板块(899050) RSI: {bj_rsi_str}\n")
+            content_lines.append(f"- 恒生科技ETF(513180) RSI: {hsTech_rsi_str}\n")
+            content_lines.append(f"- 恒生指数ETF(159920) RSI: {hsIndex_rsi_str}\n")
 
         content = "".join(content_lines)
 
@@ -1723,6 +2620,16 @@ class DailyMonitor:
         for r in results:
             # 如果有信号，每个信号一行
             for sig in r.signals:
+                # 构建历史RSI高点信息字符串
+                rsi_high_str = ''
+                if len(r.rsi_high_warnings) > 0:
+                    rsi_high_str = '; '.join([f"{w.days_elapsed}天前{w.rsi_type}RSI达{w.high_rsi:.2f}" for w in r.rsi_high_warnings])
+
+                # 构建待触发告警信息字符串
+                pending_str = ''
+                if len(r.pending_warnings) > 0:
+                    pending_str = '; '.join([f"[{w['type']}]" for w in r.pending_warnings])
+
                 data.append({
                     '股票代码': r.symbol,
                     '股票名称': r.stock_name,
@@ -1737,10 +2644,22 @@ class DailyMonitor:
                     '买入策略ID': str(r.judge_buy_ids),
                     '做T策略ID': str(r.judge_t_ids),
                     '卖出策略ID': str(r.judge_sell_ids),
+                    '历史RSI高点': rsi_high_str,
+                    '待触发告警': pending_str,
                 })
 
             # 如果没有信号，也记录一行
             if len(r.signals) == 0:
+                # 构建历史RSI高点信息字符串
+                rsi_high_str = ''
+                if len(r.rsi_high_warnings) > 0:
+                    rsi_high_str = '; '.join([f"{w.days_elapsed}天前{w.rsi_type}RSI达{w.high_rsi:.2f}" for w in r.rsi_high_warnings])
+
+                # 构建待触发告警信息字符串
+                pending_str = ''
+                if len(r.pending_warnings) > 0:
+                    pending_str = '; '.join([f"[{w['type']}]" for w in r.pending_warnings])
+
                 data.append({
                     '股票代码': r.symbol,
                     '股票名称': r.stock_name,
@@ -1755,6 +2674,8 @@ class DailyMonitor:
                     '买入策略ID': str(r.judge_buy_ids),
                     '做T策略ID': str(r.judge_t_ids),
                     '卖出策略ID': str(r.judge_sell_ids),
+                    '历史RSI高点': rsi_high_str,
+                    '待触发告警': pending_str,
                 })
 
         df = pd.DataFrame(data)
@@ -1790,6 +2711,21 @@ def is_trading_day() -> bool:
         return weekday < 5
 
 
+def is_trading_time() -> bool:
+    """
+    检查当前是否在交易时间内
+
+    A股交易时间：
+    - 上午：9:30 - 11:30
+    - 下午：13:00 - 15:00
+
+    Returns:
+        bool: 是否在交易时间内
+    """
+    current_time = datetime.now().strftime('%H:%M')
+    return current_time in MONITOR_TIMES
+
+
 def should_monitor_now() -> bool:
     """
     检查当前时间是否应该执行监控
@@ -1797,36 +2733,49 @@ def should_monitor_now() -> bool:
     Returns:
         bool: 是否应该执行监控
     """
-    current_time = datetime.now().strftime('%H:%M')
-    return current_time in MONITOR_TIMES
+    return is_trading_time()
 
 
 def run_scheduler() -> None:
     """
     运行定时调度器
 
-    每天在指定时间点执行监控：
-    - 12:00（中午）- 盘中监控
-    - 14:30（尾盘）- 收盘前监控
-    - 20:00（晚间）- 复盘监控
+    在交易日的交易时间内每30分钟执行监控：
+    - 上午：9:30, 10:00, 10:30, 11:00, 11:30
+    - 下午：13:00, 13:30, 14:00, 14:30, 15:00
     """
     print("=" * 60)
     print("日内监控调度器启动")
-    print(f"监控时间点: {MONITOR_TIMES}")
+    print(f"监控时间点（交易时间内每30分钟）:")
+    print(f"  上午: {MORNING_MONITOR_TIMES}")
+    print(f"  下午: {AFTERNOON_MONITOR_TIMES}")
     print(f"监控范围: 最近 {RECENT_TRADING_DAYS} 个交易日")
     print("=" * 60)
 
     monitor = DailyMonitor()
+    last_monitor_time: Optional[datetime] = None
 
     while True:
         now = datetime.now()
         current_time = now.strftime('%H:%M')
 
         if is_trading_day():
+            # 检查是否在交易时间内
             if current_time in MONITOR_TIMES:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发监控...")
-                monitor.run_monitor()
-                time.sleep(60)
+                # 检查是否已经执行过（避免同一时间点重复执行）
+                should_run = False
+                if last_monitor_time is None:
+                    should_run = True
+                else:
+                    # 如果距离上次执行超过25分钟，则执行（留5分钟余量避免重复）
+                    elapsed = (now - last_monitor_time).total_seconds()
+                    if elapsed >= MONITOR_INTERVAL - 300:
+                        should_run = True
+
+                if should_run:
+                    print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 触发监控...")
+                    monitor.run_monitor()
+                    last_monitor_time = now
 
         time.sleep(60)
 

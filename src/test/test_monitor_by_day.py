@@ -668,7 +668,8 @@ class MonitorTester:
                 has_new_cash=True,
                 has_sold_cash=True,
                 index_daily_rsi=index_rsi_cyb,
-                sh_index_daily_rsi=index_rsi_sh
+                sh_index_daily_rsi=index_rsi_sh,
+                kc_index_daily_rsi=np.nan  # 测试中暂不使用科创综指
             )
 
             if buy_signal_obj is not None and buy_signal_obj.triggered:
