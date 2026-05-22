@@ -47,6 +47,7 @@ sys.path.insert(0, str(project_root))
 
 # 导入策略类
 from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag, COOLDOWN_DAYS
+from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal  # 导入背离检测器（用于指数）
 
 # ==================== 数据结构 ====================
 
@@ -156,6 +157,22 @@ class DBBacktestRunner:
         self._index_metrics_df: Optional[pd.DataFrame] = None  # 创业板指 (399006)
         self._sh_index_metrics_df: Optional[pd.DataFrame] = None  # 上证指数 (000001)
         self._kc_index_metrics_df: Optional[pd.DataFrame] = None  # 科创综指 (000680)
+
+        # 指数背离检测器（用于 sell_id=4,5,6）
+        self._sh_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._sh_index_daily_divergences: List[DivergenceSignal] = []
+        self._sh_index_weekly_divergences: List[DivergenceSignal] = []
+        self._cyb_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._cyb_index_daily_divergences: List[DivergenceSignal] = []
+        self._cyb_index_weekly_divergences: List[DivergenceSignal] = []
+        self._kc_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._kc_index_daily_divergences: List[DivergenceSignal] = []
+        self._kc_index_weekly_divergences: List[DivergenceSignal] = []
+
+        # 已处理的指数背离信号ID集合（避免重复触发）
+        self._processed_sh_index_divergences: Set[str] = set()
+        self._processed_cyb_index_divergences: Set[str] = set()
+        self._processed_kc_index_divergences: Set[str] = set()
 
         # 持仓状态（使用金额追踪）
         self._shares: float = 0.0         # 持有股票数量
@@ -443,7 +460,62 @@ class DBBacktestRunner:
         # 获取指数ETF数据（用于大盘参照）
         self.fetch_index_metrics_from_db()
 
+        # 如果配置了 sell_id=4,5,6，初始化指数背离检测器
+        if any(sid in [4, 5, 6] for sid in self.judge_sell_ids):
+            self._init_index_divergence_detectors()
+
         return True
+
+    def _init_index_divergence_detectors(self) -> None:
+        """
+        初始化指数背离检测器（用于 sell_id=4,5,6）
+
+        检测上证指数、创业板指数、科创板指数的顶背离信号。
+        """
+        # 计算预热起始日期（提前365天）
+        warmup_start = (pd.Timestamp(self.start_date) - pd.Timedelta(days=365)).strftime('%Y-%m-%d')
+
+        # 检测上证指数背离（用于 sell_id=4）
+        self.logger.info("初始化上证指数背离检测器...")
+        self._sh_index_divergence_detector = DivergenceDetector()
+        self._sh_index_divergence_detector.prepare_data(
+            symbol='SHSE.000001',
+            start_date=warmup_start,
+            end_date=self.end_date
+        )
+        sh_divergences = self._sh_index_divergence_detector.detect_all_divergences()
+        self._sh_index_daily_divergences = sh_divergences.get('daily_top_confirmed', [])
+        self._sh_index_weekly_divergences = sh_divergences.get('weekly_top_confirmed', [])
+        self.logger.info(f"上证指数日线顶背离生效: {len(self._sh_index_daily_divergences)} 个")
+        self.logger.info(f"上证指数周线顶背离生效: {len(self._sh_index_weekly_divergences)} 个")
+
+        # 检测创业板指数背离（用于 sell_id=5）
+        self.logger.info("初始化创业板指数背离检测器...")
+        self._cyb_index_divergence_detector = DivergenceDetector()
+        self._cyb_index_divergence_detector.prepare_data(
+            symbol='SZSE.399006',
+            start_date=warmup_start,
+            end_date=self.end_date
+        )
+        cyb_divergences = self._cyb_index_divergence_detector.detect_all_divergences()
+        self._cyb_index_daily_divergences = cyb_divergences.get('daily_top_confirmed', [])
+        self._cyb_index_weekly_divergences = cyb_divergences.get('weekly_top_confirmed', [])
+        self.logger.info(f"创业板指数日线顶背离生效: {len(self._cyb_index_daily_divergences)} 个")
+        self.logger.info(f"创业板指数周线顶背离生效: {len(self._cyb_index_weekly_divergences)} 个")
+
+        # 检测科创板指数背离（用于 sell_id=6）
+        self.logger.info("初始化科创板指数背离检测器...")
+        self._kc_index_divergence_detector = DivergenceDetector()
+        self._kc_index_divergence_detector.prepare_data(
+            symbol='SHSE.000680',
+            start_date=warmup_start,
+            end_date=self.end_date
+        )
+        kc_divergences = self._kc_index_divergence_detector.detect_all_divergences()
+        self._kc_index_daily_divergences = kc_divergences.get('daily_top_confirmed', [])
+        self._kc_index_weekly_divergences = kc_divergences.get('weekly_top_confirmed', [])
+        self.logger.info(f"科创板指数日线顶背离生效: {len(self._kc_index_daily_divergences)} 个")
+        self.logger.info(f"科创板指数周线顶背离生效: {len(self._kc_index_weekly_divergences)} 个")
 
     def _get_trading_dates(self) -> List[pd.Timestamp]:
         """获取回测时间段内的交易日列表"""
@@ -508,6 +580,124 @@ class DBBacktestRunner:
             return {}
         except Exception:
             return {}
+
+    def _get_index_divergence_info(
+        self,
+        date: pd.Timestamp,
+        index_type: str,
+        timeframe: str
+    ) -> Optional[Dict]:
+        """
+        获取指定日期的指数背离信息（跳过已处理的信号）
+
+        Args:
+            date: 当前日期
+            index_type: 指数类型 ('sh', 'cyb', 'kc')
+            timeframe: 时间级别 ('daily' 或 'weekly')
+
+        Returns:
+            背离信息字典或 None
+        """
+        # 根据指数类型选择背离信号列表
+        if index_type == 'sh':
+            divergences = self._sh_index_daily_divergences if timeframe == 'daily' else self._sh_index_weekly_divergences
+            processed_set = self._processed_sh_index_divergences
+        elif index_type == 'cyb':
+            divergences = self._cyb_index_daily_divergences if timeframe == 'daily' else self._cyb_index_weekly_divergences
+            processed_set = self._processed_cyb_index_divergences
+        elif index_type == 'kc':
+            divergences = self._kc_index_daily_divergences if timeframe == 'daily' else self._kc_index_weekly_divergences
+            processed_set = self._processed_kc_index_divergences
+        else:
+            return None
+
+        for div in divergences:
+            if div.confirmation_date is not None:
+                if div.confirmation_date.strftime('%Y-%m-%d') == date.strftime('%Y-%m-%d'):
+                    # 生成唯一ID（使用指数类型+形成日期）
+                    div_id = f"{index_type}_{div.date.strftime('%Y-%m-%d')}"
+
+                    # 跳过已处理的背离信号
+                    if div_id in processed_set:
+                        continue
+
+                    # 标记为已处理
+                    processed_set.add(div_id)
+
+                    return {
+                        'date': div.date,
+                        'prev_high': div.peak_a_price,
+                        'curr_high': div.peak_b_price,
+                        'prev_macd': div.peak_a_macd,
+                        'curr_macd': div.peak_b_macd
+                    }
+
+        return None
+
+    def _detect_index_macd_cross_down(self, date: pd.Timestamp, index_type: str) -> bool:
+        """
+        检测指数MACD是否发生死叉（用于 sell_id=7,8,9）
+
+        Args:
+            date: 当前日期
+            index_type: 指数类型 ('sh', 'cyb', 'kc')
+
+        Returns:
+            bool: 是否发生指数MACD死叉
+
+        【逻辑说明】
+        指数MACD死叉：DIF（快线）从上方穿过DEA（慢线）下方
+        使用 divergence detector 提供的 MACD 数据进行检测
+        """
+        # 根据指数类型选择MACD数据
+        if index_type == 'sh':
+            detector = self._sh_index_divergence_detector
+        elif index_type == 'cyb':
+            detector = self._cyb_index_divergence_detector
+        elif index_type == 'kc':
+            detector = self._kc_index_divergence_detector
+        else:
+            return False
+
+        if detector is None:
+            return False
+
+        # 使用 divergence detector 的 MACD 数据
+        dif_series = detector._dif_series
+        dea_series = detector._dea_series
+
+        if dif_series is None or dea_series is None:
+            return False
+
+        # 获取当前日期的DIF/DEA值
+        try:
+            date_str = date.strftime('%Y-%m-%d')
+            # 找到当前日期在数据中的位置
+            matching_dates = dif_series.index.strftime('%Y-%m-%d') == date_str
+            if matching_dates.sum() == 0:
+                return False
+
+            current_idx = matching_dates.argmax()
+            if current_idx < 1:
+                return False
+
+            current_dif = dif_series.iloc[current_idx]
+            current_dea = dea_series.iloc[current_idx]
+            prev_dif = dif_series.iloc[current_idx - 1]
+            prev_dea = dea_series.iloc[current_idx - 1]
+
+            if np.isnan(current_dif) or np.isnan(current_dea) or np.isnan(prev_dif) or np.isnan(prev_dea):
+                return False
+
+            # MACD死叉：DIF从上方穿过DEA下方
+            if prev_dif >= prev_dea and current_dif < current_dea:
+                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] {index_type}指数MACD死叉: DIF={current_dif:.4f}<DEA={current_dea:.4f}")
+                return True
+
+        except Exception as e:
+            self.logger.warning(f"检测{index_type}指数MACD死叉失败: {e}")
+
+        return False
 
     def _execute_sell(self, date: pd.Timestamp, signal: SellSignal) -> None:
         """执行卖出操作"""
@@ -713,6 +903,43 @@ class DBBacktestRunner:
                 self.state.daily_divergence_info = divergence_info
                 self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离形成，等待死叉触发生效")
 
+            # 【新增】设置指数背离状态（用于 sell_id=4,5,6）
+            if any(sid in [4, 5, 6] for sid in self.judge_sell_ids):
+                # 上证指数背离
+                sh_daily_div_info = self._get_index_divergence_info(date, 'sh', 'daily')
+                sh_weekly_div_info = self._get_index_divergence_info(date, 'sh', 'weekly')
+                if sh_daily_div_info is not None or sh_weekly_div_info is not None:
+                    self.strategy.set_sh_index_divergence(self.state, sh_daily_div_info, sh_weekly_div_info)
+                    if sh_daily_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数日线顶背离生效")
+                    if sh_weekly_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数周线顶背离生效")
+
+                # 创业板指数背离
+                cyb_daily_div_info = self._get_index_divergence_info(date, 'cyb', 'daily')
+                cyb_weekly_div_info = self._get_index_divergence_info(date, 'cyb', 'weekly')
+                if cyb_daily_div_info is not None or cyb_weekly_div_info is not None:
+                    self.strategy.set_cyb_index_divergence(self.state, cyb_daily_div_info, cyb_weekly_div_info)
+                    if cyb_daily_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数日线顶背离生效")
+                    if cyb_weekly_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数周线顶背离生效")
+
+                # 科创板指数背离
+                kc_daily_div_info = self._get_index_divergence_info(date, 'kc', 'daily')
+                kc_weekly_div_info = self._get_index_divergence_info(date, 'kc', 'weekly')
+                if kc_daily_div_info is not None or kc_weekly_div_info is not None:
+                    self.strategy.set_kc_index_divergence(self.state, kc_daily_div_info, kc_weekly_div_info)
+                    if kc_daily_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数日线顶背离生效")
+                    if kc_weekly_div_info:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数周线顶背离生效")
+
+            # 检测指数MACD死叉（用于 sell_id=7,8,9）
+            sh_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'sh') if any(sid in [7] for sid in self.judge_sell_ids) else False
+            cyb_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'cyb') if any(sid in [8] for sid in self.judge_sell_ids) else False
+            kc_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'kc') if any(sid in [9] for sid in self.judge_sell_ids) else False
+
             # 调用策略检测卖出信号（检查触发条件：SAR死叉或MACD死叉）
             sell_signal = self.strategy.check_sell_signal(
                 date=date,
@@ -722,7 +949,10 @@ class DBBacktestRunner:
                 macd_cross_down=macd_cross_down,
                 state=self.state,
                 position=self._shares * metrics.get('close_price', 0) / self.initial_capital if self._shares > 0 else 0,
-                sell_id=sell_id
+                sell_id=sell_id,
+                sh_index_macd_cross_down=sh_index_macd_cross_down,
+                cyb_index_macd_cross_down=cyb_index_macd_cross_down,
+                kc_index_macd_cross_down=kc_index_macd_cross_down
             )
 
             # 处理卖出信号

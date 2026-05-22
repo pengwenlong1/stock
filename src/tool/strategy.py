@@ -194,7 +194,10 @@ class TradingStrategy:
         macd_cross_down: bool,
         state: StrategyState,
         position: float,
-        sell_id: int = 1
+        sell_id: int = 1,
+        sh_index_macd_cross_down: bool = False,
+        cyb_index_macd_cross_down: bool = False,
+        kc_index_macd_cross_down: bool = False
     ) -> Optional[SellSignal]:
         """
         检查卖出信号
@@ -207,7 +210,10 @@ class TradingStrategy:
             macd_cross_down: 是否发生MACD日线跌破死叉（MACD死叉 + 最低价跌破SAR）
             state: 当前策略状态
             position: 当前持仓比例
-            sell_id: 卖出策略ID（1=SAR死叉触发，2=MACD跌破死叉触发+RSI阶梯，3=MACD跌破死叉触发+仅背离）
+            sell_id: 卖出策略ID
+            sh_index_macd_cross_down: 是否发生上证指数MACD日线跌破死叉（用于 sell_id=7）
+            cyb_index_macd_cross_down: 是否发生创业板指数MACD日线跌破死叉（用于 sell_id=8）
+            kc_index_macd_cross_down: 是否发生科创板指数MACD日线跌破死叉（用于 sell_id=9）
 
         Returns:
             SellSignal 或 None（无信号）
@@ -216,9 +222,12 @@ class TradingStrategy:
         - sell_id=1: 触发条件为SAR死叉跌破（收盘价跌破SAR），含RSI阶梯判断
         - sell_id=2: 触发条件为MACD日线跌破死叉，含RSI阶梯判断
         - sell_id=3: 触发条件为MACD日线跌破死叉，仅背离判断（不含RSI阶梯）
-        - sell_id=4: 触发条件为MACD日线跌破死叉，上证指数顶背离 + 个股周线RSI阶梯
-        - sell_id=5: 触发条件为MACD日线跌破死叉，创业板指数顶背离 + 个股周线RSI阶梯
-        - sell_id=6: 触发条件为MACD日线跌破死叉，科创板指数顶背离 + 个股周线RSI阶梯
+        - sell_id=4: 触发条件为个股MACD日线跌破死叉，上证指数顶背离 + 个股周线RSI阶梯
+        - sell_id=5: 触发条件为个股MACD日线跌破死叉，创业板指数顶背离 + 个股周线RSI阶梯
+        - sell_id=6: 触发条件为个股MACD日线跌破死叉，科创板指数顶背离 + 个股周线RSI阶梯
+        - sell_id=7: 触发条件为上证指数MACD日线跌破死叉，上证指数顶背离(日线或周线) + 个股周线RSI阶梯
+        - sell_id=8: 触发条件为创业板指数MACD日线跌破死叉，创业板指数顶背离(日线或周线) + 个股周线RSI阶梯
+        - sell_id=9: 触发条件为科创板指数MACD日线跌破死叉，科创板指数顶背离(日线或周线) + 个股周线RSI阶梯
         """
         # 检查卖出冷却期（只在有持仓时检查）
         if position > 0 and state.last_sell_date is not None:
@@ -251,6 +260,18 @@ class TradingStrategy:
             # sell_id=6: MACD日线跌破死叉 + 科创板指数顶背离 + 个股周线RSI阶梯
             trigger_condition = macd_cross_down
             trigger_name = "MACD跌破死叉"
+        elif sell_id == 7:
+            # sell_id=7: 上证指数MACD日线跌破死叉 + 上证指数顶背离(日线或周线) + 个股周线RSI阶梯
+            trigger_condition = sh_index_macd_cross_down
+            trigger_name = "上证指数MACD跌破死叉"
+        elif sell_id == 8:
+            # sell_id=8: 创业板指数MACD日线跌破死叉 + 创业板指数顶背离(日线或周线) + 个股周线RSI阶梯
+            trigger_condition = cyb_index_macd_cross_down
+            trigger_name = "创业板指数MACD跌破死叉"
+        elif sell_id == 9:
+            # sell_id=9: 科创板指数MACD日线跌破死叉 + 科创板指数顶背离(日线或周线) + 个股周线RSI阶梯
+            trigger_condition = kc_index_macd_cross_down
+            trigger_name = "科创板指数MACD跌破死叉"
         else:
             # 默认使用SAR死叉跌破
             trigger_condition = sar_cross_down
@@ -385,6 +406,85 @@ class TradingStrategy:
             rsi_peak_value = current_rsi_peak_value or weekly_rsi
 
             # 获取指数背离详情
+            index_div_type = "日线顶背离" if has_index_daily_div else "周线顶背离"
+            index_div_info = index_daily_div_info if has_index_daily_div else index_weekly_div_info
+            index_div_date = index_div_info.get('date') if index_div_info else None
+
+            # 优先级1：周线RSI>90 或 rsi_flag=3 → 清仓
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level3'] or current_rsi_flag == 3:
+                reason = f"清仓信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>90 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议清仓"
+                return SellSignal(
+                    flag=SellFlag.CLEAR_ALL,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 优先级2：周线RSI>85 或 rsi_flag=2 → 卖出1/2
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level2'] or current_rsi_flag == 2:
+                reason = f"卖出信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>85 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/2"
+                return SellSignal(
+                    flag=SellFlag.SELL_HALF,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 优先级3：周线RSI>80 或 rsi_flag=1 → 卖出1/3
+            if weekly_rsi >= RSI_THRESHOLDS['weekly_sell_level1'] or current_rsi_flag == 1:
+                reason = f"卖出信号 (sell_id={sell_id}-{index_name}{index_div_type}): {index_name}{index_div_type}形成于 {index_div_date.strftime('%Y-%m-%d') if index_div_date else 'N/A'}, 个股周线RSI={weekly_rsi:.2f}>80 (峰值:{rsi_peak_date.strftime('%Y-%m-%d')}={rsi_peak_value:.2f}), {trigger_name}触发, 建议卖出1/3"
+                return SellSignal(
+                    flag=SellFlag.SELL_ONE_THIRD,
+                    reason=reason,
+                    daily_rsi=daily_rsi,
+                    weekly_rsi=weekly_rsi,
+                    rsi_peak_date=rsi_peak_date,
+                    rsi_peak_value=rsi_peak_value
+                )
+
+            # 指数有顶背离但个股周线RSI未达到阈值，不触发卖出
+            return None
+
+        # 【sell_id=7, 8, 9】指数MACD跌破死叉 + 指数顶背离(日线或周线) + 个股周线RSI阶梯判断
+        if sell_id in [7, 8, 9]:
+            # 确定检查哪个指数的背离状态
+            if sell_id == 7:
+                index_name = "上证指数"
+                has_index_daily_div = current_sh_daily_div_flag == 1
+                has_index_weekly_div = current_sh_weekly_div_flag == 1
+                index_daily_div_info = current_sh_daily_div_info
+                index_weekly_div_info = current_sh_weekly_div_info
+            elif sell_id == 8:
+                index_name = "创业板指数"
+                has_index_daily_div = current_cyb_daily_div_flag == 1
+                has_index_weekly_div = current_cyb_weekly_div_flag == 1
+                index_daily_div_info = current_cyb_daily_div_info
+                index_weekly_div_info = current_cyb_weekly_div_info
+            elif sell_id == 9:
+                index_name = "科创板指数"
+                has_index_daily_div = current_kc_daily_div_flag == 1
+                has_index_weekly_div = current_kc_weekly_div_flag == 1
+                index_daily_div_info = current_kc_daily_div_info
+                index_weekly_div_info = current_kc_weekly_div_info
+            else:
+                return None
+
+            # 检查指数是否出现顶背离（日线或周线）
+            has_index_div = has_index_daily_div or has_index_weekly_div
+
+            # 如果没有指数顶背离，则不触发卖出
+            if not has_index_div:
+                return None
+
+            # 指数有顶背离，检查个股周线RSI决定卖出比例
+            rsi_peak_date = current_rsi_peak_date or date
+            rsi_peak_value = current_rsi_peak_value or weekly_rsi
+
+            # 获取指数背离详情（优先日线，其次周线）
             index_div_type = "日线顶背离" if has_index_daily_div else "周线顶背离"
             index_div_info = index_daily_div_info if has_index_daily_div else index_weekly_div_info
             index_div_date = index_div_info.get('date') if index_div_info else None
