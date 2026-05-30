@@ -188,8 +188,8 @@ class MonitorResult:
     latest_index_daily_rsi_sh: float       # 上证指数RSI
     latest_index_daily_rsi_kc: float       # 科创综指RSI
     latest_index_daily_rsi_bj: float       # 北证板块RSI
-    latest_index_daily_rsi_hsTech: float   # 恒生科技ETF RSI
-    latest_index_daily_rsi_hsIndex: float  # 恒生指数ETF RSI
+    latest_index_daily_rsi_hsTech: float   # 恪生科技ETF RSI
+    latest_index_daily_rsi_hsIndex: float  # 恪生指数ETF RSI
     signals: List[SignalInfo]
     notes: str
     judge_buy_ids: List[int]
@@ -198,6 +198,7 @@ class MonitorResult:
     sar_cross_down_events: List[SARCrossDownInfo]  # SAR死叉跌破事件列表
     pending_warnings: List[Dict] = field(default_factory=list)  # 待触发卖出信号告警
     rsi_high_warnings: List[RSIHighInfo] = field(default_factory=list)  # 历史RSI高点告警
+    index_divergence_warnings: List[Dict] = field(default_factory=list)  # 指数顶背离告警
 
 
 # ==================== 钉钉告警类 ====================
@@ -1270,6 +1271,13 @@ class DailyMonitor:
         cross_down_signals = [s for s in sar_signals if s.signal_type == '绿转红']
         self.logger.info(f"  SAR死叉跌破信号: {len(cross_down_signals)} 个")
 
+        # 【新增】找到最近一次红转绿信号（买入信号）的日期，用于监控模式的背离检测
+        cross_up_signals = [s for s in sar_signals if s.signal_type == '红转绿']
+        last_buy_signal_date = None
+        if len(cross_up_signals) > 0:
+            last_buy_signal_date = cross_up_signals[-1].date  # 最近一次买入信号日期
+            self.logger.info(f"  最近一次买入信号（红转绿）: {last_buy_signal_date.strftime('%Y-%m-%d')}")
+
         # 【新增】检测MACD死叉信号（用于sell_id=2或3的触发条件）
         # MACD日线跌破死叉 = MACD死叉（DIF下穿DEA）+ 价格跌破SAR
         macd_cross_signals = macd_calc.detect_cross_signals(
@@ -1290,7 +1298,8 @@ class DailyMonitor:
         warmup_start = (pd.Timestamp(end_date) - pd.Timedelta(days=WARMUP_DAYS)).strftime('%Y-%m-%d')
         divergence_detector = DivergenceDetector()
         divergence_detector.prepare_data(symbol, warmup_start, end_date)
-        all_divergences = divergence_detector.detect_all_divergences()
+        # 【修改】监控模式传入买入信号日期，只判断买入信号后最新高点的顶背离
+        all_divergences = divergence_detector.detect_all_divergences(last_buy_signal_date)
         daily_divergences_confirmed = all_divergences.get('daily_top_confirmed', [])
         weekly_divergences_confirmed = all_divergences.get('weekly_top_confirmed', [])
         self.logger.info(f"  日线顶背离生效: {len(daily_divergences_confirmed)} 个")
@@ -1304,35 +1313,66 @@ class DailyMonitor:
         kc_index_daily_divergences = []
         kc_index_weekly_divergences = []
 
-        if any(sid in [4, 5, 6] for sid in stock_config.judge_sell_ids):
-            self.logger.info("  初始化指数背离检测器...")
+        # 【修复】指数背离检测器应该始终初始化，用于独立的指数顶背离告警功能
+        # 不依赖于个股的 sell_ids 配置
+        self.logger.info("  初始化指数背离检测器...")
 
-            # 上证指数背离检测器（用于 sell_id=4）
-            sh_div_detector = DivergenceDetector()
-            sh_div_detector.prepare_data(INDEX_SH, warmup_start, end_date)
-            sh_all_div = sh_div_detector.detect_all_divergences()
-            sh_index_daily_divergences = sh_all_div.get('daily_top_confirmed', [])
-            sh_index_weekly_divergences = sh_all_div.get('weekly_top_confirmed', [])
-            self.logger.info(f"  上证指数日线顶背离生效: {len(sh_index_daily_divergences)} 个")
-            self.logger.info(f"  上证指数周线顶背离生效: {len(sh_index_weekly_divergences)} 个")
+        # 上证指数背离检测器
+        sh_div_detector = DivergenceDetector()
+        sh_div_detector.prepare_data(INDEX_SH, warmup_start, end_date)
+        sh_all_div = sh_div_detector.detect_all_divergences()
+        sh_index_daily_divergences = sh_all_div.get('daily_top_confirmed', [])
+        sh_index_weekly_divergences = sh_all_div.get('weekly_top_confirmed', [])
+        self.logger.info(f"  上证指数日线顶背离生效: {len(sh_index_daily_divergences)} 个")
+        self.logger.info(f"  上证指数周线顶背离生效: {len(sh_index_weekly_divergences)} 个")
 
-            # 创业板指数背离检测器（用于 sell_id=5）
-            cyb_div_detector = DivergenceDetector()
-            cyb_div_detector.prepare_data(INDEX_CYB, warmup_start, end_date)
-            cyb_all_div = cyb_div_detector.detect_all_divergences()
-            cyb_index_daily_divergences = cyb_all_div.get('daily_top_confirmed', [])
-            cyb_index_weekly_divergences = cyb_all_div.get('weekly_top_confirmed', [])
-            self.logger.info(f"  创业板指数日线顶背离生效: {len(cyb_index_daily_divergences)} 个")
-            self.logger.info(f"  创业板指数周线顶背离生效: {len(cyb_index_weekly_divergences)} 个")
+        # 创业板指数背离检测器
+        cyb_div_detector = DivergenceDetector()
+        cyb_div_detector.prepare_data(INDEX_CYB, warmup_start, end_date)
+        cyb_all_div = cyb_div_detector.detect_all_divergences()
+        cyb_index_daily_divergences = cyb_all_div.get('daily_top_confirmed', [])
+        cyb_index_weekly_divergences = cyb_all_div.get('weekly_top_confirmed', [])
+        self.logger.info(f"  创业板指数日线顶背离生效: {len(cyb_index_daily_divergences)} 个")
+        self.logger.info(f"  创业板指数周线顶背离生效: {len(cyb_index_weekly_divergences)} 个")
 
-            # 科创板指数背离检测器（用于 sell_id=6）
-            kc_div_detector = DivergenceDetector()
-            kc_div_detector.prepare_data(INDEX_KC, warmup_start, end_date)
-            kc_all_div = kc_div_detector.detect_all_divergences()
-            kc_index_daily_divergences = kc_all_div.get('daily_top_confirmed', [])
-            kc_index_weekly_divergences = kc_all_div.get('weekly_top_confirmed', [])
-            self.logger.info(f"  科创板指数日线顶背离生效: {len(kc_index_daily_divergences)} 个")
-            self.logger.info(f"  科创板指数周线顶背离生效: {len(kc_index_weekly_divergences)} 个")
+        # 科创板指数背离检测器
+        kc_div_detector = DivergenceDetector()
+        kc_div_detector.prepare_data(INDEX_KC, warmup_start, end_date)
+        kc_all_div = kc_div_detector.detect_all_divergences()
+        kc_index_daily_divergences = kc_all_div.get('daily_top_confirmed', [])
+        kc_index_weekly_divergences = kc_all_div.get('weekly_top_confirmed', [])
+        self.logger.info(f"  科创板指数日线顶背离生效: {len(kc_index_daily_divergences)} 个")
+        self.logger.info(f"  科创板指数周线顶背离生效: {len(kc_index_weekly_divergences)} 个")
+
+        # 恒生科技ETF背离检测器
+        hs_tech_daily_divergences = []
+        hs_tech_weekly_divergences = []
+        try:
+            hs_tech_div_detector = DivergenceDetector()
+            hs_tech_div_detector.prepare_data(INDEX_HS_TECH, warmup_start, end_date)
+            hs_tech_all_div = hs_tech_div_detector.detect_all_divergences()
+            hs_tech_daily_divergences = hs_tech_all_div.get('daily_top_confirmed', [])
+            hs_tech_weekly_divergences = hs_tech_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  恒生科技ETF日线顶背离生效: {len(hs_tech_daily_divergences)} 个")
+            self.logger.info(f"  恒生科技ETF周线顶背离生效: {len(hs_tech_weekly_divergences)} 个")
+        except Exception as e:
+            self.logger.warning(f"  恒生科技ETF背离检测器初始化失败: {e}")
+
+        # 恒生指数ETF背离检测器
+        hs_index_daily_divergences = []
+        hs_index_weekly_divergences = []
+        try:
+            hs_index_div_detector = DivergenceDetector()
+            hs_index_div_detector.prepare_data(INDEX_HS_INDEX, warmup_start, end_date)
+            hs_index_all_div = hs_index_div_detector.detect_all_divergences()
+            hs_index_daily_divergences = hs_index_all_div.get('daily_top_confirmed', [])
+            hs_index_weekly_divergences = hs_index_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  恒生指数ETF日线顶背离生效: {len(hs_index_daily_divergences)} 个")
+            self.logger.info(f"  恒生指数ETF周线顶背离生效: {len(hs_index_weekly_divergences)} 个")
+        except Exception as e:
+            self.logger.warning(f"  恒生指数ETF背离检测器初始化失败: {e}")
+
+        self.logger.info("  指数背离检测器初始化完成")
 
         # 收集信号和SAR死叉跌破事件
         signals = []
@@ -1340,6 +1380,8 @@ class DailyMonitor:
 
         # 缓存每次SAR死叉对应的局部高点信息（用于背离比较）
         local_high_history: List[LocalHighInfo] = []
+
+        self.logger.info(f"  开始历史买卖信号检测: SAR死叉信号数={len(cross_down_signals)}, MACD死叉信号数={len(macd_cross_down_signals)}")
 
         # 分析每个SAR死叉跌破事件
         for i, signal in enumerate(cross_down_signals):
@@ -1563,6 +1605,7 @@ class DailyMonitor:
                             has_daily_div = True
                             daily_div_info = {
                                 'date': div.date,
+                                'prev_high_date': div.peak_a_date,
                                 'prev_high': div.peak_a_price,
                                 'curr_high': div.peak_b_price,
                                 'prev_macd': div.peak_a_macd,
@@ -1579,6 +1622,7 @@ class DailyMonitor:
                             has_weekly_div = True
                             weekly_div_info = {
                                 'date': div.date,
+                                'prev_high_date': div.peak_a_date,
                                 'prev_high': div.peak_a_price,
                                 'curr_high': div.peak_b_price,
                                 'prev_macd': div.peak_a_macd,
@@ -1616,6 +1660,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 sh_daily_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1629,6 +1674,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 sh_weekly_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1644,6 +1690,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 cyb_daily_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1657,6 +1704,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 cyb_weekly_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1672,6 +1720,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 kc_daily_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1685,6 +1734,7 @@ class DailyMonitor:
                             if search_start <= div.confirmation_date <= search_end:
                                 kc_weekly_div_info = {
                                     'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
                                     'prev_high': div.peak_a_price,
                                     'curr_high': div.peak_b_price,
                                     'prev_macd': div.peak_a_macd,
@@ -1857,10 +1907,11 @@ class DailyMonitor:
                     signals.append(signal_info)
                     self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
 
-        # ==================== MACD死叉卖出信号检测（sell_id=2或3）====================
-        # 对于配置了sell_id=2或3的情况，需要在MACD死叉事件时检测卖出条件
-        # 而不是在SAR死叉时检测
-        macd_trigger_ids = [sid for sid in stock_config.judge_sell_ids if sid in [2, 3]]
+        # ==================== MACD死叉卖出信号检测（sell_id=2,3,4,5,6）====================
+        # 对于配置了sell_id=2,3,4,5,6的情况，触发条件都是个股MACD死叉
+        # sell_id=2,3: 检查个股顶背离
+        # sell_id=4,5,6: 检查指数顶背离（上证/创业板/科创板）
+        macd_trigger_ids = [sid for sid in stock_config.judge_sell_ids if sid in [2, 3, 4, 5, 6]]
         if len(macd_trigger_ids) > 0 and len(macd_cross_down_signals) > 0:
             self.logger.info(f"  开始MACD死叉卖出检测（sell_ids={macd_trigger_ids})")
 
@@ -1887,12 +1938,6 @@ class DailyMonitor:
                 today_low = df['low'].iloc[current_idx]
                 today_close = df['close'].iloc[current_idx]
                 is_price_break_sar = today_low < yesterday_sar if not np.isnan(yesterday_sar) else False
-
-                if not is_price_break_sar:
-                    self.logger.info(f"    跌破SAR条件不满足: 最低价={today_low:.3f} >= SAR={yesterday_sar:.3f}")
-                    continue
-
-                self.logger.info(f"    跌破SAR条件满足: 最低价={today_low:.3f} < SAR={yesterday_sar:.3f}")
 
                 # 创建策略状态
                 state = StrategyState()
@@ -1926,15 +1971,25 @@ class DailyMonitor:
                     state.rsi_peak_date = rsi_peak_date
                     state.rsi_peak_value = rsi_peak_value
 
-                # 检查背离状态
+                # 检查背离状态（监控模式：背离形成后，待MACD死叉触发卖点）
+                # 用户需求：顶背离形成时告警背离信息，MACD死叉时触发卖点
+                # 【关键修改】背离触发卖点不需要SAR跌破条件，直接触发
+
+                # 计算搜索起始日期（从上次SAR买入信号开始）
+                # 【修复】使用买入信号日期本身，而不是+1天，这样同一天形成的背离也能触发
                 if last_cross_up_date is not None:
-                    search_start = last_cross_up_date + pd.Timedelta(days=1)
+                    search_start = last_cross_up_date
                 else:
                     search_start = df.index[0]
 
+                # 【关键】先检查是否有确认的背离，背离触发卖点不需要SAR跌破条件
+                has_confirmed_divergence = False
                 for div in daily_divergences_confirmed:
-                    if div.confirmation_date is not None:
-                        if search_start <= div.confirmation_date <= macd_cross_down_date:
+                    # 监控模式的背离已设置is_confirmed=True，不需要confirmation_date
+                    # 只需要检查背离是否在MACD死叉之前形成
+                    if div.is_confirmed and div.date <= macd_cross_down_date:
+                        # 【修复】使用 >= 确保背离在买入信号当天或之后形成
+                        if div.date >= search_start:
                             state.daily_divergence_flag = 1
                             state.daily_divergence_info = {
                                 'date': div.date,
@@ -1943,13 +1998,15 @@ class DailyMonitor:
                                 'prev_macd': div.peak_a_macd,
                                 'curr_macd': div.peak_b_macd
                             }
-                            self.logger.info(f"    日线顶背离生效: 彌离形成于{div.date.strftime('%Y-%m-%d')}, "
-                                           f"生效于{div.confirmation_date.strftime('%Y-%m-%d')}")
+                            has_confirmed_divergence = True
+                            self.logger.info(f"    日线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}, "
+                                           f"MACD死叉于{macd_cross_down_date.strftime('%Y-%m-%d')}")
                             break
 
                 for div in weekly_divergences_confirmed:
-                    if div.confirmation_date is not None:
-                        if search_start <= div.confirmation_date <= macd_cross_down_date:
+                    # 监控模式：背离已形成，待MACD死叉触发卖点
+                    if div.is_confirmed and div.date <= macd_cross_down_date:
+                        if div.date >= search_start:
                             state.weekly_divergence_flag = 1
                             state.weekly_divergence_info = {
                                 'date': div.date,
@@ -1958,9 +2015,113 @@ class DailyMonitor:
                                 'prev_macd': div.peak_a_macd,
                                 'curr_macd': div.peak_b_macd
                             }
-                            self.logger.info(f"    周线顶背离生效: 弥离形成于{div.date.strftime('%Y-%m-%d')}, "
-                                           f"生效于{div.confirmation_date.strftime('%Y-%m-%d')}")
+                            has_confirmed_divergence = True
+                            self.logger.info(f"    周线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}, "
+                                           f"MACD死叉于{macd_cross_down_date.strftime('%Y-%m-%d')}")
                             break
+
+                # 【关键】如果没有确认的背离，则需要SAR跌破条件才能触发卖点
+                if not has_confirmed_divergence:
+                    if not is_price_break_sar:
+                        self.logger.info(f"    跌破SAR条件不满足（无背离）: 最低价={today_low:.3f} >= SAR={yesterday_sar:.3f}")
+                        continue
+                    self.logger.info(f"    跌破SAR条件满足（无背离）: 最低价={today_low:.3f} < SAR={yesterday_sar:.3f}")
+                else:
+                    self.logger.info(f"    有确认背离，无需SAR跌破条件: 日线={state.daily_divergence_flag}, 周线={state.weekly_divergence_flag}")
+
+                # 【新增】设置指数背离状态（用于 sell_id=4,5,6）
+                if any(sid in [4, 5, 6] for sid in macd_trigger_ids):
+                    # 检查上证指数背离（用于 sell_id=4）
+                    for div in sh_index_daily_divergences:
+                        # 监控模式：背离已形成，待MACD死叉触发卖点
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                sh_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_sh_index_divergence(state, daily_info=sh_daily_div_info)
+                                self.logger.info(f"    上证指数日线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in sh_index_weekly_divergences:
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                sh_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_sh_index_divergence(state, weekly_info=sh_weekly_div_info)
+                                self.logger.info(f"    上证指数周线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+
+                    # 检查创业板指数背离（用于 sell_id=5）
+                    for div in cyb_index_daily_divergences:
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                cyb_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_cyb_index_divergence(state, daily_info=cyb_daily_div_info)
+                                self.logger.info(f"    创业板指数日线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in cyb_index_weekly_divergences:
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                cyb_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_cyb_index_divergence(state, weekly_info=cyb_weekly_div_info)
+                                self.logger.info(f"    创业板指数周线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+
+                    # 检查科创板指数背离（用于 sell_id=6）
+                    for div in kc_index_daily_divergences:
+                        # 监控模式：背离已形成，待MACD死叉触发卖点
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                kc_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_kc_index_divergence(state, daily_info=kc_daily_div_info)
+                                self.logger.info(f"    科创板指数日线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in kc_index_weekly_divergences:
+                        if div.is_confirmed and div.date <= macd_cross_down_date:
+                            if div.date >= search_start:
+                                kc_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_kc_index_divergence(state, weekly_info=kc_weekly_div_info)
+                                self.logger.info(f"    科创板指数周线顶背离卖点触发: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
 
                 self.logger.info(f"    RSI状态累积: rsi_flag={state.rsi_flag}, "
                                f"峰值={state.rsi_peak_value:.2f}, "
@@ -1970,6 +2131,10 @@ class DailyMonitor:
                 # 检测卖出信号
                 daily_rsi_at_signal = daily_rsi.iloc[current_idx] if current_idx < len(daily_rsi) else np.nan
                 weekly_rsi_at_signal = weekly_rsi.iloc[current_idx] if current_idx < len(weekly_rsi) else np.nan
+
+                # 获取当天的指数RSI
+                index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, macd_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, macd_cross_down_date.strftime('%Y-%m-%d'))
 
                 sell_signal_obj = None
                 for sell_id in macd_trigger_ids:
@@ -2008,6 +2173,8 @@ class DailyMonitor:
                         current_price=today_close,
                         daily_rsi=daily_rsi_at_signal,
                         weekly_rsi=weekly_rsi_at_signal,
+                        index_daily_rsi_cyb=index_rsi_cyb,
+                        index_daily_rsi_sh=index_rsi_sh,
                         sar_cross_down_info=cross_down_info
                     )
                     signals.append(signal_info)
@@ -2017,6 +2184,11 @@ class DailyMonitor:
         # 获取最新日期信息
         last_date = df.index[-1]
         last_date_str = last_date.strftime('%Y-%m-%d')
+
+        # 【关键】初始化卖出状态变量（用于后续历史RSI高点告警判断）
+        # 该变量会被SAR死叉检测逻辑更新
+        has_actual_sell_after_buy = False
+        last_actual_sell_date = None
 
         # 【关键】独立检测部分只对sell_id=1进行SAR死叉实时检测
         # 对于sell_id=2或3，触发条件是MACD日线跌破死叉，盘中无法准确判断MACD死叉
@@ -2188,13 +2360,13 @@ class DailyMonitor:
 
                         # 检查背离状态
                         if last_cross_up_date is not None:
-                            search_start = last_cross_up_date + pd.Timedelta(days=1)
+                            search_start = last_cross_up_date
                         else:
                             search_start = df.index[0]
 
                         for div in daily_divergences_confirmed:
                             if div.confirmation_date is not None:
-                                if search_start <= div.confirmation_date <= last_date:
+                                if div.confirmation_date >= search_start and div.confirmation_date <= last_date:
                                     state.daily_divergence_flag = 1
                                     state.daily_divergence_info = {
                                         'date': div.date,
@@ -2207,7 +2379,7 @@ class DailyMonitor:
 
                         for div in weekly_divergences_confirmed:
                             if div.confirmation_date is not None:
-                                if search_start <= div.confirmation_date <= last_date:
+                                if div.confirmation_date >= search_start and div.confirmation_date <= last_date:
                                     state.weekly_divergence_flag = 1
                                     state.weekly_divergence_info = {
                                         'date': div.date,
@@ -2426,25 +2598,164 @@ class DailyMonitor:
                 if last_sar_cross_up_date is not None and last_sar_cross_down_date is not None:
                     break
 
-        # 检查周线顶背离已生效但还没有SAR死叉
-        # 只显示在最近一次买入信号（红转绿）之后生效的背离，且当前还没卖出（绿转红）
+        # ==================== 独立计算历史卖出状态 ====================
+        # 用于历史RSI高点告警判断：检查最近一次买入后是否已经发生过卖出
+        # 【关键修复】根据 sell_ids 配置决定检查哪种卖出信号：
+        # - sell_id=1: SAR 死叉卖出（检查 cross_down_signals）
+        # - sell_id=2 或 3: MACD 死叉卖出（检查 macd_cross_down_signals）
+        self.logger.info(f"  [历史卖出检测] 开始检测: sell_ids={stock_config.judge_sell_ids}")
+
+        # 根据 sell_ids 决定检查哪种卖出信号
+        use_sar_sell = any(sid in [1] for sid in stock_config.judge_sell_ids)
+        use_macd_sell = any(sid in [2, 3] for sid in stock_config.judge_sell_ids)
+
+        # 获取最近一次买入信号日期（根据策略类型）
+        # 对于 MACD 死叉策略，买入信号也是 MACD 金叉
+        last_buy_date = None
+        if use_macd_sell and len(macd_cross_signals) > 0:
+            # MACD 金叉信号
+            macd_cross_up_signals = [s for s in macd_cross_signals if s.signal_type == '金叉']
+            if len(macd_cross_up_signals) > 0:
+                for sig in reversed(macd_cross_up_signals):
+                    if sig.date < last_date:
+                        last_buy_date = sig.date
+                        self.logger.info(f"  [历史卖出检测] MACD金叉买入信号: {last_buy_date.strftime('%Y-%m-%d')}")
+                        break
+        elif use_sar_sell and len(cross_up_signals) > 0:
+            # SAR 红转绿信号（对于 sell_id=1，这可能是买入或卖出，需要确认）
+            # 这里使用 last_sar_cross_up_date（之前已经计算好的）
+            last_buy_date = last_sar_cross_up_date
+            if last_buy_date is not None:
+                self.logger.info(f"  [历史卖出检测] SAR买入信号日期: {last_buy_date.strftime('%Y-%m-%d')}")
+
+        if last_buy_date is not None:
+            # 统一时区处理
+            buy_date_naive = last_buy_date.tz_localize(None) if last_buy_date.tz is not None else last_buy_date
+            last_date_naive = last_date.tz_localize(None) if last_date.tz is not None else last_date
+
+            # 检查买入后的卖出信号
+            sell_signals_to_check = []
+            if use_macd_sell:
+                sell_signals_to_check = macd_cross_down_signals
+                self.logger.info(f"  [历史卖出检测] 检查MACD死叉信号: {len(sell_signals_to_check)} 个")
+            if use_sar_sell:
+                sell_signals_to_check = cross_down_signals
+                self.logger.info(f"  [历史卖出检测] 检查SAR死叉信号: {len(sell_signals_to_check)} 个")
+
+            for sig in sell_signals_to_check:
+                # 统一时区处理
+                sig_date_naive = sig.date.tz_localize(None) if sig.date.tz is not None else sig.date
+                self.logger.info(f"  [历史卖出检测] 检查卖出信号: {sig_date_naive.strftime('%Y-%m-%d')}")
+
+                # 只检查买入后、今天之前的卖出信号
+                if sig_date_naive > buy_date_naive and sig_date_naive < last_date_naive:
+                    sell_date = sig.date
+                    sell_date_naive = sig_date_naive
+
+                    # 检查这个卖出信号时是否有背离生效
+                    for div in daily_divergences_confirmed:
+                        if div.confirmation_date is not None:
+                            div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
+                            if buy_date_naive < div_date <= sell_date_naive:
+                                has_actual_sell_after_buy = True
+                                last_actual_sell_date = sell_date
+                                self.logger.info(f"    [历史卖出检测] 日线背离触发卖出: {sell_date.strftime('%Y-%m-%d')}")
+                                break
+                    if has_actual_sell_after_buy:
+                        break
+
+                    # 也检查周线背离
+                    for div in weekly_divergences_confirmed:
+                        if div.confirmation_date is not None:
+                            div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
+                            if buy_date_naive < div_date <= sell_date_naive:
+                                has_actual_sell_after_buy = True
+                                last_actual_sell_date = sell_date
+                                self.logger.info(f"    [历史卖出检测] 周线背离触发卖出: {sell_date.strftime('%Y-%m-%d')}")
+                                break
+                    if has_actual_sell_after_buy:
+                        break
+
+                    # 也检查RSI阈值触发：周线RSI峰值>=85
+                    if not has_actual_sell_after_buy:
+                        # 计算买入到卖出之间的周线RSI峰值
+                        temp_peak_value = 0.0
+                        try:
+                            # 【修复】统一时区处理：将 df 索引转换为 tz-naive
+                            df_index_naive = df.index
+                            if df_index_naive.tz is not None:
+                                df_index_naive = df_index_naive.tz_localize(None)
+
+                            # 尝试在 df 索引中找到日期
+                            try:
+                                buy_idx = df_index_naive.get_loc(buy_date_naive)
+                            except KeyError:
+                                # 如果找不到精确匹配，尝试找最近的日期
+                                buy_idx = df_index_naive.get_indexer([buy_date_naive], method='nearest')[0]
+                                self.logger.info(f"    [历史卖出检测] 买入日期 {buy_date_naive.strftime('%Y-%m-%d')} 在df中未找到，使用最近索引: {buy_idx}")
+
+                            try:
+                                sell_idx = df_index_naive.get_loc(sell_date_naive)
+                            except KeyError:
+                                sell_idx = df_index_naive.get_indexer([sell_date_naive], method='nearest')[0]
+                                self.logger.info(f"    [历史卖出检测] 卖出日期 {sell_date_naive.strftime('%Y-%m-%d')} 在df中未找到，使用最近索引: {sell_idx}")
+
+                            # 确保索引有效
+                            if buy_idx >= 0 and sell_idx >= 0 and sell_idx > buy_idx:
+                                for idx in range(buy_idx + 1, sell_idx + 1):
+                                    if idx < len(weekly_rsi):
+                                        weekly_rsi_val = weekly_rsi.iloc[idx]
+                                        if not np.isnan(weekly_rsi_val):
+                                            if weekly_rsi_val > temp_peak_value:
+                                                temp_peak_value = weekly_rsi_val
+                                self.logger.info(f"    [历史卖出检测] 买入到卖出期间周线RSI峰值: {temp_peak_value:.2f}")
+                        except Exception as e:
+                            self.logger.warning(f"    [历史卖出检测] RSI峰值计算异常: {e}")
+                            # 即使计算失败，也尝试直接检查当前周线RSI是否>=85
+                            # 如果周线RSI在买入时或卖出时已经>=85，也算触发
+                            if len(weekly_rsi) > 0:
+                                # 检查最近几天的周线RSI
+                                for idx in range(max(0, len(weekly_rsi) - 5), len(weekly_rsi)):
+                                    weekly_rsi_val = weekly_rsi.iloc[idx]
+                                    if not np.isnan(weekly_rsi_val) and weekly_rsi_val >= 85:
+                                        temp_peak_value = weekly_rsi_val
+                                        self.logger.info(f"    [历史卖出检测] 找到周线RSI>=85: {temp_peak_value:.2f}")
+                                        break
+
+                        # 检查是否触发卖出（周线RSI峰值>=85）
+                        threshold_85 = RSI_THRESHOLDS['weekly_sell_level2']
+                        if temp_peak_value >= threshold_85:
+                            has_actual_sell_after_buy = True
+                            last_actual_sell_date = sell_date
+                            self.logger.info(f"    [历史卖出检测] RSI阈值触发卖出: 卖出={sell_date.strftime('%Y-%m-%d')}, 周线RSI峰值={temp_peak_value:.2f}")
+                            break
+
+        if has_actual_sell_after_buy:
+            self.logger.info(f"    [历史卖出状态] 买入后已触发卖出，不再发出历史RSI高点告警")
+
+        # 检查周线顶背离已形成但还没有SAR死叉
+        # 监控模式：背离形成即告警，待MACD死叉触发卖点
+        # 只显示在最近一次买入信号（红转绿）之后形成的背离，且当前还没卖出（绿转红）
         if weekly_divergences_confirmed and len(weekly_divergences_confirmed) > 0:
             for div in weekly_divergences_confirmed:
-                if div.confirmation_date is not None:
+                # 监控模式：检查背离是否已形成（is_confirmed=True）
+                if div.is_confirmed:
                     # 过滤条件：
-                    # 1. 背离生效日期 > 最近一次买入信号日期（在买入后触发）
+                    # 1. 背离形成日期 > 最近一次买入信号日期（在买入后形成）
                     # 2. 当前SAR趋势是多头（还没收到卖出信号）
                     # 统一时区处理：去掉时区信息进行比较
-                    div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
-                    # 如果买入信号存在，背离必须在买入后生效；如果不存在，则始终显示
-                    if (last_sar_cross_up_date is None or div_date > last_sar_cross_up_date) and latest_sar_trend == '多头':
+                    div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                    # 【修复】使用 >= 确保同一天形成的背离也能显示待触发告警
+                    if (last_sar_cross_up_date is None or div_date >= last_sar_cross_up_date) and latest_sar_trend == '多头':
+                        peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div, 'peak_a_date') and div.peak_a_date else 'N/A'
+                        peak_a_price_str = f"{div.peak_a_price:.3f}" if hasattr(div, 'peak_a_price') and div.peak_a_price else 'N/A'
                         pending_warnings.append({
                             'type': '周线顶背离',
-                            'detail': f"周线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发清仓",
+                            'detail': f"周线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), 等待SAR死叉触发清仓",
                             'severity': 'HIGH',
-                            'confirmation_date': div.confirmation_date
+                            'divergence_date': div.date
                         })
-                        self.logger.warning(f"  [待触发告警] 周线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发清仓")
+                        self.logger.warning(f"  [待触发告警] 周线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，等待SAR死叉触发清仓")
 
         # 检查周线RSI已达警戒级别但还没有SAR死叉
         # 只有 sell_id=1 或 2 才检查RSI阈值（sell_id=3不含RSI阶梯）
@@ -2479,25 +2790,163 @@ class DailyMonitor:
                 })
                 self.logger.info(f"  [待触发提示] 周线RSI>80，等待SAR死叉触发卖出1/3")
 
-        # 检查日线顶背离已生效但还没有SAR死叉
-        # 只显示在最近一次买入信号（红转绿）之后生效的背离，且当前还没卖出（绿转红）
+        # 检查日线顶背离已形成但还没有SAR死叉
+        # 监控模式：背离形成即告警，待MACD死叉触发卖点
+        # 只显示在最近一次买入信号（红转绿）之后形成的背离，且当前还没卖出（绿转红）
         if daily_divergences_confirmed and len(daily_divergences_confirmed) > 0:
             for div in daily_divergences_confirmed:
-                if div.confirmation_date is not None:
+                # 监控模式：检查背离是否已形成（is_confirmed=True）
+                if div.is_confirmed:
                     # 过滤条件：
-                    # 1. 背离生效日期 > 最近一次买入信号日期（在买入后触发）
+                    # 1. 背离形成日期 > 最近一次买入信号日期（在买入后形成）
                     # 2. 当前SAR趋势是多头（还没收到卖出信号）
                     # 统一时区处理：去掉时区信息进行比较
-                    div_date = div.confirmation_date.tz_localize(None) if div.confirmation_date.tz is not None else div.confirmation_date
-                    # 如果买入信号存在，背离必须在买入后生效；如果不存在，则始终显示
-                    if (last_sar_cross_up_date is None or div_date > last_sar_cross_up_date) and latest_sar_trend == '多头':
+                    div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                    # 【修复】使用 >= 确保同一天形成的背离也能显示待触发告警
+                    if (last_sar_cross_up_date is None or div_date >= last_sar_cross_up_date) and latest_sar_trend == '多头':
+                        peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div, 'peak_a_date') and div.peak_a_date else 'N/A'
+                        peak_a_price_str = f"{div.peak_a_price:.3f}" if hasattr(div, 'peak_a_price') and div.peak_a_price else 'N/A'
                         pending_warnings.append({
                             'type': '日线顶背离',
-                            'detail': f"日线顶背离生效于{div.confirmation_date.strftime('%Y-%m-%d')}, 等待SAR死叉触发卖出1/3",
+                            'detail': f"日线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), 等待SAR死叉触发卖出1/3",
                             'severity': 'LOW',
-                            'confirmation_date': div.confirmation_date
+                            'divergence_date': div.date
                         })
-                        self.logger.info(f"  [待触发提示] 日线顶背离已生效({div.confirmation_date.strftime('%Y-%m-%d')})，等待SAR死叉触发卖出1/3")
+                        self.logger.info(f"  [待触发提示] 日线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，等待SAR死叉触发卖出1/3")
+
+        # ==================== 指数顶背离告警 ====================
+        # 显示最近一个月（30天）内形成的顶背离，日线和周线合并显示
+        index_divergence_warnings = []
+        recent_days = 30  # 最近30天（一个月）
+        end_date_ts = pd.Timestamp(end_date)
+
+        # 收集最近一个月内形成的指数顶背离
+        for div in sh_index_daily_divergences + sh_index_weekly_divergences:
+            if div.is_confirmed:
+                div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                days_diff = (end_date_ts - div_date).days
+                if days_diff <= recent_days:
+                    timeframe = '日线' if div in sh_index_daily_divergences else '周线'
+                    peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div.peak_a_date, 'strftime') else str(div.peak_a_date)[:10]
+                    peak_b_date_str = div.date.strftime('%Y-%m-%d')
+                    index_divergence_warnings.append({
+                        'index_name': '上证指数',
+                        'index_code': '000001',
+                        'type': f'{timeframe}顶背离',
+                        'detail': f"上证指数{timeframe}顶背离形成于{peak_b_date_str}",
+                        'severity': 'HIGH',
+                        'divergence_date': div.date,
+                        'days_elapsed': days_diff,
+                        'peak_a_date': peak_a_date_str,
+                        'peak_b_date': peak_b_date_str,
+                        'peak_a_price': div.peak_a_price,
+                        'peak_b_price': div.peak_b_price,
+                        'peak_a_macd': div.peak_a_macd,
+                        'peak_b_macd': div.peak_b_macd
+                    })
+                    self.logger.warning(f"  [指数背离告警] 上证指数{timeframe}顶背离: 前高点{peak_a_date_str}={div.peak_a_price:.2f}MACD={div.peak_a_macd:.4f}, 当前高点{peak_b_date_str}={div.peak_b_price:.2f}MACD={div.peak_b_macd:.4f}")
+
+        for div in cyb_index_daily_divergences + cyb_index_weekly_divergences:
+            if div.is_confirmed:
+                div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                days_diff = (end_date_ts - div_date).days
+                if days_diff <= recent_days:
+                    timeframe = '日线' if div in cyb_index_daily_divergences else '周线'
+                    peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div.peak_a_date, 'strftime') else str(div.peak_a_date)[:10]
+                    peak_b_date_str = div.date.strftime('%Y-%m-%d')
+                    index_divergence_warnings.append({
+                        'index_name': '创业板指数',
+                        'index_code': '399006',
+                        'type': f'{timeframe}顶背离',
+                        'detail': f"创业板指数{timeframe}顶背离形成于{peak_b_date_str}",
+                        'severity': 'HIGH',
+                        'divergence_date': div.date,
+                        'days_elapsed': days_diff,
+                        'peak_a_date': peak_a_date_str,
+                        'peak_b_date': peak_b_date_str,
+                        'peak_a_price': div.peak_a_price,
+                        'peak_b_price': div.peak_b_price,
+                        'peak_a_macd': div.peak_a_macd,
+                        'peak_b_macd': div.peak_b_macd
+                    })
+                    self.logger.warning(f"  [指数背离告警] 创业板指数{timeframe}顶背离: 前高点{peak_a_date_str}={div.peak_a_price:.2f}MACD={div.peak_a_macd:.4f}, 当前高点{peak_b_date_str}={div.peak_b_price:.2f}MACD={div.peak_b_macd:.4f}")
+
+        for div in kc_index_daily_divergences + kc_index_weekly_divergences:
+            if div.is_confirmed:
+                div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                days_diff = (end_date_ts - div_date).days
+                if days_diff <= recent_days:
+                    timeframe = '日线' if div in kc_index_daily_divergences else '周线'
+                    peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div.peak_a_date, 'strftime') else str(div.peak_a_date)[:10]
+                    peak_b_date_str = div.date.strftime('%Y-%m-%d')
+                    index_divergence_warnings.append({
+                        'index_name': '科创综指',
+                        'index_code': '000680',
+                        'type': f'{timeframe}顶背离',
+                        'detail': f"科创综指{timeframe}顶背离形成于{peak_b_date_str}",
+                        'severity': 'HIGH',
+                        'divergence_date': div.date,
+                        'days_elapsed': days_diff,
+                        'peak_a_date': peak_a_date_str,
+                        'peak_b_date': peak_b_date_str,
+                        'peak_a_price': div.peak_a_price,
+                        'peak_b_price': div.peak_b_price,
+                        'peak_a_macd': div.peak_a_macd,
+                        'peak_b_macd': div.peak_b_macd
+                    })
+                    self.logger.warning(f"  [指数背离告警] 科创综指{timeframe}顶背离: 前高点{peak_a_date_str}={div.peak_a_price:.2f}MACD={div.peak_a_macd:.4f}, 当前高点{peak_b_date_str}={div.peak_b_price:.2f}MACD={div.peak_b_macd:.4f}")
+
+        # 恒生科技ETF顶背离告警
+        for div in hs_tech_daily_divergences + hs_tech_weekly_divergences:
+            if div.is_confirmed:
+                div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                days_diff = (end_date_ts - div_date).days
+                if days_diff <= recent_days:
+                    timeframe = '日线' if div in hs_tech_daily_divergences else '周线'
+                    peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div.peak_a_date, 'strftime') else str(div.peak_a_date)[:10]
+                    peak_b_date_str = div.date.strftime('%Y-%m-%d')
+                    index_divergence_warnings.append({
+                        'index_name': '恒生科技ETF',
+                        'index_code': '513180',
+                        'type': f'{timeframe}顶背离',
+                        'detail': f"恒生科技ETF{timeframe}顶背离形成于{peak_b_date_str}",
+                        'severity': 'HIGH',
+                        'divergence_date': div.date,
+                        'days_elapsed': days_diff,
+                        'peak_a_date': peak_a_date_str,
+                        'peak_b_date': peak_b_date_str,
+                        'peak_a_price': div.peak_a_price,
+                        'peak_b_price': div.peak_b_price,
+                        'peak_a_macd': div.peak_a_macd,
+                        'peak_b_macd': div.peak_b_macd
+                    })
+                    self.logger.warning(f"  [指数背离告警] 恒生科技ETF{timeframe}顶背离: 前高点{peak_a_date_str}={div.peak_a_price:.2f}MACD={div.peak_a_macd:.4f}, 当前高点{peak_b_date_str}={div.peak_b_price:.2f}MACD={div.peak_b_macd:.4f}")
+
+        # 恒生指数ETF顶背离告警
+        for div in hs_index_daily_divergences + hs_index_weekly_divergences:
+            if div.is_confirmed:
+                div_date = div.date.tz_localize(None) if div.date.tz is not None else div.date
+                days_diff = (end_date_ts - div_date).days
+                if days_diff <= recent_days:
+                    timeframe = '日线' if div in hs_index_daily_divergences else '周线'
+                    peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div.peak_a_date, 'strftime') else str(div.peak_a_date)[:10]
+                    peak_b_date_str = div.date.strftime('%Y-%m-%d')
+                    index_divergence_warnings.append({
+                        'index_name': '恒生指数ETF',
+                        'index_code': '159920',
+                        'type': f'{timeframe}顶背离',
+                        'detail': f"恒生指数ETF{timeframe}顶背离形成于{peak_b_date_str}",
+                        'severity': 'HIGH',
+                        'divergence_date': div.date,
+                        'days_elapsed': days_diff,
+                        'peak_a_date': peak_a_date_str,
+                        'peak_b_date': peak_b_date_str,
+                        'peak_a_price': div.peak_a_price,
+                        'peak_b_price': div.peak_b_price,
+                        'peak_a_macd': div.peak_a_macd,
+                        'peak_b_macd': div.peak_b_macd
+                    })
+                    self.logger.warning(f"  [指数背离告警] 恒生指数ETF{timeframe}顶背离: 前高点{peak_a_date_str}={div.peak_a_price:.2f}MACD={div.peak_a_macd:.4f}, 当前高点{peak_b_date_str}={div.peak_b_price:.2f}MACD={div.peak_b_macd:.4f}")
 
         # ==================== 历史RSI高点告警 ====================
         # 检查最近一次买入信号（红转绿）之后的历史RSI高点，即使当前RSI已降低也要告警
@@ -2510,7 +2959,11 @@ class DailyMonitor:
         # 判断是否需要检查周线RSI阈值
         check_weekly_rsi_threshold = any(sid in [1, 2] for sid in stock_config.judge_sell_ids)
 
-        if latest_sar_trend == '多头' and check_weekly_rsi_threshold:
+        # 【修复】使用 has_actual_sell_after_buy 判断是否已经卖出（而不是只看最近2天的signals列表）
+        # 这样可以正确识别历史卖出，避免卖出后仍发出历史RSI高点告警
+        # 注意：has_actual_sell_after_buy 是在卖出信号检测逻辑中已经计算好的
+
+        if latest_sar_trend == '多头' and check_weekly_rsi_threshold and not has_actual_sell_after_buy:
             # 计算回溯起始日期（从最近一次买入信号日期开始，或从配置的回溯天数开始）
             if last_sar_cross_up_date is not None:
                 # 从最近一次买入信号（红转绿）日期开始查找
@@ -2596,7 +3049,8 @@ class DailyMonitor:
             judge_sell_ids=stock_config.judge_sell_ids,
             sar_cross_down_events=sar_cross_down_events,
             pending_warnings=pending_warnings,
-            rsi_high_warnings=rsi_high_warnings
+            rsi_high_warnings=rsi_high_warnings,
+            index_divergence_warnings=index_divergence_warnings
         )
 
         return result
@@ -2750,9 +3204,12 @@ class DailyMonitor:
         # 收集有历史RSI高点告警的股票
         results_with_rsi_high = [r for r in results if len(r.rsi_high_warnings) > 0]
 
-        # 如果没有信号且没有待触发告警且没有历史RSI高点告警，不发送告警
-        if len(results_with_signals) == 0 and len(results_with_warnings) == 0 and len(results_with_rsi_high) == 0:
-            self.logger.info("无信号且无待触发告警且无历史RSI高点告警，不发送钉钉告警")
+        # 收集有指数顶背离告警的股票（去重，所有股票共享同一组指数背离信息）
+        results_with_index_div = [r for r in results if len(r.index_divergence_warnings) > 0]
+
+        # 如果没有信号且没有待触发告警且没有历史RSI高点告警且没有指数背离告警，不发送告警
+        if len(results_with_signals) == 0 and len(results_with_warnings) == 0 and len(results_with_rsi_high) == 0 and len(results_with_index_div) == 0:
+            self.logger.info("无信号且无待触发告警且无历史RSI高点告警且无指数背离告警，不发送钉钉告警")
             return
 
         # 构建Markdown消息
@@ -2861,6 +3318,27 @@ class DailyMonitor:
                 content_lines.append(f"- **{r.stock_name}** ({r.symbol}): {warning.days_elapsed}天前{warning.rsi_type}RSI达**{warning.high_rsi:.2f}**，当前已降至{warning.current_rsi:.2f}\n")
             content_lines.append("\n")
 
+        # 指数顶背离告警（独立于个股，所有股票共享同一组指数背离信息）
+        if len(results_with_index_div) > 0:
+            # 去重：取第一个股票的指数背离信息（所有股票的指数背离信息相同）
+            all_index_warnings = results_with_index_div[0].index_divergence_warnings
+            # 去重：同一指数同一类型的背离只显示一次
+            unique_warnings = {}
+            for w in all_index_warnings:
+                key = f"{w['index_name']}-{w['type']}"
+                if key not in unique_warnings:
+                    unique_warnings[key] = w
+
+            if len(unique_warnings) > 0:
+                content_lines.append(f"### 🚨 指数顶背离告警 ({len(unique_warnings)}条)\n")
+                content_lines.append("---\n")
+                content_lines.append("*指数顶背离对市场整体有影响，需重点关注*\n\n")
+                for key, warning in unique_warnings.items():
+                    content_lines.append(f"- **{warning['index_name']}** ({warning['index_code']}): [{warning['type']}]\n")
+                    content_lines.append(f"  - 前高点({warning['peak_a_date']}): 价格={warning['peak_a_price']:.2f} MACD={warning['peak_a_macd']:.4f}\n")
+                    content_lines.append(f"  - 当前高点({warning['peak_b_date']}): 价格={warning['peak_b_price']:.2f} MACD={warning['peak_b_macd']:.4f}\n")
+                content_lines.append("\n")
+
         # 市场概况
         content_lines.append(f"### 📊 市场概况\n")
         content_lines.append("---\n")
@@ -2920,6 +3398,11 @@ class DailyMonitor:
                 if len(r.pending_warnings) > 0:
                     pending_str = '; '.join([f"[{w['type']}]" for w in r.pending_warnings])
 
+                # 构建指数顶背离告警信息字符串
+                index_div_str = ''
+                if len(r.index_divergence_warnings) > 0:
+                    index_div_str = '; '.join([f"[{w['index_name']}{w['type']}]" for w in r.index_divergence_warnings])
+
                 data.append({
                     '股票代码': r.symbol,
                     '股票名称': r.stock_name,
@@ -2936,6 +3419,7 @@ class DailyMonitor:
                     '卖出策略ID': str(r.judge_sell_ids),
                     '历史RSI高点': rsi_high_str,
                     '待触发告警': pending_str,
+                    '指数顶背离': index_div_str,
                 })
 
             # 如果没有信号，也记录一行
@@ -2949,6 +3433,11 @@ class DailyMonitor:
                 pending_str = ''
                 if len(r.pending_warnings) > 0:
                     pending_str = '; '.join([f"[{w['type']}]" for w in r.pending_warnings])
+
+                # 构建指数顶背离告警信息字符串
+                index_div_str = ''
+                if len(r.index_divergence_warnings) > 0:
+                    index_div_str = '; '.join([f"[{w['index_name']}{w['type']}]" for w in r.index_divergence_warnings])
 
                 data.append({
                     '股票代码': r.symbol,
@@ -2966,6 +3455,7 @@ class DailyMonitor:
                     '卖出策略ID': str(r.judge_sell_ids),
                     '历史RSI高点': rsi_high_str,
                     '待触发告警': pending_str,
+                    '指数顶背离': index_div_str,
                 })
 
         df = pd.DataFrame(data)

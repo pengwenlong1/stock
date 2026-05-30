@@ -186,10 +186,12 @@ class DivergenceDetector:
         self._symbol = symbol
 
         # 初始化PeakDetector（日线参数）
+        # 注意：min_distance必须小于MAX_DAYS_INTERVAL(60)，否则可能错过峰点导致无法形成背离判断
+        # 【修复】min_distance=5 与 MIN_KLINE_INTERVAL=5 保持一致，允许检测间隔≥5天的峰点
         self._peak_detector = PeakDetector(
             atr_period=14,
             prominence_factor=1.0,
-            min_distance=20  # 日线最小间隔20天
+            min_distance=5  # 日线最小间隔5天（与MIN_KLINE_INTERVAL一致）
         )
         self._peak_detector.prepare_data(df['high'], df['low'], df['close'])
 
@@ -333,7 +335,7 @@ class DivergenceDetector:
         except Exception:
             return 0.0, peak_a.date
 
-    def detect_daily_top_divergence(self) -> List[DivergenceSignal]:
+    def detect_daily_top_divergence(self, buy_signal_date: Optional[pd.Timestamp] = None) -> List[DivergenceSignal]:
         """
         检测日线顶背离
 
@@ -348,6 +350,10 @@ class DivergenceDetector:
            - 时间间隔≤60日
            - 回调幅度≤30%
            - 两者高于60日均线
+
+        Args:
+            buy_signal_date: 最近一次买入信号（SAR金叉）日期，用于确定peak B的搜索范围
+                            如果传入此参数，将从买入信号日期到当前日期之间找最高点作为peak B
 
         Returns:
             顶背离信号列表
@@ -368,21 +374,136 @@ class DivergenceDetector:
 
         logger.info(f"[日线] 检测到 {len(peaks)} 个峰点（使用最高价）")
 
+        # 【新增】输出所有峰点的详细信息
         macd_series = self._macd_calculator._macd_series
+        for i, peak in enumerate(peaks):
+            macd_val = self._get_value_at_date(peak.date, macd_series)
+            macd_str = f"{macd_val:.4f}" if not np.isnan(macd_val) else "N/A"
+            logger.info(f"  [峰点{i+1}] {peak.date.strftime('%Y-%m-%d')} | 最高价={peak.price:.3f} | MACD={macd_str}")
+
         divergences = []
+
+        # ==================== 监控模式：从买入信号后的最新最高点判断顶背离 ====================
+        # 用户需求：监控模式下只判断上一次金叉后的最新高点的顶背离
+        # 传入buy_signal_date时，从该日期到当前日期之间找最高点作为peak B
+        if buy_signal_date is not None:
+            # 确保买入信号日期在数据范围内
+            if buy_signal_date not in self._df.index:
+                # 找最近的交易日
+                valid_dates = self._df.index[self._df.index >= buy_signal_date]
+                if len(valid_dates) == 0:
+                    logger.warning(f"  [监控模式] 买入信号日期{buy_signal_date.strftime('%Y-%m-%d')}超出数据范围")
+                    return divergences
+                buy_signal_date = valid_dates[0]
+
+            # 从买入信号日期到当前日期之间找最高点作为peak B
+            recent_df = self._df.loc[buy_signal_date:]
+            recent_high_idx = recent_df['high'].idxmax()
+            recent_high_price = recent_df['high'].max()
+            recent_high_macd = self._get_value_at_date(recent_high_idx, macd_series)
+
+            if np.isnan(recent_high_macd):
+                logger.warning(f"  [监控模式] 最新高点{recent_high_idx.strftime('%Y-%m-%d')}的MACD值为空")
+                return divergences
+
+            recent_high_macd_str = f"{recent_high_macd:.4f}"
+            logger.info(f"  [监控模式] 买入信号后的最新高点: {recent_high_idx.strftime('%Y-%m-%d')} | 最高价={recent_high_price:.3f} | MACD={recent_high_macd_str}")
+
+            # 创建虚拟波峰B
+            virtual_peak_b = PeakInfo(
+                date=recent_high_idx,
+                price=recent_high_price,
+                prominence=0,
+                atr_value=0,
+                is_peak=True
+            )
+
+            # 【修改】从买入信号之前的峰点列表中找peak A（受min_distance限制）
+            # peaks列表已经通过PeakDetector检测，受min_distance限制
+            found_peak_a = None
+
+            # 从最近的峰点开始向更早遍历，找买入信号之前的峰点
+            for j in range(len(peaks) - 1, -1, -1):
+                peak_a = peaks[j]
+
+                # peak A必须在买入信号之前
+                if peak_a.date >= buy_signal_date:
+                    continue
+
+                # 获取peak A的MACD值
+                macd_a = self._get_value_at_date(peak_a.date, macd_series)
+
+                if np.isnan(macd_a):
+                    continue
+
+                # 检查条件1：价格创新高（peak B价格 > peak A价格）
+                if recent_high_price <= peak_a.price:
+                    continue
+
+                # 检查条件2：MACD减弱（peak B的MACD < peak A的MACD）
+                if recent_high_macd >= macd_a:
+                    continue
+
+                # 计算间隔天数
+                days_interval = (recent_high_idx - peak_a.date).days
+
+                # 检查间隔≤60天
+                if days_interval > self.MAX_DAYS_INTERVAL:
+                    continue
+
+                # 满足条件，记录peak A
+                found_peak_a = {
+                    'date': peak_a.date,
+                    'price': peak_a.price,
+                    'macd': macd_a
+                }
+                break  # 找到最近的满足条件的峰点A，退出
+
+            if found_peak_a:
+                days_interval = (recent_high_idx - found_peak_a['date']).days
+                retracement, min_date = self.calculate_retracement(
+                    PeakInfo(date=found_peak_a['date'], price=found_peak_a['price'], prominence=0, atr_value=0, is_peak=True),
+                    virtual_peak_b
+                )
+
+                if retracement <= self.MAX_RETRACEMENT:
+                    logger.info(f"  [监控模式-日线顶背离形成] {recent_high_idx.strftime('%Y-%m-%d')} | 高点A: {found_peak_a['date'].strftime('%Y-%m-%d')} 最高价={found_peak_a['price']:.3f} MACD={found_peak_a['macd']:.4f} | 高点B: 最高价={recent_high_price:.3f} MACD={recent_high_macd:.4f} | 间隔={days_interval}天 | 回调={retracement:.1%}")
+
+                    divergence = DivergenceSignal(
+                        date=recent_high_idx,
+                        divergence_type=DivergenceType.TOP,
+                        timeframe=TimeFrame.DAILY,
+                        peak_a_date=found_peak_a['date'],
+                        peak_a_price=found_peak_a['price'],
+                        peak_b_price=recent_high_price,
+                        peak_a_macd=found_peak_a['macd'],
+                        peak_b_macd=recent_high_macd,
+                        days_interval=days_interval,
+                        retracement_pct=retracement,
+                        is_confirmed=True,
+                        divergence_flag=1
+                    )
+                    divergences.append(divergence)
+
+            # 监控模式只需要这一个背离，直接返回
+            return divergences
+
+        # ==================== 标准模式（回测）：遍历所有峰点组合 ====================
+        # 记录监控模式已检测到的背离日期，避免重复
+        monitored_dates = set(d.date for d in divergences)
 
         # 从最新的峰点开始，向更早遍历寻找满足条件的参照峰点
         for i in range(len(peaks) - 1, 0, -1):
             peak_b = peaks[i]  # 当前峰点B
 
+            # 如果监控模式已检测到此峰点的背离，跳过
+            if peak_b.date in monitored_dates:
+                continue
+
             # 获取峰点B的MACD柱值和最高价（peak.price是最高价）
             macd_b = self._get_value_at_date(peak_b.date, macd_series)
             price_b = peak_b.price  # 最高价
             high_b = peak_b.price   # 最高价
-
-            # 检查B是否高于60日均线（使用最高价）
-            if not self.check_above_ma60(peak_b.date):
-                continue
 
             # 从最近向更早遍历，找第一个满足条件的A
             for j in range(i - 1, -1, -1):
@@ -404,18 +525,14 @@ class DivergenceDetector:
                 price_a = peak_a.price  # 最高价
                 high_a = peak_a.price    # 最高价
 
-                # 检查条件3：B最高价 > A最高价
+                # 检查条件3：B最高价 > A最高价（价格创新高）
                 if high_b <= high_a:
                     continue
 
-                # 检查条件4：B的MACD柱 < A的MACD柱（跳过NaN值）
+                # 检查条件4：B的MACD柱 < A的MACD柱（动能减弱）
                 if np.isnan(macd_a) or np.isnan(macd_b):
                     continue
                 if macd_b >= macd_a:
-                    continue
-
-                # 检查A是否高于60日均线（使用最高价）
-                if not self.check_above_ma60(peak_a.date):
                     continue
 
                 # 计算回调幅度（使用最低价计算回调）
@@ -543,7 +660,10 @@ class DivergenceDetector:
 
     def check_divergence_confirmation(self, divergences: List[DivergenceSignal]) -> List[DivergenceSignal]:
         """
-        检查背离是否已确认生效（5日均线跌破10日均线）
+        检查背离是否已确认生效
+
+        监控模式：背离已设置is_confirmed=True，直接加入确认列表（用户需求：不需要MA5/MA10确认）
+        回测模式：检查MA5/MA10确认条件
 
         Args:
             divergences: 背离信号列表
@@ -554,7 +674,15 @@ class DivergenceDetector:
         confirmed = []
 
         for div in divergences:
-            # 检查背离形成后的均线跌破
+            # 监控模式：背离已设置is_confirmed=True，直接加入确认列表
+            # 用户需求：顶背离形成时告警背离信息，MACD死叉时触发卖点
+            # 不需要MA5/MA10确认条件
+            if div.is_confirmed:
+                confirmed.append(div)
+                logger.info(f"[{div.timeframe.value}顶背离已形成] {div.date.strftime('%Y-%m-%d')} 背离已形成，待MACD死叉触发卖点")
+                continue
+
+            # 回测模式：检查背离形成后的均线跌破（MA5<MA10）
             # 从背离高点B之后开始检查
             check_start = div.date
 
@@ -594,15 +722,21 @@ class DivergenceDetector:
         except Exception:
             return 0.0
 
-    def detect_all_divergences(self) -> Dict[str, List[DivergenceSignal]]:
+    def detect_all_divergences(self, buy_signal_date: Optional[pd.Timestamp] = None) -> Dict[str, List[DivergenceSignal]]:
         """
         检测所有背离信号
+
+        Args:
+            buy_signal_date: 最近一次买入信号（SAR金叉）日期，用于监控模式确定peak B范围
+                            如果传入此参数，监控模式只判断买入信号后最新高点的顶背离
 
         Returns:
             包含各类背离信号的字典
         """
         logger.info("\n" + "=" * 60)
         logger.info("开始背离检测（按照背离判断.md逻辑）")
+        if buy_signal_date:
+            logger.info(f"监控模式：买入信号日期={buy_signal_date.strftime('%Y-%m-%d')}")
         logger.info("=" * 60)
 
         results = {
@@ -614,7 +748,7 @@ class DivergenceDetector:
 
         # 日线顶背离
         logger.info("\n--- 日线顶背离检测 ---")
-        daily_top = self.detect_daily_top_divergence()
+        daily_top = self.detect_daily_top_divergence(buy_signal_date)
         results['daily_top_formed'] = daily_top
 
         # 检查日线顶背离确认生效

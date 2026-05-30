@@ -337,8 +337,10 @@ class TradingStrategy:
             if current_weekly_div_flag == 1:
                 div_info = current_weekly_div_info or {}
                 divergence_date = div_info.get('date')
+                divergence_prev_high_date = div_info.get('prev_high_date')
                 divergence_prev_high = div_info.get('prev_high', 0.0)
-                reason = f"清仓信号 (sell_id=3-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议清仓"
+                prev_high_date_str = divergence_prev_high_date.strftime('%Y-%m-%d') if divergence_prev_high_date else 'N/A'
+                reason = f"清仓信号 (sell_id=3-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高点{prev_high_date_str}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议清仓"
                 return SellSignal(
                     flag=SellFlag.CLEAR_ALL,
                     reason=reason,
@@ -352,8 +354,10 @@ class TradingStrategy:
             if current_daily_div_flag == 1:
                 div_info = current_daily_div_info or {}
                 divergence_date = div_info.get('date')
+                divergence_prev_high_date = div_info.get('prev_high_date')
                 divergence_prev_high = div_info.get('prev_high', 0.0)
-                reason = f"卖出信号 (sell_id=3-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
+                prev_high_date_str = divergence_prev_high_date.strftime('%Y-%m-%d') if divergence_prev_high_date else 'N/A'
+                reason = f"卖出信号 (sell_id=3-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高点{prev_high_date_str}, {trigger_name}触发, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
                 return SellSignal(
                     flag=SellFlag.SELL_ONE_THIRD,
                     reason=reason,
@@ -542,8 +546,10 @@ class TradingStrategy:
             sell_flag = SellFlag.CLEAR_ALL
             div_info = current_weekly_div_info or {}
             divergence_date = div_info.get('date')
+            divergence_prev_high_date = div_info.get('prev_high_date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
-            reason = f"清仓信号 (sell_id={sell_id}-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议清仓"
+            prev_high_date_str = divergence_prev_high_date.strftime('%Y-%m-%d') if divergence_prev_high_date else 'N/A'
+            reason = f"清仓信号 (sell_id={sell_id}-周线顶背离): 周线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高点{prev_high_date_str}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议清仓"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
@@ -588,8 +594,10 @@ class TradingStrategy:
             sell_flag = SellFlag.SELL_ONE_THIRD
             div_info = current_daily_div_info or {}
             divergence_date = div_info.get('date')
+            divergence_prev_high_date = div_info.get('prev_high_date')
             divergence_prev_high = div_info.get('prev_high', 0.0)
-            reason = f"卖出信号 (sell_id={sell_id}-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
+            prev_high_date_str = divergence_prev_high_date.strftime('%Y-%m-%d') if divergence_prev_high_date else 'N/A'
+            reason = f"卖出信号 (sell_id={sell_id}-日线顶背离): 日线顶背离形成于 {divergence_date.strftime('%Y-%m-%d') if divergence_date else 'N/A'}, 前高点{prev_high_date_str}, {trigger_name}触发生效, 前高={divergence_prev_high:.3f}, 建议卖出1/3"
             return SellSignal(
                 flag=sell_flag,
                 reason=reason,
