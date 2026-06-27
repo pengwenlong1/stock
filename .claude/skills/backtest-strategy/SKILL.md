@@ -64,6 +64,196 @@ description: |
 | sell_id=7 | 上证指数MACD日线死叉 | 以指数死叉为准 |
 | sell_id=8 | 创业板指数MACD日线死叉 | 以指数死叉为准 |
 | sell_id=9 | 科创板指数MACD日线死叉 | 以指数死叉为准 |
+| sell_id=10-15 | 个股顶背离 + 指数环境共振 | 详见下方规则 |
+
+### sell_id=10-15 个股顶背离 + 指数环境共振规则
+
+**核心逻辑**：当个股形成顶背离时，根据个股和指数的MACD状态决定卖出触发时机。
+
+#### 触发场景矩阵
+
+| 场景 | 个股状态 | 指数状态 | 触发条件 | 说明 |
+|-----|---------|---------|---------|------|
+| **(1)** | 个股顶背离 + 个股已处于死叉 | 不限 | **立即卖出** | 个股自身确认顶背离，无需等待指数 |
+| **(2)** | 个股顶背离 + 个股未死叉 | 指数已处于死叉 | **等待个股死叉 或 指数重新死叉** | 指数环境恶化，若指数再次出现死叉也触发 |
+| **(3)** | 个股顶背离 + 个股未死叉 | 指数未死叉 | **等待个股或指数死叉** | 双方都未确认，等待任意确认 |
+
+#### 代码实现逻辑
+
+```python
+# sell_id=10: 个股顶背离 + 上证指数环境
+stock_top_divergence = state.daily_divergence_flag > 0  # 个股顶背离是否形成
+
+if stock_top_divergence:
+    if macd_dead_cross_state:  # 个股已处于死叉状态
+        # (1) 个股顶背离 + 个股已处于死叉 → 直接触发
+        trigger_condition = True
+        trigger_name = "个股顶背离+个股已处于死叉状态"
+    elif sh_index_dead_cross_state:  # 指数已处于死叉状态，个股未死叉
+        # (2) 个股顶背离 + 指数已处于死叉 → 等待个股死叉 或 指数重新死叉
+        trigger_condition = macd_cross_down or sh_index_macd_cross_down
+        trigger_name = "个股顶背离+上证指数已处于死叉状态，等待个股死叉或指数重新死叉"
+    else:  # 指数未死叉，个股未死叉
+        # (3) 个股顶背离 + 双方都未死叉 → 等待任意一方死叉
+        trigger_condition = macd_cross_down or sh_index_macd_cross_down
+        trigger_name = "个股顶背离，等待个股或上证指数死叉"
+else:
+    trigger_condition = False  # 无个股顶背离，不触发
+```
+
+#### sell_id=10-15 对应指数
+
+| sell_id | 对应指数 | 检测方法 |
+|---------|---------|---------|
+| sell_id=10 | 上证指数 (SHSE.000001) | `sh_index_dead_cross_state` |
+| sell_id=11 | 创业板指数 (SZSE.399006) | `cyb_index_dead_cross_state` |
+| sell_id=12 | 科创板指数 (SHSE.000680) | `kc_index_dead_cross_state` |
+| sell_id=13 | 上证50指数 (SHSE.000016) | `sh50_index_dead_cross_state` |
+| sell_id=14 | 创业板50指数 (SZSE.399673) | `cyb50_index_dead_cross_state` |
+| sell_id=15 | 科创板50指数 (SHSE.000688) | `kc50_index_dead_cross_state` |
+
+#### 关键参数说明
+
+| 参数 | 含义 | 检测方式 |
+|-----|------|---------|
+| `macd_dead_cross_state` | 个股MACD是否已处于死叉状态 | `DIF < DEA` |
+| `sh_index_dead_cross_state` | 上证指数是否已处于死叉状态 | `指数MACD柱 < 0` |
+| `macd_cross_down` | 当天新发生个股MACD死叉 | `DIF下穿DEA` |
+| `sh_index_macd_cross_down` | 当天新发生上证指数MACD死叉 | `指数DIF下穿DEA` |
+
+#### 日志示例
+
+```
+# 场景(1): 个股顶背离 + 个股已处于死叉 → 直接卖出
+[2025-03-20] 日线顶背离形成
+[2025-03-20] 个股MACD已处于死叉状态: DIF=-2.5 < DEA=-1.8
+[2025-03-20] 卖出信号触发: 个股顶背离+个股已处于死叉状态
+
+# 场景(2): 个股顶背离 + 指数已处于死叉 → 等待个股死叉
+[2025-03-20] 日线顶背离形成
+[2025-03-20] 上证指数MACD已处于死叉状态: MACD柱=-6.0 < 0
+[2025-03-20] 等待个股死叉触发卖出
+[2025-03-25] 个股MACD死叉触发: DIF下穿DEA
+[2025-03-25] 卖出信号触发: 个股顶背离+上证指数已处于死叉状态
+
+# 场景(3): 个股顶背离 + 双方未死叉 → 等待任意死叉
+[2025-03-20] 日线顶背离形成
+[2025-03-20] 个股未处于死叉状态，指数未处于死叉状态
+[2025-03-20] 等待个股或上证指数死叉触发卖出
+[2025-03-22] 上证指数MACD死叉触发
+[2025-03-22] 卖出信号触发: 个股顶背离，上证指数死叉确认
+```
+
+### 顶背离形成时指数已处于死叉状态的直接卖出规则
+
+**核心规则**：当顶背离形成时，如果对应的指数已经处于死叉状态（MACD死叉或SAR死叉），则直接触发卖出，无需等待新的死叉信号。
+
+#### 触发条件
+
+| 背离类型 | 死叉状态检查 | 卖出比例 |
+|---------|-------------|---------|
+| **周线顶背离** | 指数MACD柱 < 0（DIF < DEA）或 SAR > Close | **清仓（卖出全部）** |
+| **日线顶背离** | 指数MACD柱 < 0（DIF < DEA）或 SAR > Close | **卖出1/3** |
+
+#### 适用范围
+
+- **sell_id=10,11,12**：个股周线顶背离 + 指数（上证/创业板/科创板）MACD死叉
+- **sell_id=13,14,15**：个股周线顶背离 + 新指数（上证50/创业板50/科创板50）MACD死叉
+- **sell_id=4,5,6**：个股日线顶背离 + 指数背离（同样适用直接卖出规则）
+
+#### 代码实现逻辑
+
+```python
+# 周线顶背离形成时检查指数是否已处于死叉状态
+if weekly_top_div and self.state.weekly_divergence_flag == 0:
+    # 设置背离标志
+    self.state.weekly_divergence_flag = 1
+    self.logger.info(f"周线顶背离形成，等待死叉触发生效")
+
+    # 【关键规则】检查指数是否已经是死叉状态
+    immediate_sell = False
+
+    # 检查MACD死叉状态（MACD柱 < 0 表示 DIF < DEA）
+    if self._is_index_macd_dead_cross_state(date, index_type):
+        immediate_sell = True
+        self.logger.info(f"指数MACD已处于死叉状态，直接触发卖出")
+
+    # 检查SAR死叉状态（SAR > Close）
+    elif self._is_index_sar_dead_cross_state(date, index_type):
+        immediate_sell = True
+        self.logger.info(f"指数SAR已处于死叉状态，直接触发卖出")
+
+    # 如果需要立即卖出，执行清仓
+    if immediate_sell and self._shares > 0:
+        sell_signal = SellSignal(
+            flag=SellFlag.CLEAR_ALL,  # 周线顶背离清仓
+            reason=f"清仓信号: 周线顶背离形成，指数已处于死叉状态"
+        )
+        self._execute_sell(date, sell_signal)
+```
+
+#### 日志示例
+
+```
+[2025-03-20] 日线顶背离形成，等待死叉触发生效
+[2025-03-20] 创业板指数MACD已处于死叉状态: MACD柱=-6.0169 < 0
+[2025-03-20] 创业板指数MACD已处于死叉状态，直接触发卖出
+[2025-03-20] 卖出: 260股 @ 131.760 | 卖出信号 (sell_id=11): 日线顶背离形成于 2025-03-20, 创业板指数MACD已处于死叉状态，卖出比例1/3
+```
+
+#### 为什么需要这个规则
+
+正常流程：顶背离形成 → 设置标志 → 等待指数死叉 → 触发卖出
+
+问题场景：顶背离形成时，指数可能已经处于死叉状态（之前已经死叉了），此时如果等待"新的死叉"，会导致：
+1. 卖出时机延迟，错过最佳卖点
+2. 背离信号可能长期等待，无法及时生效
+
+解决方案：顶背离形成当天，检查指数是否已处于死叉状态，如果是则直接卖出。
+
+### 顶背离与RSI峰值间隔校验规则（sell_id=10-15专用）
+
+**核心规则**：指数顶背离形成日期与个股周线RSI峰值日期之间的间隔不得超过5个工作日，否则顶背离失效。
+
+#### 规则说明
+
+在sell_id=10-15策略中，当检测到指数顶背离时，需要校验：
+- 指数顶背离形成日期（`index_div_date`）
+- 个股周线RSI峰值日期（`rsi_peak_date`）
+- 两日期间隔工作日数 ≤ 5天
+
+如果间隔超过5个工作日，则：
+- 指数顶背离信号失效
+- 不触发卖出（跳过该背离检查）
+- 继续检查其他卖出条件（如周线顶背离）
+
+#### 为什么需要这个规则
+
+问题场景：指数顶背离形成于12月10日，但个股RSI峰值出现在12月26日（相距16天），两者时间关联性弱：
+1. 指数背离已过时效，个股RSI峰值是后续行情产生
+2. 背离信号与个股状态脱节，卖出信号不准确
+
+解决方案：校验日期间隔，确保背离信号与个股状态时间上匹配。
+
+#### 代码实现
+
+```python
+# 校验：指数顶背离与个股RSI峰值间隔不超过5个工作日
+days_diff = count_trading_days(index_div_date, rsi_peak_date)
+if days_diff > MAX_DIVERGENCE_RSI_PEAK_DAYS:
+    logger.debug(f"指数顶背离({index_div_date})与个股RSI峰值({rsi_peak_date})间隔{days_diff}个工作日，超过5天，顶背离失效")
+    # 跳过该背离检查，不触发卖出
+else:
+    # 继续检查RSI阈值触发卖出
+    if weekly_rsi >= 80:
+        return SellSignal(...)
+```
+
+#### 常量定义
+
+```python
+MAX_DIVERGENCE_RSI_PEAK_DAYS = 5  # 指数顶背离与个股RSI峰值最大间隔（工作日）
+```
 
 ## 三、杜绝未来函数（Look-ahead Bias）
 

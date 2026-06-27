@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import logging
+import multiprocessing
 import os
 import sys
 import time
@@ -85,6 +86,9 @@ INDEX_KC = 'SHSE.000680'    # 科创综指
 INDEX_BJ = 'BJSE.899050'    # 北证板块
 INDEX_HS_TECH = 'SHSE.513180'  # 恒生科技ETF（替代港股恒生科技）
 INDEX_HS_INDEX = 'SZSE.159920'  # 恒生指数ETF（替代港股恒生指数）
+INDEX_SH50 = 'SHSE.000016'   # 上证50指数
+INDEX_CYB50 = 'SZSE.399673'  # 创业板50指数
+INDEX_KC50 = 'SHSE.000688'   # 科创板50指数
 
 # 预热天数（用于指标计算）
 # 【重要】月线RSI计算需要足够长的历史数据让EMA状态稳定
@@ -101,6 +105,22 @@ RECENT_TRADING_DAYS = 2
 # RSI历史高点回溯天数（用于检测曾经触发RSI高点但当前RSI已降低的情况）
 # 延长回溯天数以覆盖更多历史高点
 RSI_HIGH_LOOKBACK_DAYS = 30
+
+
+# ==================== 配置加载 ====================
+
+def load_process_config() -> dict:
+    """
+    从process_config.json读取配置
+
+    Returns:
+        配置字典，包含max_workers_monitor等参数
+    """
+    config_path = os.path.join(project_root, 'config', 'process_config.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"max_workers_backtest": 4, "max_workers_monitor": 4}
 
 
 # ==================== 数据结构 ====================
@@ -365,7 +385,9 @@ class DailyMonitor:
     def __init__(self,
                  config_path: Optional[str] = None,
                  settings_path: Optional[str] = None,
-                 output_dir: Optional[str] = None) -> None:
+                 output_dir: Optional[str] = None,
+                 max_workers: Optional[int] = None,
+                 use_multiprocessing: bool = True) -> None:
         """
         初始化监控器
 
@@ -373,6 +395,8 @@ class DailyMonitor:
             config_path: 股票配置文件路径（默认为 config/stocks_monitor_by_day.csv）
             settings_path: 设置文件路径（默认为 config/settings.json）
             output_dir: 输出目录路径
+            max_workers: 最大并行进程数（None则从配置文件读取）
+            use_multiprocessing: 是否使用多进程（True则用multiprocessing.Pool）
         """
         # 配置文件路径
         if config_path is None:
@@ -389,6 +413,14 @@ class DailyMonitor:
         self.output_dir = output_dir
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+
+        # 多进程配置
+        self.use_multiprocessing = use_multiprocessing
+        if max_workers is None:
+            process_config = load_process_config()
+            self.max_workers = process_config.get('max_workers_monitor', 4)
+        else:
+            self.max_workers = max_workers
 
         # 初始化掘金token和钉钉配置
         self._init_settings()
@@ -420,24 +452,34 @@ class DailyMonitor:
             self.dingtalk = None
 
     def _setup_logging(self) -> None:
-        """配置日志"""
+        """配置日志（使用命名logger避免混淆）"""
         timestamp = datetime.now().strftime('%Y%m%d')
         log_file = os.path.join(self.output_dir, f'monitor_{timestamp}.log')
 
-        # 清除已有handlers
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
+        # 创建专用logger（不使用根logger）
+        self.logger = logging.getLogger('daily_monitor')
 
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.FileHandler(log_file, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        # 清除该logger已有的handlers
+        self.logger.handlers.clear()
+
+        # 设置日志级别
+        self.logger.setLevel(logging.INFO)
+
+        # 添加文件handler
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        self.logger.addHandler(file_handler)
+
+        # 添加控制台handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        self.logger.addHandler(console_handler)
+
+        # 不传播到根logger
+        self.logger.propagate = False
+
         self.log_file = log_file
 
     def _get_stock_name(self, symbol: str) -> str:
@@ -535,6 +577,50 @@ class DailyMonitor:
                 current = current - pd.Timedelta(days=1)
             return dates
 
+    def _save_csv_with_comments(self, df: pd.DataFrame, comment_lines: List[Tuple[int, str]],
+                                  original_lines: List[str]) -> None:
+        """
+        保存CSV文件，保留原有的注释行和空行
+
+        Args:
+            df: 更新后的DataFrame
+            comment_lines: 原始文件中的注释行列表，格式为 [(行号, 行内容)]
+            original_lines: 原始文件的所有行内容
+        """
+        # 将DataFrame转换为CSV字符串，过滤掉空行
+        csv_content = df.to_csv(index=False, encoding='utf-8')
+        new_lines = [line for line in csv_content.split('\n') if line.strip()]
+
+        # 构建最终输出
+        output_lines = []
+
+        # 新CSV的第0行是header
+        new_header = new_lines[0] if len(new_lines) > 0 else ''
+        output_lines.append(new_header)
+
+        # DataFrame数据行从索引1开始
+        new_data_idx = 1
+
+        # 遍历原始文件从第1行开始（索引0是header，已处理）
+        for orig_idx, orig_line in enumerate(original_lines[1:], start=1):
+            stripped_line = orig_line.strip()
+
+            # 检查是否为注释行
+            if stripped_line.startswith('#'):
+                # 保留注释行
+                output_lines.append(stripped_line)
+            # 跳过空行，不保留
+            elif stripped_line == '':
+                continue
+            # 否则是数据行，用新数据替换
+            elif new_data_idx < len(new_lines):
+                output_lines.append(new_lines[new_data_idx])
+                new_data_idx += 1
+
+        # 写入文件（使用Unix换行符，避免Windows产生额外空行）
+        with open(self.config_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('\n'.join(output_lines) + '\n')
+
     def load_stock_config(self) -> List[StockConfig]:
         """
         加载股票配置（从 stocks_monitor_by_day.csv）
@@ -548,7 +634,17 @@ class DailyMonitor:
             self.logger.error(f"配置文件不存在: {self.config_path}")
             return []
 
-        df = pd.read_csv(self.config_path, dtype={'symbol': str})
+        # 先读取原始文件内容，保存注释行
+        with open(self.config_path, 'r', encoding='utf-8') as f:
+            original_lines = f.readlines()
+
+        # 提取注释行及其行号
+        comment_lines = []
+        for i, line in enumerate(original_lines):
+            if line.strip().startswith('#'):
+                comment_lines.append((i, line))
+
+        df = pd.read_csv(self.config_path, dtype={'symbol': str}, comment='#')
 
         # 确保 name 列存在
         if 'name' not in df.columns:
@@ -567,9 +663,9 @@ class DailyMonitor:
                     self.logger.info(f"自动填充股票名称: {ticker} -> {stock_name}")
                     needs_update = True
 
-        # 如果有更新，保存回CSV文件
+        # 如果有更新，保存回CSV文件（保留注释行）
         if needs_update:
-            df.to_csv(self.config_path, index=False, encoding='utf-8')
+            self._save_csv_with_comments(df, comment_lines, original_lines)
             self.logger.info(f"已更新股票名称到CSV文件: {self.config_path}")
 
         stocks = []
@@ -1344,6 +1440,50 @@ class DailyMonitor:
         self.logger.info(f"  科创板指数日线顶背离生效: {len(kc_index_daily_divergences)} 个")
         self.logger.info(f"  科创板指数周线顶背离生效: {len(kc_index_weekly_divergences)} 个")
 
+        # 【新增】新指数背离检测器（用于 sell_id=13,14,15）
+        sh50_index_daily_divergences = []
+        sh50_index_weekly_divergences = []
+        cyb50_index_daily_divergences = []
+        cyb50_index_weekly_divergences = []
+        kc50_index_daily_divergences = []
+        kc50_index_weekly_divergences = []
+
+        # 上证50指数背离检测器
+        try:
+            sh50_div_detector = DivergenceDetector()
+            sh50_div_detector.prepare_data(INDEX_SH50, warmup_start, end_date)
+            sh50_all_div = sh50_div_detector.detect_all_divergences()
+            sh50_index_daily_divergences = sh50_all_div.get('daily_top_confirmed', [])
+            sh50_index_weekly_divergences = sh50_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  上证50指数日线顶背离生效: {len(sh50_index_daily_divergences)} 个")
+            self.logger.info(f"  上证50指数周线顶背离生效: {len(sh50_index_weekly_divergences)} 个")
+        except Exception as e:
+            self.logger.warning(f"  上证50指数背离检测失败: {e}")
+
+        # 创业板50指数背离检测器
+        try:
+            cyb50_div_detector = DivergenceDetector()
+            cyb50_div_detector.prepare_data(INDEX_CYB50, warmup_start, end_date)
+            cyb50_all_div = cyb50_div_detector.detect_all_divergences()
+            cyb50_index_daily_divergences = cyb50_all_div.get('daily_top_confirmed', [])
+            cyb50_index_weekly_divergences = cyb50_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  创业板50指数日线顶背离生效: {len(cyb50_index_daily_divergences)} 个")
+            self.logger.info(f"  创业板50指数周线顶背离生效: {len(cyb50_index_weekly_divergences)} 个")
+        except Exception as e:
+            self.logger.warning(f"  创业板50指数背离检测失败: {e}")
+
+        # 科创板50指数背离检测器
+        try:
+            kc50_div_detector = DivergenceDetector()
+            kc50_div_detector.prepare_data(INDEX_KC50, warmup_start, end_date)
+            kc50_all_div = kc50_div_detector.detect_all_divergences()
+            kc50_index_daily_divergences = kc50_all_div.get('daily_top_confirmed', [])
+            kc50_index_weekly_divergences = kc50_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  科创板50指数日线顶背离生效: {len(kc50_index_daily_divergences)} 个")
+            self.logger.info(f"  科创板50指数周线顶背离生效: {len(kc50_index_weekly_divergences)} 个")
+        except Exception as e:
+            self.logger.warning(f"  科创板50指数背离检测失败: {e}")
+
         # 恒生科技ETF背离检测器
         hs_tech_daily_divergences = []
         hs_tech_weekly_divergences = []
@@ -1652,8 +1792,8 @@ class DailyMonitor:
                 if has_weekly_div and weekly_div_info is not None:
                     strategy.set_weekly_divergence(state, weekly_div_info)
 
-                # 【新增】设置指数背离状态（用于 sell_id=4,5,6）
-                if any(sid in [4, 5, 6] for sid in stock_config.judge_sell_ids):
+                # 【新增】设置指数背离状态（用于 sell_id=4,5,6,10,11,12）
+                if any(sid in [4, 5, 6, 10, 11, 12] for sid in stock_config.judge_sell_ids):
                     # 检查上证指数背离（用于 sell_id=4）
                     for div in sh_index_daily_divergences:
                         if div.confirmation_date is not None:
@@ -1744,6 +1884,98 @@ class DailyMonitor:
                                 self.logger.info(f"    科创板指数周线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
                                 break
 
+                # 【新增】设置新指数背离状态（用于 sell_id=13,14,15）
+                if any(sid in [13, 14, 15] for sid in stock_config.judge_sell_ids):
+                    # 检查上证50指数背离（用于 sell_id=13）
+                    for div in sh50_index_daily_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                sh50_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_sh50_index_divergence(state, daily_info=sh50_daily_div_info)
+                                self.logger.info(f"    上证50指数日线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in sh50_index_weekly_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                sh50_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_sh50_index_divergence(state, weekly_info=sh50_weekly_div_info)
+                                self.logger.info(f"    上证50指数周线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+
+                    # 检查创业板50指数背离（用于 sell_id=14）
+                    for div in cyb50_index_daily_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                cyb50_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_cyb50_index_divergence(state, daily_info=cyb50_daily_div_info)
+                                self.logger.info(f"    创业板50指数日线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in cyb50_index_weekly_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                cyb50_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_cyb50_index_divergence(state, weekly_info=cyb50_weekly_div_info)
+                                self.logger.info(f"    创业板50指数周线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+
+                    # 检查科创板50指数背离（用于 sell_id=15）
+                    for div in kc50_index_daily_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                kc50_daily_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_kc50_index_divergence(state, daily_info=kc50_daily_div_info)
+                                self.logger.info(f"    科创板50指数日线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+                    for div in kc50_index_weekly_divergences:
+                        if div.confirmation_date is not None:
+                            if search_start <= div.confirmation_date <= search_end:
+                                kc50_weekly_div_info = {
+                                    'date': div.date,
+                                    'prev_high_date': div.peak_a_date,
+                                    'prev_high': div.peak_a_price,
+                                    'curr_high': div.peak_b_price,
+                                    'prev_macd': div.peak_a_macd,
+                                    'curr_macd': div.peak_b_macd
+                                }
+                                strategy.set_kc50_index_divergence(state, weekly_info=kc50_weekly_div_info)
+                                self.logger.info(f"    科创板50指数周线顶背离生效: 背离形成于{div.date.strftime('%Y-%m-%d')}")
+                                break
+
                 # 获取指数RSI
                 index_rsi_cyb = self.get_index_rsi_at_date(INDEX_CYB, current_cross_down_date.strftime('%Y-%m-%d'))
                 index_rsi_sh = self.get_index_rsi_at_date(INDEX_SH, current_cross_down_date.strftime('%Y-%m-%d'))
@@ -1751,6 +1983,9 @@ class DailyMonitor:
                 index_rsi_bj = self.get_index_rsi_at_date(INDEX_BJ, current_cross_down_date.strftime('%Y-%m-%d'))
                 index_rsi_hsTech = self.get_index_rsi_at_date(INDEX_HS_TECH, current_cross_down_date.strftime('%Y-%m-%d'))
                 index_rsi_hsIndex = self.get_index_rsi_at_date(INDEX_HS_INDEX, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_sh50 = self.get_index_rsi_at_date(INDEX_SH50, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_cyb50 = self.get_index_rsi_at_date(INDEX_CYB50, current_cross_down_date.strftime('%Y-%m-%d'))
+                index_rsi_kc50 = self.get_index_rsi_at_date(INDEX_KC50, current_cross_down_date.strftime('%Y-%m-%d'))
 
                 # 获取当前日期在DataFrame中的索引位置（用于获取月线RSI）
                 current_idx = df.index.get_loc(current_cross_down_date) if current_cross_down_date in df.index else -1
@@ -1834,14 +2069,55 @@ class DailyMonitor:
                         trigger_macd = trigger_index_macd  # 使用指数MACD作为触发条件
                         if trigger_index_macd:
                             self.logger.info(f"    {trigger_name}触发")
+                    elif sell_id in [10, 11, 12]:
+                        # sell_id=10,11,12: 指数MACD日线死叉触发 + （个股背离或指数背离+个股RSI）
+                        # 检测对应指数的MACD死叉
+                        if sell_id == 10:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_SH, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "上证指数MACD跌破死叉"
+                        elif sell_id == 11:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_CYB, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "创业板指数MACD跌破死叉"
+                        elif sell_id == 12:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_KC, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "科创板指数MACD跌破死叉"
+                        else:
+                            trigger_index_macd = False
+                            trigger_name = "未知指数MACD"
+                        trigger_sar = False
+                        trigger_macd = trigger_index_macd  # 使用指数MACD作为触发条件
+                        if trigger_index_macd:
+                            self.logger.info(f"    {trigger_name}触发")
+                    elif sell_id in [13, 14, 15]:
+                        # sell_id=13,14,15: 新指数MACD日线死叉触发 + （个股背离或指数背离+个股RSI）
+                        # 检测对应指数的MACD死叉
+                        if sell_id == 13:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_SH50, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "上证50指数MACD跌破死叉"
+                        elif sell_id == 14:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_CYB50, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "创业板50指数MACD跌破死叉"
+                        elif sell_id == 15:
+                            trigger_index_macd = self.detect_index_macd_cross_down(INDEX_KC50, current_cross_down_date.strftime('%Y-%m-%d'))
+                            trigger_name = "科创板50指数MACD跌破死叉"
+                        else:
+                            trigger_index_macd = False
+                            trigger_name = "未知指数MACD"
+                        trigger_sar = False
+                        trigger_macd = trigger_index_macd  # 使用指数MACD作为触发条件
+                        if trigger_index_macd:
+                            self.logger.info(f"    {trigger_name}触发")
                     else:
                         # 未知的sell_id，跳过
                         continue
 
                     # 计算指数MACD触发状态（用于传递给check_sell_signal）
-                    sh_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_SH, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [7] else False
-                    cyb_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_CYB, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [8] else False
-                    kc_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_KC, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [9] else False
+                    sh_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_SH, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [7, 10] else False
+                    cyb_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_CYB, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [8, 11] else False
+                    kc_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_KC, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [9, 12] else False
+                    sh50_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_SH50, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [13] else False
+                    cyb50_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_CYB50, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [14] else False
+                    kc50_index_macd_cross_down = self.detect_index_macd_cross_down(INDEX_KC50, current_cross_down_date.strftime('%Y-%m-%d')) if sell_id in [15] else False
 
                     # 调用check_sell_signal检测卖出信号
                     sell_signal_obj = strategy.check_sell_signal(
@@ -1855,7 +2131,10 @@ class DailyMonitor:
                         sell_id=sell_id,
                         sh_index_macd_cross_down=sh_index_macd_cross_down,
                         cyb_index_macd_cross_down=cyb_index_macd_cross_down,
-                        kc_index_macd_cross_down=kc_index_macd_cross_down
+                        kc_index_macd_cross_down=kc_index_macd_cross_down,
+                        sh50_index_macd_cross_down=sh50_index_macd_cross_down,
+                        cyb50_index_macd_cross_down=cyb50_index_macd_cross_down,
+                        kc50_index_macd_cross_down=kc50_index_macd_cross_down
                     )
                     if sell_signal_obj is not None:
                         break  # 找到一个卖出信号就停止
@@ -2749,13 +3028,36 @@ class DailyMonitor:
                     if (last_sar_cross_up_date is None or div_date >= last_sar_cross_up_date) and latest_sar_trend == '多头':
                         peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div, 'peak_a_date') and div.peak_a_date else 'N/A'
                         peak_a_price_str = f"{div.peak_a_price:.3f}" if hasattr(div, 'peak_a_price') and div.peak_a_price else 'N/A'
+
+                        # 【修复】根据sell_id确定等待条件
+                        # sell_id=1-3: 只等待个股死叉
+                        # sell_id=10: 等待个股或上证指数死叉
+                        # sell_id=11: 等待个股或创业板指数死叉
+                        # sell_id=12: 等待个股或科创板指数死叉
+                        # sell_id=13: 等待个股或上证50指数死叉
+                        # sell_id=14: 等待个股或创业板50指数死叉
+                        # sell_id=15: 等待个股或科创板50指数死叉
+                        wait_condition = "等待个股SAR死叉"
+                        if any(sid in [10] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或上证指数SAR/MACD死叉"
+                        elif any(sid in [11] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或创业板指数SAR/MACD死叉"
+                        elif any(sid in [12] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或科创板指数SAR/MACD死叉"
+                        elif any(sid in [13] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或上证50指数SAR/MACD死叉"
+                        elif any(sid in [14] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或创业板50指数SAR/MACD死叉"
+                        elif any(sid in [15] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或科创板50指数SAR/MACD死叉"
+
                         pending_warnings.append({
                             'type': '周线顶背离',
-                            'detail': f"周线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), 等待SAR死叉触发清仓",
+                            'detail': f"周线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), {wait_condition}触发清仓",
                             'severity': 'HIGH',
                             'divergence_date': div.date
                         })
-                        self.logger.warning(f"  [待触发告警] 周线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，等待SAR死叉触发清仓")
+                        self.logger.warning(f"  [待触发告警] 周线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，{wait_condition}触发清仓")
 
         # 检查周线RSI已达警戒级别但还没有SAR死叉
         # 只有 sell_id=1 或 2 才检查RSI阈值（sell_id=3不含RSI阶梯）
@@ -2806,18 +3108,41 @@ class DailyMonitor:
                     if (last_sar_cross_up_date is None or div_date >= last_sar_cross_up_date) and latest_sar_trend == '多头':
                         peak_a_date_str = div.peak_a_date.strftime('%Y-%m-%d') if hasattr(div, 'peak_a_date') and div.peak_a_date else 'N/A'
                         peak_a_price_str = f"{div.peak_a_price:.3f}" if hasattr(div, 'peak_a_price') and div.peak_a_price else 'N/A'
+
+                        # 【修复】根据sell_id确定等待条件
+                        # sell_id=1-3: 只等待个股死叉
+                        # sell_id=10: 等待个股或上证指数死叉
+                        # sell_id=11: 等待个股或创业板指数死叉
+                        # sell_id=12: 等待个股或科创板指数死叉
+                        # sell_id=13: 等待个股或上证50指数死叉
+                        # sell_id=14: 等待个股或创业板50指数死叉
+                        # sell_id=15: 等待个股或科创板50指数死叉
+                        wait_condition = "等待个股SAR死叉"
+                        if any(sid in [10] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或上证指数SAR/MACD死叉"
+                        elif any(sid in [11] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或创业板指数SAR/MACD死叉"
+                        elif any(sid in [12] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或科创板指数SAR/MACD死叉"
+                        elif any(sid in [13] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或上证50指数SAR/MACD死叉"
+                        elif any(sid in [14] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或创业板50指数SAR/MACD死叉"
+                        elif any(sid in [15] for sid in stock_config.judge_sell_ids):
+                            wait_condition = "等待个股或科创板50指数SAR/MACD死叉"
+
                         pending_warnings.append({
                             'type': '日线顶背离',
-                            'detail': f"日线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), 等待SAR死叉触发卖出1/3",
+                            'detail': f"日线顶背离形成于{div.date.strftime('%Y-%m-%d')}, 前高点{peak_a_date_str}({peak_a_price_str}), {wait_condition}触发卖出1/3",
                             'severity': 'LOW',
                             'divergence_date': div.date
                         })
-                        self.logger.info(f"  [待触发提示] 日线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，等待SAR死叉触发卖出1/3")
+                        self.logger.info(f"  [待触发提示] 日线顶背离已形成({div.date.strftime('%Y-%m-%d')})，前高点{peak_a_date_str}({peak_a_price_str})，{wait_condition}触发卖出1/3")
 
         # ==================== 指数顶背离告警 ====================
-        # 显示最近一个月（30天）内形成的顶背离，日线和周线合并显示
+        # 显示最近10个交易日（约2周）内形成的顶背离，日线和周线合并显示
         index_divergence_warnings = []
-        recent_days = 30  # 最近30天（一个月）
+        recent_days = 10  # 最近10个交易日
         end_date_ts = pd.Timestamp(end_date)
 
         # 收集最近一个月内形成的指数顶背离
@@ -3057,13 +3382,25 @@ class DailyMonitor:
 
     def run_monitor(self) -> List[MonitorResult]:
         """
-        执行监控
+        执行监控（根据配置选择多进程或顺序执行）
+
+        Returns:
+            List[MonitorResult]: 监控结果列表
+        """
+        if self.use_multiprocessing:
+            return self._run_monitor_multiprocess()
+        else:
+            return self._run_monitor_sequential()
+
+    def _run_monitor_sequential(self) -> List[MonitorResult]:
+        """
+        顺序执行监控
 
         Returns:
             List[MonitorResult]: 监控结果列表
         """
         self.logger.info("=" * 80)
-        self.logger.info("日内监控启动")
+        self.logger.info("日内监控启动（顺序模式）")
         self.logger.info(f"监控时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"监控范围: 最近 {RECENT_TRADING_DAYS} 个交易日")
         self.logger.info("=" * 80)
@@ -3085,6 +3422,65 @@ class DailyMonitor:
             result = self.monitor_single_stock(stock_config, today)
             if result is not None:
                 results.append(result)
+
+        # 输出监控报告
+        self._output_report(results)
+
+        # 发送钉钉告警
+        self._send_dingtalk_alert(results)
+
+        return results
+
+    def _run_monitor_multiprocess(self) -> List[MonitorResult]:
+        """
+        使用多进程并行执行监控
+
+        Returns:
+            List[MonitorResult]: 监控结果列表
+        """
+        self.logger.info("=" * 80)
+        self.logger.info("日内监控启动（多进程模式）")
+        self.logger.info(f"监控时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"监控范围: 最近 {RECENT_TRADING_DAYS} 个交易日")
+        self.logger.info(f"并行进程数: {self.max_workers}")
+        self.logger.info("=" * 80)
+
+        # 加载股票配置
+        stocks = self.load_stock_config()
+        if len(stocks) == 0:
+            self.logger.error("无活跃股票配置")
+            return []
+
+        # 获取当前日期
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 将股票配置转换为字典（便于pickle）
+        stock_dicts = [
+            {
+                'symbol': s.symbol,
+                'stock_name': s.stock_name,
+                'start_date': s.start_date,
+                'end_date': s.end_date,
+                'judge_buy_ids': s.judge_buy_ids,
+                'judge_t_ids': s.judge_t_ids,
+                'judge_sell_ids': s.judge_sell_ids,
+                'initial_capital': s.initial_capital,
+                'active': s.active
+            }
+            for s in stocks
+        ]
+
+        results = []
+
+        # 使用多进程池
+        with multiprocessing.Pool(processes=self.max_workers) as pool:
+            for result in pool.imap_unordered(
+                _monitor_single_stock_process,
+                [(stock_dict, today, self.output_dir) for stock_dict in stock_dicts]
+            ):
+                if result is not None:
+                    results.append(result)
+                    self.logger.info(f"监控完成: {result.symbol} ({result.stock_name}) - 信号数: {len(result.signals)}")
 
         # 输出监控报告
         self._output_report(results)
@@ -3532,7 +3928,11 @@ def run_scheduler() -> None:
     print(f"监控范围: 最近 {RECENT_TRADING_DAYS} 个交易日")
     print("=" * 60)
 
-    monitor = DailyMonitor()
+    # 从配置文件读取进程数
+    process_config = load_process_config()
+    max_workers = process_config.get('max_workers_monitor', 4)
+
+    monitor = DailyMonitor(max_workers=max_workers, use_multiprocessing=True)
     last_monitor_time: Optional[datetime] = None
 
     while True:
@@ -3560,17 +3960,88 @@ def run_scheduler() -> None:
         time.sleep(60)
 
 
+def _monitor_single_stock_process(args: tuple) -> Optional['MonitorResult']:
+    """
+    多进程监控单个股票（独立函数，可被pickle）
+
+    Args:
+        args: (stock_dict, today, output_dir) 元组
+
+    Returns:
+        MonitorResult 或 None
+    """
+    stock_dict, today, output_dir = args
+
+    # 在子进程中创建新的监控器实例
+    try:
+        # 创建子进程专用logger
+        logger = logging.getLogger(f'monitor_subprocess_{stock_dict["symbol"]}')
+        logger.handlers.clear()
+        logger.setLevel(logging.INFO)
+
+        # 添加控制台handler（子进程日志会输出到主进程的控制台）
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        logger.addHandler(console_handler)
+        logger.propagate = False
+
+        # 重建StockConfig
+        stock_config = StockConfig(
+            symbol=stock_dict['symbol'],
+            stock_name=stock_dict['stock_name'],
+            start_date=stock_dict['start_date'],
+            end_date=stock_dict['end_date'],
+            judge_buy_ids=stock_dict['judge_buy_ids'],
+            judge_t_ids=stock_dict['judge_t_ids'],
+            judge_sell_ids=stock_dict['judge_sell_ids'],
+            initial_capital=stock_dict['initial_capital'],
+            active=stock_dict['active']
+        )
+
+        # 创建临时监控器实例（只用于monitor_single_stock）
+        # 注意：这里不初始化完整的DailyMonitor，而是直接调用相关方法
+        logger.info(f"子进程开始监控: {stock_config.symbol}")
+
+        # 由于monitor_single_stock依赖很多实例方法，这里使用简化方案：
+        # 创建一个完整但轻量的DailyMonitor实例
+        temp_monitor = DailyMonitor(
+            config_path=None,
+            settings_path=None,
+            output_dir=output_dir,
+            max_workers=1,
+            use_multiprocessing=False
+        )
+
+        result = temp_monitor.monitor_single_stock(stock_config, today)
+
+        logger.info(f"子进程监控完成: {stock_config.symbol}")
+        return result
+
+    except Exception as e:
+        logging.error(f"子进程监控失败: {stock_dict['symbol']}, 错误: {e}")
+        return None
+
+
 def run_once() -> None:
     """
     单次执行监控（用于测试或手动触发）
+    使用多进程配置
     """
-    monitor = DailyMonitor()
+    # 从配置文件读取进程数
+    process_config = load_process_config()
+    max_workers = process_config.get('max_workers_monitor', 4)
+
+    monitor = DailyMonitor(max_workers=max_workers, use_multiprocessing=True)
     monitor.run_monitor()
 
 
 # ==================== 主函数 ====================
 
 if __name__ == "__main__":
+    # Windows多进程支持
+    multiprocessing.freeze_support()
+
     import argparse
 
     parser = argparse.ArgumentParser(description="日内监控脚本")

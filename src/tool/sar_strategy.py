@@ -1278,7 +1278,7 @@ class SARRealtimeMonitor:
             self.logger.error(f"配置文件不存在: {self.config_path}")
             return []
 
-        df = pd.read_csv(self.config_path)
+        df = pd.read_csv(self.config_path, comment='#')
         stocks = []
 
         for _, row in df.iterrows():

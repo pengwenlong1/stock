@@ -28,15 +28,29 @@ from pymysql.cursors import DictCursor
 
 # 添加项目路径
 project_root = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-sys.path.insert(0, project_root)
+project_root_str = str(project_root)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 # 导入工具类
-from src.tool.rsi_calculator import RSI
-from src.tool.sar_strategy import SARStrategy, SARSignal
-from src.tool.macd_calculator import MACDCalculator
-from src.tool.ma_calculator import MACalculator
-from src.tool.peak_detector import PeakDetector
-from src.tool.divergence_detector import DivergenceDetector
+try:
+    from src.tool.rsi_calculator import RSI
+    from src.tool.sar_strategy import SARStrategy, SARSignal
+    from src.tool.macd_calculator import MACDCalculator
+    from src.tool.ma_calculator import MACalculator
+    from src.tool.peak_detector import PeakDetector
+    from src.tool.divergence_detector import DivergenceDetector
+except ModuleNotFoundError as e:
+    # 如果还是失败，尝试直接添加当前工作目录
+    cwd = str(Path.cwd())
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    from src.tool.rsi_calculator import RSI
+    from src.tool.sar_strategy import SARStrategy, SARSignal
+    from src.tool.macd_calculator import MACDCalculator
+    from src.tool.ma_calculator import MACalculator
+    from src.tool.peak_detector import PeakDetector
+    from src.tool.divergence_detector import DivergenceDetector
 
 try:
     from gm.api import history, set_token, ADJUST_PREV, get_trading_dates, get_instruments
@@ -107,7 +121,8 @@ def load_index_list() -> List[Dict]:
         return []
 
     # 使用 dtype 参数确保指数代码作为字符串读取，不丢失前导0
-    df = pd.read_csv(str(index_csv_path), dtype={'symbol': str})
+    # comment='#' 支持跳过以 # 开头的注释行
+    df = pd.read_csv(str(index_csv_path), dtype={'symbol': str}, comment='#')
 
     index_list = []
     for row in df.to_dict('records'):
@@ -319,9 +334,11 @@ class IndexDataFiller:
             divergence_detector.prepare_data(full_symbol, start_date, end_date)
             divergences = divergence_detector.detect_all_divergences()
             # 使用日期字符串格式存储，避免时区匹配问题
+            # 顶背离
             daily_top_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('daily_top_confirmed', []) if d.confirmation_date is not None)
-            daily_bottom_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('daily_bottom_confirmed', []) if d.confirmation_date is not None)
             weekly_top_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('weekly_top_confirmed', []) if d.confirmation_date is not None)
+            # 底背离
+            daily_bottom_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('daily_bottom_confirmed', []) if d.confirmation_date is not None)
             weekly_bottom_div_dates = set(d.confirmation_date.strftime('%Y-%m-%d') for d in divergences.get('weekly_bottom_confirmed', []) if d.confirmation_date is not None)
         except Exception as e:
             logger.warning(f"背离检测失败: {e}")

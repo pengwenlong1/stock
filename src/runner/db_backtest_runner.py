@@ -30,6 +30,7 @@ python src/runner/db_backtest_runner.py
 """
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,6 +49,7 @@ sys.path.insert(0, str(project_root))
 # 导入策略类
 from src.tool.strategy import TradingStrategy, StrategyState, SellSignal, BuySignal, SellFlag, COOLDOWN_DAYS
 from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal  # 导入背离检测器（用于指数）
+from src.tool.rsi_calculator import RSI  # 导入RSI计算类（用于月线RSI）
 
 # ==================== 数据结构 ====================
 
@@ -152,6 +154,7 @@ class DBBacktestRunner:
         # 数据存储
         self._df: Optional[pd.DataFrame] = None
         self._metrics_df: Optional[pd.DataFrame] = None
+        self._monthly_rsi_series: Optional[pd.Series] = None  # 月线RSI序列（用于buy_id=15-18）
 
         # 指数数据（用于大盘参照）
         self._index_metrics_df: Optional[pd.DataFrame] = None  # 创业板指 (399006)
@@ -169,10 +172,24 @@ class DBBacktestRunner:
         self._kc_index_daily_divergences: List[DivergenceSignal] = []
         self._kc_index_weekly_divergences: List[DivergenceSignal] = []
 
+        # 新指数背离检测器（用于 sell_id=13,14,15）
+        self._sh50_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._sh50_index_daily_divergences: List[DivergenceSignal] = []
+        self._sh50_index_weekly_divergences: List[DivergenceSignal] = []
+        self._cyb50_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._cyb50_index_daily_divergences: List[DivergenceSignal] = []
+        self._cyb50_index_weekly_divergences: List[DivergenceSignal] = []
+        self._kc50_index_divergence_detector: Optional[DivergenceDetector] = None
+        self._kc50_index_daily_divergences: List[DivergenceSignal] = []
+        self._kc50_index_weekly_divergences: List[DivergenceSignal] = []
+
         # 已处理的指数背离信号ID集合（避免重复触发）
         self._processed_sh_index_divergences: Set[str] = set()
         self._processed_cyb_index_divergences: Set[str] = set()
         self._processed_kc_index_divergences: Set[str] = set()
+        self._processed_sh50_index_divergences: Set[str] = set()
+        self._processed_cyb50_index_divergences: Set[str] = set()
+        self._processed_kc50_index_divergences: Set[str] = set()
 
         # 持仓状态（使用金额追踪）
         self._shares: float = 0.0         # 持有股票数量
@@ -229,24 +246,39 @@ class DBBacktestRunner:
             self.logger.info("数据库连接已关闭")
 
     def _setup_logging(self) -> None:
-        """配置日志"""
+        """配置日志（使用命名logger避免混淆）"""
         log_file = self.output_dir / f'db_backtest_{self.stock_id}.log'
 
-        # 清除已有handlers
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
+        # 创建该股票专用的logger（不使用根logger）
+        self.logger = logging.getLogger(f'db_backtest_{self.stock_id}')
 
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.FileHandler(str(log_file), encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        # 清除该logger已有的handlers
+        self.logger.handlers.clear()
+
+        # 设置日志级别
+        self.logger.setLevel(logging.INFO)
+
+        # 添加文件handler
+        file_handler = logging.FileHandler(str(log_file), encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        self.logger.addHandler(file_handler)
+
+        # 添加控制台handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        self.logger.addHandler(console_handler)
+
+        # 不传播到根logger
+        self.logger.propagate = False
+
         self.log_file = str(log_file)
+
+        # 为divergence_detector设置专用日志文件
+        from src.tool.divergence_detector import setup_log_file, clear_log_file
+        clear_log_file()  # 先清除旧的文件handler
+        setup_log_file(str(log_file))
 
     def fetch_metrics_from_db(self) -> bool:
         """
@@ -316,6 +348,14 @@ class DBBacktestRunner:
             self.logger.info(f"日线顶背离数: {df['is_daily_top_divergence'].sum()}")
             self.logger.info(f"周线顶背离数: {df['is_weekly_top_divergence'].sum()}")
 
+            # 计算月线RSI(6)（用于buy_id=15-18）
+            close_series = pd.Series(df['close_price'].values, index=df.index, name='Close')
+            rsi_monthly = RSI(period=6, freq='monthly')
+            monthly_rsi_series = rsi_monthly.calculate(close_series)
+            df['rsi_monthly'] = monthly_rsi_series
+            self._monthly_rsi_series = monthly_rsi_series
+            self.logger.info(f"月线RSI数据: 有效={monthly_rsi_series.notna().sum()}")
+
             return True
 
         except Exception as e:
@@ -365,7 +405,7 @@ class DBBacktestRunner:
         try:
             # 创业板指 (399006) - stock_id为字符串格式
             sql = """
-                SELECT trade_date, rsi_daily
+                SELECT trade_date, rsi_daily, macd, sar, close_price
                 FROM stock_index_daily_metrics
                 WHERE stock_id = '399006'
                   AND trade_date >= %s
@@ -387,7 +427,7 @@ class DBBacktestRunner:
 
             # 上证指数 (000001) - stock_id为字符串格式
             sql = """
-                SELECT trade_date, rsi_daily
+                SELECT trade_date, rsi_daily, macd, sar, close_price
                 FROM stock_index_daily_metrics
                 WHERE stock_id = '000001'
                   AND trade_date >= %s
@@ -409,7 +449,7 @@ class DBBacktestRunner:
 
             # 科创综指 (000680) - stock_id为字符串格式
             sql = """
-                SELECT trade_date, rsi_daily
+                SELECT trade_date, rsi_daily, macd, sar, close_price
                 FROM stock_index_daily_metrics
                 WHERE stock_id = '000680'
                   AND trade_date >= %s
@@ -460,62 +500,202 @@ class DBBacktestRunner:
         # 获取指数ETF数据（用于大盘参照）
         self.fetch_index_metrics_from_db()
 
-        # 如果配置了 sell_id=4,5,6，初始化指数背离检测器
-        if any(sid in [4, 5, 6] for sid in self.judge_sell_ids):
+        # 如果配置了 sell_id=4,5,6,10,11,12,13,14,15，初始化指数背离检测器
+        if any(sid in [4, 5, 6, 10, 11, 12, 13, 14, 15] for sid in self.judge_sell_ids):
             self._init_index_divergence_detectors()
 
         return True
 
     def _init_index_divergence_detectors(self) -> None:
         """
-        初始化指数背离检测器（用于 sell_id=4,5,6）
+        初始化指数背离检测器（用于 sell_id=4,5,6,10,11,12）
 
         检测上证指数、创业板指数、科创板指数的顶背离信号。
         """
+        # 【关键】设置掘金Token（用于DivergenceDetector获取数据）
+        try:
+            from gm.api import set_token
+
+            # 尝试多种路径查找settings.json
+            possible_paths = [
+                Path.cwd() / "config" / "settings.json",
+                Path(__file__).resolve().parent.parent.parent / "config" / "settings.json",
+                Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))) / "config" / "settings.json"
+            ]
+
+            gm_token = None
+            for settings_path in possible_paths:
+                if settings_path.exists():
+                    self.logger.info(f"找到settings.json: {settings_path}")
+                    with settings_path.open('r', encoding='utf-8') as f:
+                        config = json.load(f)
+                        gm_token = config.get('gm_token')
+                        if gm_token:
+                            break
+
+            if gm_token:
+                set_token(gm_token)
+                self.logger.info("掘金Token设置成功")
+            else:
+                self.logger.error("未找到有效的掘金Token，请在config/settings.json中配置gm_token")
+                return  # 如果没有Token，直接返回，不初始化指数检测器
+        except Exception as e:
+            self.logger.error(f"设置掘金Token失败: {e}")
+            return
+
         # 计算预热起始日期（提前365天）
         warmup_start = (pd.Timestamp(self.start_date) - pd.Timedelta(days=365)).strftime('%Y-%m-%d')
 
-        # 检测上证指数背离（用于 sell_id=4）
-        self.logger.info("初始化上证指数背离检测器...")
-        self._sh_index_divergence_detector = DivergenceDetector()
-        self._sh_index_divergence_detector.prepare_data(
-            symbol='SHSE.000001',
-            start_date=warmup_start,
-            end_date=self.end_date
-        )
-        sh_divergences = self._sh_index_divergence_detector.detect_all_divergences()
-        self._sh_index_daily_divergences = sh_divergences.get('daily_top_confirmed', [])
-        self._sh_index_weekly_divergences = sh_divergences.get('weekly_top_confirmed', [])
-        self.logger.info(f"上证指数日线顶背离生效: {len(self._sh_index_daily_divergences)} 个")
-        self.logger.info(f"上证指数周线顶背离生效: {len(self._sh_index_weekly_divergences)} 个")
+        # 检测上证指数背离（用于 sell_id=4,10）
+        if any(sid in [4, 10] for sid in self.judge_sell_ids):
+            self.logger.info("初始化上证指数背离检测器...")
+            try:
+                self._sh_index_divergence_detector = DivergenceDetector()
+                df = self._sh_index_divergence_detector.prepare_data(
+                    symbol='SHSE.000001',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    sh_divergences = self._sh_index_divergence_detector.detect_all_divergences()
+                    self._sh_index_daily_divergences = sh_divergences.get('daily_top_confirmed', [])
+                    self._sh_index_weekly_divergences = sh_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"上证指数日线顶背离生效: {len(self._sh_index_daily_divergences)} 个")
+                    self.logger.info(f"上证指数周线顶背离生效: {len(self._sh_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("上证指数数据获取失败，跳过背离检测")
+                    self._sh_index_daily_divergences = []
+                    self._sh_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"上证指数背离检测器初始化失败: {e}")
+                self._sh_index_daily_divergences = []
+                self._sh_index_weekly_divergences = []
 
-        # 检测创业板指数背离（用于 sell_id=5）
-        self.logger.info("初始化创业板指数背离检测器...")
-        self._cyb_index_divergence_detector = DivergenceDetector()
-        self._cyb_index_divergence_detector.prepare_data(
-            symbol='SZSE.399006',
-            start_date=warmup_start,
-            end_date=self.end_date
-        )
-        cyb_divergences = self._cyb_index_divergence_detector.detect_all_divergences()
-        self._cyb_index_daily_divergences = cyb_divergences.get('daily_top_confirmed', [])
-        self._cyb_index_weekly_divergences = cyb_divergences.get('weekly_top_confirmed', [])
-        self.logger.info(f"创业板指数日线顶背离生效: {len(self._cyb_index_daily_divergences)} 个")
-        self.logger.info(f"创业板指数周线顶背离生效: {len(self._cyb_index_weekly_divergences)} 个")
+        # 检测创业板指数背离（用于 sell_id=5,11）
+        if any(sid in [5, 11] for sid in self.judge_sell_ids):
+            self.logger.info("初始化创业板指数背离检测器...")
+            try:
+                self._cyb_index_divergence_detector = DivergenceDetector()
+                df = self._cyb_index_divergence_detector.prepare_data(
+                    symbol='SZSE.399006',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    cyb_divergences = self._cyb_index_divergence_detector.detect_all_divergences()
+                    self._cyb_index_daily_divergences = cyb_divergences.get('daily_top_confirmed', [])
+                    self._cyb_index_weekly_divergences = cyb_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"创业板指数日线顶背离生效: {len(self._cyb_index_daily_divergences)} 个")
+                    self.logger.info(f"创业板指数周线顶背离生效: {len(self._cyb_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("创业板指数数据获取失败，跳过背离检测")
+                    self._cyb_index_daily_divergences = []
+                    self._cyb_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"创业板指数背离检测器初始化失败: {e}")
+                self._cyb_index_daily_divergences = []
+                self._cyb_index_weekly_divergences = []
 
-        # 检测科创板指数背离（用于 sell_id=6）
-        self.logger.info("初始化科创板指数背离检测器...")
-        self._kc_index_divergence_detector = DivergenceDetector()
-        self._kc_index_divergence_detector.prepare_data(
-            symbol='SHSE.000680',
-            start_date=warmup_start,
-            end_date=self.end_date
-        )
-        kc_divergences = self._kc_index_divergence_detector.detect_all_divergences()
-        self._kc_index_daily_divergences = kc_divergences.get('daily_top_confirmed', [])
-        self._kc_index_weekly_divergences = kc_divergences.get('weekly_top_confirmed', [])
-        self.logger.info(f"科创板指数日线顶背离生效: {len(self._kc_index_daily_divergences)} 个")
-        self.logger.info(f"科创板指数周线顶背离生效: {len(self._kc_index_weekly_divergences)} 个")
+        # 检测科创板指数背离（用于 sell_id=6,12）
+        if any(sid in [6, 12] for sid in self.judge_sell_ids):
+            self.logger.info("初始化科创板指数背离检测器...")
+            try:
+                self._kc_index_divergence_detector = DivergenceDetector()
+                df = self._kc_index_divergence_detector.prepare_data(
+                    symbol='SHSE.000680',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    kc_divergences = self._kc_index_divergence_detector.detect_all_divergences()
+                    self._kc_index_daily_divergences = kc_divergences.get('daily_top_confirmed', [])
+                    self._kc_index_weekly_divergences = kc_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"科创板指数日线顶背离生效: {len(self._kc_index_daily_divergences)} 个")
+                    self.logger.info(f"科创板指数周线顶背离生效: {len(self._kc_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("科创板指数数据获取失败，跳过背离检测")
+                    self._kc_index_daily_divergences = []
+                    self._kc_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"科创板指数背离检测器初始化失败: {e}")
+                self._kc_index_daily_divergences = []
+                self._kc_index_weekly_divergences = []
+
+        # 检测新指数背离（用于 sell_id=13,14,15）
+        # 上证50指数背离检测器
+        if any(sid in [13] for sid in self.judge_sell_ids):
+            self.logger.info("初始化上证50指数背离检测器...")
+            try:
+                self._sh50_index_divergence_detector = DivergenceDetector()
+                df = self._sh50_index_divergence_detector.prepare_data(
+                    symbol='SHSE.000016',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    sh50_divergences = self._sh50_index_divergence_detector.detect_all_divergences()
+                    self._sh50_index_daily_divergences = sh50_divergences.get('daily_top_confirmed', [])
+                    self._sh50_index_weekly_divergences = sh50_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"上证50指数日线顶背离生效: {len(self._sh50_index_daily_divergences)} 个")
+                    self.logger.info(f"上证50指数周线顶背离生效: {len(self._sh50_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("上证50指数数据获取失败，跳过背离检测")
+                    self._sh50_index_daily_divergences = []
+                    self._sh50_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"上证50指数背离检测器初始化失败: {e}")
+                self._sh50_index_daily_divergences = []
+                self._sh50_index_weekly_divergences = []
+
+        # 创业板50指数背离检测器
+        if any(sid in [14] for sid in self.judge_sell_ids):
+            self.logger.info("初始化创业板50指数背离检测器...")
+            try:
+                self._cyb50_index_divergence_detector = DivergenceDetector()
+                df = self._cyb50_index_divergence_detector.prepare_data(
+                    symbol='SZSE.399673',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    cyb50_divergences = self._cyb50_index_divergence_detector.detect_all_divergences()
+                    self._cyb50_index_daily_divergences = cyb50_divergences.get('daily_top_confirmed', [])
+                    self._cyb50_index_weekly_divergences = cyb50_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"创业板50指数日线顶背离生效: {len(self._cyb50_index_daily_divergences)} 个")
+                    self.logger.info(f"创业板50指数周线顶背离生效: {len(self._cyb50_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("创业板50指数数据获取失败，跳过背离检测")
+                    self._cyb50_index_daily_divergences = []
+                    self._cyb50_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"创业板50指数背离检测器初始化失败: {e}")
+                self._cyb50_index_daily_divergences = []
+                self._cyb50_index_weekly_divergences = []
+
+        # 科创板50指数背离检测器
+        if any(sid in [15] for sid in self.judge_sell_ids):
+            self.logger.info("初始化科创板50指数背离检测器...")
+            try:
+                self._kc50_index_divergence_detector = DivergenceDetector()
+                df = self._kc50_index_divergence_detector.prepare_data(
+                    symbol='SHSE.000688',
+                    start_date=warmup_start,
+                    end_date=self.end_date
+                )
+                if df is not None and not df.empty:
+                    kc50_divergences = self._kc50_index_divergence_detector.detect_all_divergences()
+                    self._kc50_index_daily_divergences = kc50_divergences.get('daily_top_confirmed', [])
+                    self._kc50_index_weekly_divergences = kc50_divergences.get('weekly_top_confirmed', [])
+                    self.logger.info(f"科创板50指数日线顶背离生效: {len(self._kc50_index_daily_divergences)} 个")
+                    self.logger.info(f"科创板50指数周线顶背离生效: {len(self._kc50_index_weekly_divergences)} 个")
+                else:
+                    self.logger.warning("科创板50指数数据获取失败，跳过背离检测")
+                    self._kc50_index_daily_divergences = []
+                    self._kc50_index_weekly_divergences = []
+            except Exception as e:
+                self.logger.warning(f"科创板50指数背离检测器初始化失败: {e}")
+                self._kc50_index_daily_divergences = []
+                self._kc50_index_weekly_divergences = []
 
     def _get_trading_dates(self) -> List[pd.Timestamp]:
         """获取回测时间段内的交易日列表"""
@@ -592,7 +772,7 @@ class DBBacktestRunner:
 
         Args:
             date: 当前日期
-            index_type: 指数类型 ('sh', 'cyb', 'kc')
+            index_type: 指数类型 ('sh', 'cyb', 'kc', 'sh50', 'cyb50', 'kc50')
             timeframe: 时间级别 ('daily' 或 'weekly')
 
         Returns:
@@ -608,6 +788,15 @@ class DBBacktestRunner:
         elif index_type == 'kc':
             divergences = self._kc_index_daily_divergences if timeframe == 'daily' else self._kc_index_weekly_divergences
             processed_set = self._processed_kc_index_divergences
+        elif index_type == 'sh50':
+            divergences = self._sh50_index_daily_divergences if timeframe == 'daily' else self._sh50_index_weekly_divergences
+            processed_set = self._processed_sh50_index_divergences if hasattr(self, '_processed_sh50_index_divergences') else set()
+        elif index_type == 'cyb50':
+            divergences = self._cyb50_index_daily_divergences if timeframe == 'daily' else self._cyb50_index_weekly_divergences
+            processed_set = self._processed_cyb50_index_divergences if hasattr(self, '_processed_cyb50_index_divergences') else set()
+        elif index_type == 'kc50':
+            divergences = self._kc50_index_daily_divergences if timeframe == 'daily' else self._kc50_index_weekly_divergences
+            processed_set = self._processed_kc50_index_divergences if hasattr(self, '_processed_kc50_index_divergences') else set()
         else:
             return None
 
@@ -634,13 +823,51 @@ class DBBacktestRunner:
 
         return None
 
+    def _get_weekly_rsi_near_divergence(
+        self,
+        div_date: pd.Timestamp,
+        lookback_days: int = 5
+    ) -> Tuple[float, pd.Timestamp]:
+        """
+        获取顶背离形成日期附近（±5个交易日）的最高周线RSI值
+
+        Args:
+            div_date: 顶背离形成日期
+            lookback_days: 向前/向后查找的天数（默认5天）
+
+        Returns:
+            (最高周线RSI值, 对应日期)
+        """
+        # 检查数据是否已加载
+        if self._df is None or len(self._df) == 0:
+            return 0.0, div_date
+
+        # 定义查找范围
+        start_date = div_date - pd.Timedelta(days=lookback_days)
+        end_date = div_date + pd.Timedelta(days=lookback_days)
+
+        # 截取范围内的数据
+        range_df = self._df[(self._df.index >= start_date) & (self._df.index <= end_date)]
+
+        if len(range_df) == 0:
+            return 0.0, div_date
+
+        # 找到周线RSI最高的日期
+        if 'rsi_weekly' not in range_df.columns:
+            return 0.0, div_date
+
+        max_rsi_idx = range_df['rsi_weekly'].idxmax()
+        max_rsi_value = range_df['rsi_weekly'].max()
+
+        return max_rsi_value, max_rsi_idx
+
     def _detect_index_macd_cross_down(self, date: pd.Timestamp, index_type: str) -> bool:
         """
-        检测指数MACD是否发生死叉（用于 sell_id=7,8,9）
+        检测指数MACD是否发生死叉（用于 sell_id=7,8,9,10,11,12,13,14,15）
 
         Args:
             date: 当前日期
-            index_type: 指数类型 ('sh', 'cyb', 'kc')
+            index_type: 指数类型 ('sh', 'cyb', 'kc', 'sh50', 'cyb50', 'kc50')
 
         Returns:
             bool: 是否发生指数MACD死叉
@@ -656,15 +883,24 @@ class DBBacktestRunner:
             detector = self._cyb_index_divergence_detector
         elif index_type == 'kc':
             detector = self._kc_index_divergence_detector
+        elif index_type == 'sh50':
+            detector = self._sh50_index_divergence_detector
+        elif index_type == 'cyb50':
+            detector = self._cyb50_index_divergence_detector
+        elif index_type == 'kc50':
+            detector = self._kc50_index_divergence_detector
         else:
             return False
 
         if detector is None:
             return False
 
-        # 使用 divergence detector 的 MACD 数据
-        dif_series = detector._dif_series
-        dea_series = detector._dea_series
+        # 使用 divergence detector 的 MACD Calculator
+        if detector._macd_calculator is None:
+            return False
+
+        dif_series = detector._macd_calculator._dif_series
+        dea_series = detector._macd_calculator._dea_series
 
         if dif_series is None or dea_series is None:
             return False
@@ -698,6 +934,129 @@ class DBBacktestRunner:
             self.logger.warning(f"检测{index_type}指数MACD死叉失败: {e}")
 
         return False
+
+    def _is_index_macd_dead_cross_state(self, date: pd.Timestamp, index_type: str) -> bool:
+        """
+        检查指数MACD是否处于死叉状态（DIF < DEA，即MACD柱 < 0）
+
+        与 _detect_index_macd_cross_down 不同，此方法检查是否已经是死叉状态，
+        而不是检测当天是否发生新的死叉。
+
+        Args:
+            date: 当前日期
+            index_type: 指数类型 ('sh', 'cyb', 'kc', 'sh50', 'cyb50', 'kc50')
+
+        Returns:
+            bool: 是否处于MACD死叉状态（MACD柱 < 0）
+        """
+        # 根据指数类型选择指数数据DataFrame
+        if index_type == 'sh':
+            index_df = self._sh_index_metrics_df
+        elif index_type == 'cyb':
+            index_df = self._index_metrics_df  # 创业板指
+        elif index_type == 'kc':
+            index_df = self._kc_index_metrics_df
+        elif index_type == 'sh50':
+            index_df = getattr(self, '_sh50_index_metrics_df', None)
+        elif index_type == 'cyb50':
+            index_df = getattr(self, '_cyb50_index_metrics_df', None)
+        elif index_type == 'kc50':
+            index_df = getattr(self, '_kc50_index_metrics_df', None)
+        else:
+            return False
+
+        if index_df is None or index_df.empty:
+            return False
+
+        try:
+            date_str = date.strftime('%Y-%m-%d')
+            matching = index_df.index.strftime('%Y-%m-%d') == date_str
+            if matching.sum() == 0:
+                return False
+
+            row = index_df[matching].iloc[0]
+            macd_value = row.get('macd', None)
+
+            if macd_value is None:
+                return False
+
+            # 处理可能的NaN值
+            if pd.isna(macd_value):
+                return False
+
+            macd_value = float(macd_value)
+
+            # MACD柱 < 0 表示 DIF < DEA，即处于死叉状态
+            if macd_value < 0:
+                self.logger.info(f"[{date_str}] {index_type}指数MACD已处于死叉状态: MACD柱={macd_value:.4f} < 0")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.warning(f"检查{index_type}指数MACD状态失败: {e}")
+            return False
+
+    def _is_index_sar_dead_cross_state(self, date: pd.Timestamp, index_type: str) -> bool:
+        """
+        检查指数SAR是否处于死叉状态（SAR在收盘价上方，即绿转红状态）
+
+        Args:
+            date: 当前日期
+            index_type: 指数类型 ('sh', 'cyb', 'kc', 'sh50', 'cyb50', 'kc50')
+
+        Returns:
+            bool: 是否处于SAR死叉状态（SAR > Close）
+        """
+        # 根据指数类型选择指数数据DataFrame
+        if index_type == 'sh':
+            index_df = self._sh_index_metrics_df
+        elif index_type == 'cyb':
+            index_df = self._index_metrics_df  # 创业板指
+        elif index_type == 'kc':
+            index_df = self._kc_index_metrics_df
+        elif index_type == 'sh50':
+            index_df = getattr(self, '_sh50_index_metrics_df', None)
+        elif index_type == 'cyb50':
+            index_df = getattr(self, '_cyb50_index_metrics_df', None)
+        elif index_type == 'kc50':
+            index_df = getattr(self, '_kc50_index_metrics_df', None)
+        else:
+            return False
+
+        if index_df is None or index_df.empty:
+            return False
+
+        try:
+            date_str = date.strftime('%Y-%m-%d')
+            matching = index_df.index.strftime('%Y-%m-%d') == date_str
+            if matching.sum() == 0:
+                return False
+
+            row = index_df[matching].iloc[0]
+            close_price = row.get('close_price', None)
+            sar_value = row.get('sar', None)
+
+            if close_price is None or sar_value is None:
+                return False
+
+            # 处理可能的NaN值
+            if pd.isna(close_price) or pd.isna(sar_value):
+                return False
+
+            close_price = float(close_price)
+            sar_value = float(sar_value)
+
+            # SAR死叉状态：SAR > Close（SAR在价格上方）
+            if sar_value > close_price:
+                self.logger.info(f"[{date_str}] {index_type}指数SAR已处于死叉状态: SAR={sar_value:.4f} > Close={close_price:.2f}")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.warning(f"检查{index_type}指数SAR状态失败: {e}")
+            return False
 
     def _execute_sell(self, date: pd.Timestamp, signal: SellSignal) -> None:
         """执行卖出操作"""
@@ -851,10 +1210,15 @@ class DBBacktestRunner:
             # 判断 MACD 死叉（DIF下穿DEA）作为 sell_id=2 的触发条件
             # 不需要额外条件，只要MACD死叉就触发
             macd_cross_down = False
+            macd_dead_cross_state = False  # 个股MACD是否处于死叉状态（用于sell_id=10-15）
             current_dif = metrics.get('dif', np.nan)
             current_dea = metrics.get('dea', np.nan)
 
             if not np.isnan(current_dif) and not np.isnan(current_dea):
+                # 检测个股MACD是否处于死叉状态（DIF < DEA）
+                if current_dif < current_dea:
+                    macd_dead_cross_state = True
+
                 try:
                     date_idx = trading_dates.index(date)
                     if date_idx > 0:
@@ -882,6 +1246,10 @@ class DBBacktestRunner:
             weekly_top_div = metrics.get('is_weekly_top_divergence', 0) == 1
 
             # 【周线顶背离形成】设置标志，等待死叉触发生效后卖出
+            # 【完整规则】根据用户需求实现三种场景：
+            # (1) 若个股处于死叉，则直接卖出
+            # (2) 个股未处于死叉，但指数处于死叉，则等待个股或指数再次重新死叉时卖出
+            # (3) 若个股未处于死叉，指数也未处于死叉，则等待个股或指数出现死叉时卖出
             if weekly_top_div and self.state.weekly_divergence_flag == 0:
                 self.state.weekly_divergence_flag = 1
                 divergence_info = {
@@ -892,7 +1260,55 @@ class DBBacktestRunner:
                 self.state.weekly_divergence_info = divergence_info
                 self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 周线顶背离形成，等待死叉触发生效")
 
+                # 【场景(1)】检查个股是否已处于MACD死叉状态 → 直接卖出
+                stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                if stock_macd_dead and self._shares > 0:
+                    sell_signal = SellSignal(
+                        flag=SellFlag.CLEAR_ALL,
+                        reason=f"清仓信号 (sell_id={sell_id}-个股周线顶背离): 周线顶背离形成于 {date.strftime('%Y-%m-%d')}, 个股MACD已处于死叉状态，建议清仓",
+                        daily_rsi=daily_rsi,
+                        weekly_rsi=weekly_rsi
+                    )
+                    self._execute_sell(date, sell_signal)
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态（DIF<DEA），直接触发卖出")
+                    continue  # 卖出后当天不再处理其他信号
+
+                # 【场景(2)和(3)】检查指数死叉状态（仅用于日志，不直接卖出）
+                # 确定检查哪个指数
+                index_type_for_sell = None
+                index_name = ""
+                if any(sid in [10, 11, 12] for sid in self.judge_sell_ids):
+                    if 10 in self.judge_sell_ids:
+                        index_type_for_sell = 'sh'
+                        index_name = "上证指数"
+                    elif 11 in self.judge_sell_ids:
+                        index_type_for_sell = 'cyb'
+                        index_name = "创业板指数"
+                    elif 12 in self.judge_sell_ids:
+                        index_type_for_sell = 'kc'
+                        index_name = "科创板指数"
+                elif any(sid in [13, 14, 15] for sid in self.judge_sell_ids):
+                    if 13 in self.judge_sell_ids:
+                        index_type_for_sell = 'sh50'
+                        index_name = "上证50指数"
+                    elif 14 in self.judge_sell_ids:
+                        index_type_for_sell = 'cyb50'
+                        index_name = "创业板50指数"
+                    elif 15 in self.judge_sell_ids:
+                        index_type_for_sell = 'kc50'
+                        index_name = "科创板50指数"
+
+                if index_type_for_sell:
+                    if self._is_index_macd_dead_cross_state(date, index_type_for_sell):
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] {index_name}MACD已处于死叉状态，但需等待个股死叉或指数再次重新死叉时才卖出")
+                    elif self._is_index_sar_dead_cross_state(date, index_type_for_sell):
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] {index_name}SAR已处于死叉状态，但需等待个股死叉或指数再次重新死叉时才卖出")
+
             # 【日线顶背离形成】设置标志，等待死叉触发生效后卖出
+            # 【完整规则】根据用户需求实现三种场景：
+            # (1) 若个股处于死叉，则直接卖出
+            # (2) 个股未处于死叉，但指数处于死叉，则等待个股或指数再次重新死叉时卖出
+            # (3) 若个股未处于死叉，指数也未处于死叉，则等待个股或指数出现死叉时卖出
             if daily_top_div and self.state.daily_divergence_flag == 0:
                 self.state.daily_divergence_flag = 1
                 divergence_info = {
@@ -903,42 +1319,429 @@ class DBBacktestRunner:
                 self.state.daily_divergence_info = divergence_info
                 self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 日线顶背离形成，等待死叉触发生效")
 
-            # 【新增】设置指数背离状态（用于 sell_id=4,5,6）
-            if any(sid in [4, 5, 6] for sid in self.judge_sell_ids):
-                # 上证指数背离
+                # 【场景(1)】检查个股是否已处于MACD死叉状态 → 直接卖出
+                stock_macd_dead_daily = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                if stock_macd_dead_daily and self._shares > 0:
+                    sell_signal = SellSignal(
+                        flag=SellFlag.SELL_ONE_THIRD,  # 日线顶背离卖出1/3
+                        reason=f"卖出信号 (sell_id={sell_id}-个股日线顶背离): 日线顶背离形成于 {date.strftime('%Y-%m-%d')}, 个股MACD已处于死叉状态，建议卖出1/3",
+                        daily_rsi=daily_rsi,
+                        weekly_rsi=weekly_rsi
+                    )
+                    self._execute_sell(date, sell_signal)
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态（DIF<DEA），直接触发卖出")
+                    continue  # 卖出后当天不再处理其他信号
+
+                # 【场景(2)和(3)】检查指数死叉状态（仅用于日志，不直接卖出）
+                index_type_for_sell_daily = None
+                index_name_daily = ""
+                if any(sid in [4, 10] for sid in self.judge_sell_ids):
+                    index_type_for_sell_daily = 'sh'
+                    index_name_daily = "上证指数"
+                elif any(sid in [5, 11] for sid in self.judge_sell_ids):
+                    index_type_for_sell_daily = 'cyb'
+                    index_name_daily = "创业板指数"
+                elif any(sid in [6, 12] for sid in self.judge_sell_ids):
+                    index_type_for_sell_daily = 'kc'
+                    index_name_daily = "科创板指数"
+                elif any(sid in [13, 14, 15] for sid in self.judge_sell_ids):
+                    if 13 in self.judge_sell_ids:
+                        index_type_for_sell_daily = 'sh50'
+                        index_name_daily = "上证50指数"
+                    elif 14 in self.judge_sell_ids:
+                        index_type_for_sell_daily = 'cyb50'
+                        index_name_daily = "创业板50指数"
+                    elif 15 in self.judge_sell_ids:
+                        index_type_for_sell_daily = 'kc50'
+                        index_name_daily = "科创板50指数"
+
+                if index_type_for_sell_daily:
+                    if self._is_index_macd_dead_cross_state(date, index_type_for_sell_daily):
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] {index_name_daily}MACD已处于死叉状态，但需等待个股死叉或指数再次重新死叉时才卖出")
+                    elif self._is_index_sar_dead_cross_state(date, index_type_for_sell_daily):
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] {index_name_daily}SAR已处于死叉状态，但需等待个股死叉或指数再次重新死叉时才卖出")
+
+            # 【新增】设置指数背离状态并判断是否直接卖出
+            # 【重要】根据具体的sell_id只检测对应指数的背离，而不是检测所有指数
+            # sell_id=4,10: 上证指数
+            # sell_id=5,11: 创业板指数
+            # sell_id=6,12: 科创板指数
+            # sell_id=13: 上证50指数
+            # sell_id=14: 创业板50指数
+            # sell_id=15: 科创板50指数
+
+            # 【sell_id=4,10】上证指数背离
+            if any(sid in [4, 10] for sid in self.judge_sell_ids):
                 sh_daily_div_info = self._get_index_divergence_info(date, 'sh', 'daily')
                 sh_weekly_div_info = self._get_index_divergence_info(date, 'sh', 'weekly')
                 if sh_daily_div_info is not None or sh_weekly_div_info is not None:
                     self.strategy.set_sh_index_divergence(self.state, sh_daily_div_info, sh_weekly_div_info)
-                    if sh_daily_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数日线顶背离生效")
-                    if sh_weekly_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数周线顶背离生效")
 
-                # 创业板指数背离
+                    index_div_type = "日线顶背离" if sh_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'sh')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'sh')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if sh_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-上证指数{index_div_type}): 上证指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 上证指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待上证指数死叉或个股再次重新死叉时才卖出")
+
+            # 【sell_id=5,11】创业板指数背离
+            if any(sid in [5, 11] for sid in self.judge_sell_ids):
                 cyb_daily_div_info = self._get_index_divergence_info(date, 'cyb', 'daily')
                 cyb_weekly_div_info = self._get_index_divergence_info(date, 'cyb', 'weekly')
                 if cyb_daily_div_info is not None or cyb_weekly_div_info is not None:
                     self.strategy.set_cyb_index_divergence(self.state, cyb_daily_div_info, cyb_weekly_div_info)
-                    if cyb_daily_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数日线顶背离生效")
-                    if cyb_weekly_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数周线顶背离生效")
 
-                # 科创板指数背离
+                    index_div_type = "日线顶背离" if cyb_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'cyb')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'cyb')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if cyb_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-创业板指数{index_div_type}): 创业板指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 创业板指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待创业板指数死叉或个股再次重新死叉时才卖出")
+
+            # 【sell_id=6,12】科创板指数背离
+            if any(sid in [6, 12] for sid in self.judge_sell_ids):
                 kc_daily_div_info = self._get_index_divergence_info(date, 'kc', 'daily')
                 kc_weekly_div_info = self._get_index_divergence_info(date, 'kc', 'weekly')
                 if kc_daily_div_info is not None or kc_weekly_div_info is not None:
                     self.strategy.set_kc_index_divergence(self.state, kc_daily_div_info, kc_weekly_div_info)
-                    if kc_daily_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数日线顶背离生效")
-                    if kc_weekly_div_info:
-                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数周线顶背离生效")
 
-            # 检测指数MACD死叉（用于 sell_id=7,8,9）
-            sh_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'sh') if any(sid in [7] for sid in self.judge_sell_ids) else False
-            cyb_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'cyb') if any(sid in [8] for sid in self.judge_sell_ids) else False
-            kc_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'kc') if any(sid in [9] for sid in self.judge_sell_ids) else False
+                    index_div_type = "日线顶背离" if kc_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'kc')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'kc')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if kc_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-科创板指数{index_div_type}): 科创板指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 科创板指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待科创板指数死叉或个股再次重新死叉时才卖出")
+
+            # 【新增】设置新指数背离状态（用于 sell_id=13,14,15）
+            # 【重要】根据具体的sell_id只检测对应指数的背离，而不是检测所有指数
+            # sell_id=13: 上证50指数
+            # sell_id=14: 创业板50指数
+            # sell_id=15: 科创板50指数
+
+            # 【sell_id=13】上证50指数背离
+            if 13 in self.judge_sell_ids:
+                sh50_daily_div_info = self._get_index_divergence_info(date, 'sh50', 'daily')
+                sh50_weekly_div_info = self._get_index_divergence_info(date, 'sh50', 'weekly')
+                if sh50_daily_div_info is not None or sh50_weekly_div_info is not None:
+                    self.strategy.set_sh50_index_divergence(self.state, sh50_daily_div_info, sh50_weekly_div_info)
+
+                    index_div_type = "日线顶背离" if sh50_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证50指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'sh50')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'sh50')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if sh50_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-上证50指数{index_div_type}): 上证50指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 上证50指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证50指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 上证50指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待上证50指数死叉或个股再次重新死叉时才卖出")
+
+            # 【sell_id=14】创业板50指数背离
+            if 14 in self.judge_sell_ids:
+                cyb50_daily_div_info = self._get_index_divergence_info(date, 'cyb50', 'daily')
+                cyb50_weekly_div_info = self._get_index_divergence_info(date, 'cyb50', 'weekly')
+                if cyb50_daily_div_info is not None or cyb50_weekly_div_info is not None:
+                    self.strategy.set_cyb50_index_divergence(self.state, cyb50_daily_div_info, cyb50_weekly_div_info)
+
+                    index_div_type = "日线顶背离" if cyb50_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板50指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'cyb50')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'cyb50')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if cyb50_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-创业板50指数{index_div_type}): 创业板50指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 创业板50指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板50指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板50指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待创业板50指数死叉或个股再次重新死叉时才卖出")
+
+            # 【sell_id=15】科创板50指数背离
+            if 15 in self.judge_sell_ids:
+                kc50_daily_div_info = self._get_index_divergence_info(date, 'kc50', 'daily')
+                kc50_weekly_div_info = self._get_index_divergence_info(date, 'kc50', 'weekly')
+                if kc50_daily_div_info is not None or kc50_weekly_div_info is not None:
+                    self.strategy.set_kc50_index_divergence(self.state, kc50_daily_div_info, kc50_weekly_div_info)
+
+                    index_div_type = "日线顶背离" if kc50_daily_div_info else "周线顶背离"
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板50指数{index_div_type}生效")
+
+                    # 【场景(1)】检查指数是否已处于死叉状态 + 个股周线RSI条件
+                    # 根据buy_sell.md：指数顶背离需要个股周线RSI > 80 才能触发卖出
+                    # 注意：检查的是顶背离形成日期附近（±5天）的最高周线RSI
+                    index_macd_dead = self._is_index_macd_dead_cross_state(date, 'kc50')
+                    index_sar_dead = self._is_index_sar_dead_cross_state(date, 'kc50')
+                    if (index_macd_dead or index_sar_dead) and self._shares > 0:
+                        # 获取背离形成日期附近（±5天）的最高周线RSI
+                        div_date = date  # 背离确认日期
+                        max_weekly_rsi, max_rsi_date = self._get_weekly_rsi_near_divergence(div_date, lookback_days=5)
+
+                        # 定义死叉类型（用于日志输出）
+                        dead_cross_type = "MACD" if index_macd_dead else "SAR"
+
+                        # 检查个股周线RSI是否满足条件
+                        if max_weekly_rsi >= 80:
+                            # 根据指数背离类型确定卖出比例
+                            if kc50_weekly_div_info:
+                                # 周线顶背离：RSI > 80 卖出1/2，RSI > 85 清仓
+                                if max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                else:
+                                    sell_flag = SellFlag.SELL_HALF
+                            else:
+                                # 日线顶背离：RSI > 80 卖出1/3，RSI > 85 卖出1/2，RSI > 90 清仓
+                                if max_weekly_rsi >= 90:
+                                    sell_flag = SellFlag.CLEAR_ALL
+                                elif max_weekly_rsi >= 85:
+                                    sell_flag = SellFlag.SELL_HALF
+                                else:
+                                    sell_flag = SellFlag.SELL_ONE_THIRD
+
+                            sell_signal = SellSignal(
+                                flag=sell_flag,
+                                reason=f"{sell_flag.name} (sell_id={sell_id}-科创板50指数{index_div_type}): 科创板50指数{index_div_type}形成于 {date.strftime('%Y-%m-%d')}, 科创板50指数{dead_cross_type}已处于死叉状态, 背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})>80，建议卖出",
+                                daily_rsi=daily_rsi,
+                                weekly_rsi=weekly_rsi
+                            )
+                            self._execute_sell(date, sell_signal)
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板50指数{index_div_type}+{dead_cross_type}死叉+背离附近周RSI={max_weekly_rsi:.2f}>80，触发卖出")
+                            continue
+                        else:
+                            self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创板50指数{index_div_type}+{dead_cross_type}死叉，但背离附近最高周RSI={max_weekly_rsi:.2f}({max_rsi_date.strftime('%Y-%m-%d')})<80，不触发卖出")
+
+                    # 【场景(2)和(3)】检查个股死叉状态（仅用于日志，不直接卖出）
+                    stock_macd_dead = metrics.get('macd', 0) < metrics.get('macd_signal', 0) if metrics.get('macd') and metrics.get('macd_signal') else False
+                    if stock_macd_dead:
+                        self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 个股MACD已处于死叉状态，但需等待科创板50指数死叉或个股再次重新死叉时才卖出")
+
+            # 检测指数MACD死叉（用于 sell_id=7,8,9,10,11,12）
+            sh_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'sh') if any(sid in [7, 10] for sid in self.judge_sell_ids) else False
+            cyb_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'cyb') if any(sid in [8, 11] for sid in self.judge_sell_ids) else False
+            kc_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'kc') if any(sid in [9, 12] for sid in self.judge_sell_ids) else False
+
+            # 检测新指数MACD死叉（用于 sell_id=13,14,15）
+            sh50_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'sh50') if any(sid in [13] for sid in self.judge_sell_ids) else False
+            cyb50_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'cyb50') if any(sid in [14] for sid in self.judge_sell_ids) else False
+            kc50_index_macd_cross_down = self._detect_index_macd_cross_down(date, 'kc50') if any(sid in [15] for sid in self.judge_sell_ids) else False
+
+            # 检测指数是否已处于死叉状态（用于 sell_id=10-15）
+            # 当个股顶背离形成时，如果指数已处于死叉状态，需要等待个股死叉才卖出
+            sh_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'sh') if any(sid in [10] for sid in self.judge_sell_ids) else False
+            cyb_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'cyb') if any(sid in [11] for sid in self.judge_sell_ids) else False
+            kc_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'kc') if any(sid in [12] for sid in self.judge_sell_ids) else False
+            sh50_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'sh50') if any(sid in [13] for sid in self.judge_sell_ids) else False
+            cyb50_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'cyb50') if any(sid in [14] for sid in self.judge_sell_ids) else False
+            kc50_index_dead_cross_state = self._is_index_macd_dead_cross_state(date, 'kc50') if any(sid in [15] for sid in self.judge_sell_ids) else False
 
             # 调用策略检测卖出信号（检查触发条件：SAR死叉或MACD死叉）
             sell_signal = self.strategy.check_sell_signal(
@@ -952,7 +1755,17 @@ class DBBacktestRunner:
                 sell_id=sell_id,
                 sh_index_macd_cross_down=sh_index_macd_cross_down,
                 cyb_index_macd_cross_down=cyb_index_macd_cross_down,
-                kc_index_macd_cross_down=kc_index_macd_cross_down
+                kc_index_macd_cross_down=kc_index_macd_cross_down,
+                sh50_index_macd_cross_down=sh50_index_macd_cross_down,
+                cyb50_index_macd_cross_down=cyb50_index_macd_cross_down,
+                kc50_index_macd_cross_down=kc50_index_macd_cross_down,
+                macd_dead_cross_state=macd_dead_cross_state,
+                sh_index_dead_cross_state=sh_index_dead_cross_state,
+                cyb_index_dead_cross_state=cyb_index_dead_cross_state,
+                kc_index_dead_cross_state=kc_index_dead_cross_state,
+                sh50_index_dead_cross_state=sh50_index_dead_cross_state,
+                cyb50_index_dead_cross_state=cyb50_index_dead_cross_state,
+                kc50_index_dead_cross_state=kc50_index_dead_cross_state
             )
 
             # 处理卖出信号
@@ -977,14 +1790,15 @@ class DBBacktestRunner:
                         rsi_val = matching.iloc[0]['rsi_daily']
                         if pd.notna(rsi_val):
                             index_daily_rsi = float(rsi_val)
-                            # 调试：记录创业板RSI值（当有卖出资金且RSI较低时）
-                            if self._sold_cash > 0 and index_daily_rsi < 30:
+                            # 调试：记录创业板RSI值（当buy_id包含创业板相关ID且RSI较低时）
+                            if any(bid in [3, 5] for bid in self.judge_buy_ids) and self._sold_cash > 0 and index_daily_rsi < 30:
                                 self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 创业板指数RSI={index_daily_rsi:.2f}, 待买回资金={self._sold_cash:.2f}")
                 except Exception as e:
-                    self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 获取创业板指数RSI失败: {e}")
+                    if any(bid in [3, 5] for bid in self.judge_buy_ids):
+                        self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 获取创业板指数RSI失败: {e}")
             else:
-                # 调试：记录指数数据缺失
-                if self._sold_cash > 0:
+                # 调试：记录指数数据缺失（仅在需要创业板数据时）
+                if any(bid in [3, 5] for bid in self.judge_buy_ids) and self._sold_cash > 0:
                     self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 创业板指数数据缺失(_index_metrics_df=None), 无法检查buy_id=5条件")
 
             # 获取上证指数的RSI
@@ -1009,12 +1823,45 @@ class DBBacktestRunner:
                         rsi_val = matching.iloc[0]['rsi_daily']
                         if pd.notna(rsi_val):
                             kc_index_daily_rsi = float(rsi_val)
-                except Exception:
-                    pass
+                            # 调试：记录科创综指RSI值（当buy_id=8且RSI较低时）
+                            if any(bid == 8 for bid in self.judge_buy_ids) and kc_index_daily_rsi < 30:
+                                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 科创综指RSI={kc_index_daily_rsi:.2f}, 待买回资金={self._sold_cash:.2f}")
+                except Exception as e:
+                    self.logger.warning(f"[{date.strftime('%Y-%m-%d')}] 获取科创综指RSI失败: {e}")
 
-            # 调试：记录买入条件检测前的状态
-            if not np.isnan(index_daily_rsi) and index_daily_rsi < 25:
-                self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入条件检测: 创业板RSI={index_daily_rsi:.2f}, 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 新资金={self._cash:.2f}, 待买回={self._sold_cash:.2f}")
+            # 调试：根据buy_id记录对应的指数RSI值
+            index_rsi_to_check = np.nan
+            index_name = "未知指数"
+            for buy_id in self.judge_buy_ids:
+                if buy_id in [3, 5]:  # 创业板指数
+                    index_rsi_to_check = index_daily_rsi
+                    index_name = "创业板指数"
+                elif buy_id in [6, 7, 10]:  # 上证指数
+                    index_rsi_to_check = sh_index_daily_rsi
+                    index_name = "上证指数"
+                elif buy_id == 8:  # 科创综指
+                    index_rsi_to_check = kc_index_daily_rsi
+                    index_name = "科创综指"
+
+                if not np.isnan(index_rsi_to_check) and index_rsi_to_check < 25:
+                    self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入条件检测: {index_name}RSI={index_rsi_to_check:.2f}, 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 新资金={self._cash:.2f}, 待买回={self._sold_cash:.2f}")
+                    break  # 只打印第一个匹配的指数
+
+            # 获取当前日期的月线RSI（用于buy_id=15-18）
+            monthly_rsi = np.nan
+            if self._monthly_rsi_series is not None and len(self._monthly_rsi_series) > 0:
+                date_str = date.strftime('%Y-%m-%d')
+                matching = self._monthly_rsi_series[self._monthly_rsi_series.index.strftime('%Y-%m-%d') == date_str]
+                if len(matching) > 0:
+                    monthly_rsi = float(matching.iloc[0])
+                else:
+                    # 如果找不到精确匹配，尝试找最近的日期
+                    try:
+                        idx = self._monthly_rsi_series.index.get_indexer([date], method='nearest')[0]
+                        if idx >= 0:
+                            monthly_rsi = float(self._monthly_rsi_series.iloc[idx])
+                    except Exception:
+                        pass
 
             # 调用策略检测买入信号
             buy_signal = self.strategy.check_buy_signal(
@@ -1026,7 +1873,8 @@ class DBBacktestRunner:
                 has_sold_cash=self._sold_cash > 0,
                 index_daily_rsi=index_daily_rsi,
                 sh_index_daily_rsi=sh_index_daily_rsi,
-                kc_index_daily_rsi=kc_index_daily_rsi
+                kc_index_daily_rsi=kc_index_daily_rsi,
+                monthly_rsi=monthly_rsi
             )
 
             # 调试：记录买入信号检测结果
@@ -1034,23 +1882,75 @@ class DBBacktestRunner:
                 if buy_signal is not None:
                     self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入信号触发: {buy_signal.reason}")
                 else:
-                    # 记录为什么没有触发买入
+                    # 记录为什么没有触发买入（根据buy_id动态生成）
                     reasons = []
                     if np.isnan(daily_rsi):
                         reasons.append("日RSI无效")
                     if np.isnan(weekly_rsi):
                         reasons.append("周RSI无效")
-                    if np.isnan(index_daily_rsi):
-                        reasons.append("创业板RSI无效")
-                    # 检查各buy_id条件
+
+                    # 检查各buy_id条件（动态根据buy_id类型）
                     for buy_id in self.strategy.buy_ids:
-                        if buy_id == 4 and not (daily_rsi < 20 and weekly_rsi < 20):
+                        if buy_id == 1 and not (daily_rsi < 20 and weekly_rsi < 25):
+                            reasons.append(f"buy_id=1不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f})")
+                        elif buy_id == 2 and not (daily_rsi < 25 and weekly_rsi < 30):
+                            reasons.append(f"buy_id=2不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f})")
+                        elif buy_id == 4 and not (daily_rsi < 20 and weekly_rsi < 20):
                             reasons.append(f"buy_id=4不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f})")
-                        elif buy_id == 5 and not (index_daily_rsi < 20):
-                            reasons.append(f"buy_id=5不满足(创业板RSI={index_daily_rsi:.2f})")
-                        elif buy_id == 6 and not (sh_index_daily_rsi < 20):
-                            reasons.append(f"buy_id=6不满足(上证RSI={sh_index_daily_rsi:.2f})")
-                    if len(reasons) > 0 and (index_daily_rsi < 30 or daily_rsi < 30):
+                        elif buy_id == 5:
+                            if np.isnan(index_daily_rsi):
+                                reasons.append(f"buy_id=5不满足(创业板RSI数据缺失)")
+                            elif not (index_daily_rsi < 20):
+                                reasons.append(f"buy_id=5不满足(创业板RSI={index_daily_rsi:.2f})")
+                        elif buy_id == 6:
+                            if np.isnan(sh_index_daily_rsi):
+                                reasons.append(f"buy_id=6不满足(上证RSI数据缺失)")
+                            elif not (sh_index_daily_rsi < 20):
+                                reasons.append(f"buy_id=6不满足(上证RSI={sh_index_daily_rsi:.2f})")
+                        elif buy_id == 7:
+                            if np.isnan(sh_index_daily_rsi):
+                                reasons.append(f"buy_id=7不满足(上证RSI数据缺失)")
+                            elif not (sh_index_daily_rsi < 25):
+                                reasons.append(f"buy_id=7不满足(上证RSI={sh_index_daily_rsi:.2f})")
+                        elif buy_id == 8:
+                            if np.isnan(kc_index_daily_rsi):
+                                reasons.append(f"buy_id=8不满足(科创综指RSI数据缺失)")
+                            elif not (kc_index_daily_rsi < 20):
+                                reasons.append(f"buy_id=8不满足(科创综指RSI={kc_index_daily_rsi:.2f})")
+                        elif buy_id == 15:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=15不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 22):
+                                reasons.append(f"buy_id=15不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 16:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=16不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 23):
+                                reasons.append(f"buy_id=16不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 17:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=17不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 20):
+                                reasons.append(f"buy_id=17不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 18:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=18不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 20):
+                                reasons.append(f"buy_id=18不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+
+                    # 只有在有资金且指数RSI较低时才打印调试日志
+                    should_log = False
+                    for buy_id in self.strategy.buy_ids:
+                        if buy_id in [3, 5] and not np.isnan(index_daily_rsi) and index_daily_rsi < 30:
+                            should_log = True
+                        elif buy_id in [6, 7] and not np.isnan(sh_index_daily_rsi) and sh_index_daily_rsi < 30:
+                            should_log = True
+                        elif buy_id == 8 and not np.isnan(kc_index_daily_rsi) and kc_index_daily_rsi < 30:
+                            should_log = True
+                        elif buy_id in [15, 16, 17, 18] and not np.isnan(monthly_rsi) and monthly_rsi < 30:
+                            should_log = True
+
+                    if len(reasons) > 0 and should_log:
                         self.logger.debug(f"[{date.strftime('%Y-%m-%d')}] 买入未触发: {', '.join(reasons)}")
 
             if buy_signal is not None and buy_signal.triggered:
@@ -1129,7 +2029,7 @@ class DBBacktestRunner:
         }
 
     def _calculate_max_drawdown(self) -> float:
-        """计算最大回撤率"""
+        """计算最大回撤率（返回负数形式，如-50%表示下跌50%）"""
         if len(self._trade_records) == 0 or self._metrics_df is None:
             return 0.0
 
@@ -1142,7 +2042,7 @@ class DBBacktestRunner:
         for date in trading_dates:
             metrics = self._get_metrics_at_date(date)
             price = metrics.get('close_price', np.nan)
-            if np.isnan(price):
+            if np.isnan(price) or price <= 0:
                 continue
 
             # 根据交易记录计算当日持仓状态
@@ -1152,31 +2052,44 @@ class DBBacktestRunner:
             for trade in self._trade_records:
                 if trade.date <= date:
                     if trade.action == 'buy':
+                        # 买入：shares增加，资金减少
+                        buy_cost = trade.amount * trade.price
                         shares += trade.amount
-                        cash -= trade.amount * trade.price if trade.amount * trade.price <= cash else 0
-                        sold_cash -= trade.amount * trade.price if trade.amount * trade.price <= sold_cash else sold_cash
+                        # 先从sold_cash买回，再从cash买入新资金
+                        if buy_cost <= sold_cash:
+                            sold_cash -= buy_cost
+                        else:
+                            remaining_cost = buy_cost - sold_cash
+                            sold_cash = 0.0
+                            cash -= remaining_cost if remaining_cost <= cash else 0
                     else:
-                        shares -= trade.amount
-                        sold_cash += trade.amount * trade.price
+                        # 卖出：shares减少（确保不变成负数），sold_cash增加
+                        sell_amount = min(trade.amount, shares) if shares > 0 else 0
+                        shares -= sell_amount
+                        sold_cash += sell_amount * trade.price
 
             value = shares * price + cash + sold_cash
-            daily_values.append((date, value))
+            # 确保value是正数才记录
+            if value > 0:
+                daily_values.append((date, value))
 
         if len(daily_values) < 2:
             return 0.0
 
-        # 计算最大回撤
+        # 计算最大回撤（使用标准定义：从峰值下跌的百分比，输出负数）
         max_value = daily_values[0][1]
-        max_drawdown = 0.0
+        max_drawdown = 0.0  # 最大回撤幅度（正数，但输出时会变成负数）
 
         for date, value in daily_values:
             if value > max_value:
                 max_value = value
-            drawdown = (max_value - value) / max_value * 100 if max_value > 0 else 0.0
-            if drawdown > max_drawdown:
-                max_drawdown = drawdown
+            if max_value > 0:
+                drawdown_pct = (max_value - value) / max_value * 100
+                if drawdown_pct > max_drawdown:
+                    max_drawdown = drawdown_pct
 
-        return max_drawdown
+        # 返回负数形式（如-50%表示下跌50%）
+        return -max_drawdown
 
     def generate_report(self) -> Dict:
         """生成回测报告"""
@@ -1426,7 +2339,8 @@ class BatchDBBacktestRunner:
             return []
 
         # 使用 dtype 参数确保股票代码作为字符串读取，不丢失前导0
-        df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str})
+        # comment='#' 支持跳过以 # 开头的注释行
+        df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str}, comment='#')
 
         # 只加载 active=1 的股票
         active_df = df[df['active'] == 1]

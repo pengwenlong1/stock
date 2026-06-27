@@ -622,9 +622,13 @@ class DatabaseFiller:
             # 周线顶背离形成日期
             weekly_top_div_dates = set(d.date.strftime('%Y-%m-%d') for d in divergences.get('weekly_top_formed', []) if d.date is not None)
 
-            # 底背离（目前暂不计算，设为空）
-            daily_bottom_div_dates = set()
-            weekly_bottom_div_dates = set()
+            # 日线底背离形成日期
+            daily_bottom_div_dates = set(d.date.strftime('%Y-%m-%d') for d in divergences.get('daily_bottom_formed', []) if d.date is not None)
+            # 周线底背离形成日期
+            weekly_bottom_div_dates = set(d.date.strftime('%Y-%m-%d') for d in divergences.get('weekly_bottom_formed', []) if d.date is not None)
+
+            logger.info(f"日线顶背离: {len(daily_top_div_dates)} 个 | 日线底背离: {len(daily_bottom_div_dates)} 个")
+            logger.info(f"周线顶背离: {len(weekly_top_div_dates)} 个 | 周线底背离: {len(weekly_bottom_div_dates)} 个")
         except Exception as e:
             logger.warning(f"背离检测失败: {e}")
             daily_top_div_dates = set()
@@ -824,7 +828,8 @@ def load_stock_list() -> List[Dict]:
         return []
 
     # 使用 dtype 参数确保股票代码作为字符串读取，不丢失前导0
-    df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str})
+    # comment='#' 支持跳过以 # 开头的注释行
+    df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str}, comment='#')
 
     # 确保 name 列存在
     if 'name' not in df.columns:
@@ -857,10 +862,17 @@ def load_stock_list() -> List[Dict]:
                     logger.info(f"自动填充股票名称: {ticker} -> {stock_name}")
                     needs_update = True
 
-    # 如果有更新，保存回CSV文件（保存完整文件，包括active=0的股票）
+    # 如果有更新，保存回CSV文件（保存完整文件，包括active=0的股票和注释行）
     if needs_update:
+        # 先读取原始文件的注释行（用于保留）
+        comment_lines = []
+        with open(str(stock_csv_path), 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip().startswith('#'):
+                    comment_lines.append(line)
+
         # 重新读取完整文件以保留所有股票
-        full_df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str})
+        full_df = pd.read_csv(str(stock_csv_path), dtype={'symbol': str}, comment='#')
         if 'name' not in full_df.columns:
             full_df['name'] = ''
         # 更新缺失的name
@@ -872,9 +884,15 @@ def load_stock_list() -> List[Dict]:
                 if stock_name:
                     full_df.loc[idx, 'name'] = stock_name
                     logger.info(f"更新CSV: {ticker} -> {stock_name}")
-        # 保存完整文件
-        full_df.to_csv(str(stock_csv_path), index=False, encoding='utf-8')
-        logger.info(f"已更新股票名称到CSV文件: {stock_csv_path}")
+        # 保存完整文件（先写入注释行，再写入数据）
+        with open(str(stock_csv_path), 'w', encoding='utf-8') as f:
+            # 写入注释行
+            for comment_line in comment_lines:
+                f.write(comment_line)
+            # 写入数据（使用to_csv生成的内容）
+            csv_data = full_df.to_csv(index=False, encoding='utf-8')
+            f.write(csv_data)
+        logger.info(f"已更新股票名称到CSV文件: {stock_csv_path}（保留注释行）")
 
     stock_list = []
     for row in df.to_dict('records'):
