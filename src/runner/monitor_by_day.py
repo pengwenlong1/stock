@@ -57,7 +57,7 @@ from src.tool.sar_strategy import SARStrategy, SARSignal  # 导入SAR策略类
 from src.tool.divergence_detector import DivergenceDetector, DivergenceSignal  # 导入背离检测器
 
 try:
-    from gm.api import history, set_token, ADJUST_PREV, get_trading_dates, get_instruments, current
+    from gm.api import history, set_token, ADJUST_PREV, get_trading_dates, get_instruments, current, get_fundamentals
 except ImportError:
     history = None
     set_token = None
@@ -65,6 +65,7 @@ except ImportError:
     get_trading_dates = None
     get_instruments = None
     current = None
+    get_fundamentals = None
 
 
 # ==================== 监控配置 ====================
@@ -191,6 +192,8 @@ class SignalInfo:
     index_daily_rsi_cyb: float
     index_daily_rsi_sh: float
     sar_cross_down_info: Optional[SARCrossDownInfo] = None
+    monthly_rsi: float = float('nan')     # 月线RSI
+    dividend_yield_rate: float = float('nan')  # 股息率(%)
 
 
 @dataclass
@@ -528,7 +531,7 @@ class DailyMonitor:
         if isinstance(id_str, int):
             return [id_str]
         # 分号分隔的多个ID
-        return [int(x.strip()) for x in str(id_str).replace(';', ',').split(',') if x.strip()]
+        return [int(float(x.strip())) for x in str(id_str).replace(';', ',').split(',') if x.strip()]
 
     def get_recent_trading_dates(self, end_date: str, count: int = RECENT_TRADING_DAYS) -> List[str]:
         """
@@ -938,7 +941,7 @@ class DailyMonitor:
         rsi_weekly = RSI(period=6, freq='weekly')
         weekly_rsi = rsi_weekly.calculate(close_series)
 
-        # 计算月线RSI(6)（用于buy_id=10和buy_id=11）
+        # 计算月线RSI(6)（用于buy_id=10,11,15-26）
         rsi_monthly = RSI(period=6, freq='monthly')
         monthly_rsi = rsi_monthly.calculate(close_series)
 
@@ -1298,6 +1301,36 @@ class DailyMonitor:
         except Exception:
             return np.nan
 
+    def get_dividend_yield_rate(self, symbol: str, date: str) -> float:
+        """
+        获取个股股息率（TTM）
+
+        Args:
+            symbol: 股票代码（掘金格式，如 SHSE.512480）
+            date: 查询日期（YYYY-MM-DD）
+
+        Returns:
+            float: 股息率(%)，查询失败返回 nan
+        """
+        if get_fundamentals is None:
+            return np.nan
+
+        try:
+            df = get_fundamentals(
+                table='trading_derivative_indicator',
+                symbols=symbol,
+                trade_date=date,
+                fields='dividend_yield',
+                df=True
+            )
+            if df is not None and not df.empty and 'dividend_yield' in df.columns:
+                val = df['dividend_yield'].iloc[0]
+                if val is not None and not np.isnan(val):
+                    return float(val)
+        except Exception:
+            pass
+        return np.nan
+
     def monitor_single_stock(self,
                               stock_config: StockConfig,
                               end_date: str) -> Optional[MonitorResult]:
@@ -1392,14 +1425,21 @@ class DailyMonitor:
 
         # 【新增】初始化背离检测器（与回测逻辑一致）
         warmup_start = (pd.Timestamp(end_date) - pd.Timedelta(days=WARMUP_DAYS)).strftime('%Y-%m-%d')
-        divergence_detector = DivergenceDetector()
-        divergence_detector.prepare_data(symbol, warmup_start, end_date)
-        # 【修改】监控模式传入买入信号日期，只判断买入信号后最新高点的顶背离
-        all_divergences = divergence_detector.detect_all_divergences(last_buy_signal_date)
-        daily_divergences_confirmed = all_divergences.get('daily_top_confirmed', [])
-        weekly_divergences_confirmed = all_divergences.get('weekly_top_confirmed', [])
-        self.logger.info(f"  日线顶背离生效: {len(daily_divergences_confirmed)} 个")
-        self.logger.info(f"  周线顶背离生效: {len(weekly_divergences_confirmed)} 个")
+        has_sell_ids = len(stock_config.judge_sell_ids) > 0
+
+        daily_divergences_confirmed = []
+        weekly_divergences_confirmed = []
+        if has_sell_ids:
+            divergence_detector = DivergenceDetector()
+            divergence_detector.prepare_data(symbol, warmup_start, end_date)
+            # 【修改】监控模式传入买入信号日期，只判断买入信号后最新高点的顶背离
+            all_divergences = divergence_detector.detect_all_divergences(last_buy_signal_date)
+            daily_divergences_confirmed = all_divergences.get('daily_top_confirmed', [])
+            weekly_divergences_confirmed = all_divergences.get('weekly_top_confirmed', [])
+            self.logger.info(f"  日线顶背离生效: {len(daily_divergences_confirmed)} 个")
+            self.logger.info(f"  周线顶背离生效: {len(weekly_divergences_confirmed)} 个")
+        else:
+            self.logger.info("  judge_sell_ids为空，跳过个股顶背离检测")
 
         # 【新增】初始化指数背离检测器（用于 sell_id=4,5,6）
         sh_index_daily_divergences = []
@@ -1410,35 +1450,47 @@ class DailyMonitor:
         kc_index_weekly_divergences = []
 
         # 【修复】指数背离检测器应该始终初始化，用于独立的指数顶背离告警功能
-        # 不依赖于个股的 sell_ids 配置
+        # 但当 sell_ids 为空时跳过所有卖点判断
         self.logger.info("  初始化指数背离检测器...")
 
         # 上证指数背离检测器
-        sh_div_detector = DivergenceDetector()
-        sh_div_detector.prepare_data(INDEX_SH, warmup_start, end_date)
-        sh_all_div = sh_div_detector.detect_all_divergences()
-        sh_index_daily_divergences = sh_all_div.get('daily_top_confirmed', [])
-        sh_index_weekly_divergences = sh_all_div.get('weekly_top_confirmed', [])
-        self.logger.info(f"  上证指数日线顶背离生效: {len(sh_index_daily_divergences)} 个")
-        self.logger.info(f"  上证指数周线顶背离生效: {len(sh_index_weekly_divergences)} 个")
+        if has_sell_ids:
+            sh_div_detector = DivergenceDetector()
+            sh_div_detector.prepare_data(INDEX_SH, warmup_start, end_date)
+            sh_all_div = sh_div_detector.detect_all_divergences()
+            sh_index_daily_divergences = sh_all_div.get('daily_top_confirmed', [])
+            sh_index_weekly_divergences = sh_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  上证指数日线顶背离生效: {len(sh_index_daily_divergences)} 个")
+            self.logger.info(f"  上证指数周线顶背离生效: {len(sh_index_weekly_divergences)} 个")
+        else:
+            sh_index_daily_divergences = []
+            sh_index_weekly_divergences = []
 
         # 创业板指数背离检测器
-        cyb_div_detector = DivergenceDetector()
-        cyb_div_detector.prepare_data(INDEX_CYB, warmup_start, end_date)
-        cyb_all_div = cyb_div_detector.detect_all_divergences()
-        cyb_index_daily_divergences = cyb_all_div.get('daily_top_confirmed', [])
-        cyb_index_weekly_divergences = cyb_all_div.get('weekly_top_confirmed', [])
-        self.logger.info(f"  创业板指数日线顶背离生效: {len(cyb_index_daily_divergences)} 个")
-        self.logger.info(f"  创业板指数周线顶背离生效: {len(cyb_index_weekly_divergences)} 个")
+        if has_sell_ids:
+            cyb_div_detector = DivergenceDetector()
+            cyb_div_detector.prepare_data(INDEX_CYB, warmup_start, end_date)
+            cyb_all_div = cyb_div_detector.detect_all_divergences()
+            cyb_index_daily_divergences = cyb_all_div.get('daily_top_confirmed', [])
+            cyb_index_weekly_divergences = cyb_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  创业板指数日线顶背离生效: {len(cyb_index_daily_divergences)} 个")
+            self.logger.info(f"  创业板指数周线顶背离生效: {len(cyb_index_weekly_divergences)} 个")
+        else:
+            cyb_index_daily_divergences = []
+            cyb_index_weekly_divergences = []
 
         # 科创板指数背离检测器
-        kc_div_detector = DivergenceDetector()
-        kc_div_detector.prepare_data(INDEX_KC, warmup_start, end_date)
-        kc_all_div = kc_div_detector.detect_all_divergences()
-        kc_index_daily_divergences = kc_all_div.get('daily_top_confirmed', [])
-        kc_index_weekly_divergences = kc_all_div.get('weekly_top_confirmed', [])
-        self.logger.info(f"  科创板指数日线顶背离生效: {len(kc_index_daily_divergences)} 个")
-        self.logger.info(f"  科创板指数周线顶背离生效: {len(kc_index_weekly_divergences)} 个")
+        if has_sell_ids:
+            kc_div_detector = DivergenceDetector()
+            kc_div_detector.prepare_data(INDEX_KC, warmup_start, end_date)
+            kc_all_div = kc_div_detector.detect_all_divergences()
+            kc_index_daily_divergences = kc_all_div.get('daily_top_confirmed', [])
+            kc_index_weekly_divergences = kc_all_div.get('weekly_top_confirmed', [])
+            self.logger.info(f"  科创板指数日线顶背离生效: {len(kc_index_daily_divergences)} 个")
+            self.logger.info(f"  科创板指数周线顶背离生效: {len(kc_index_weekly_divergences)} 个")
+        else:
+            kc_index_daily_divergences = []
+            kc_index_weekly_divergences = []
 
         # 【新增】新指数背离检测器（用于 sell_id=13,14,15）
         sh50_index_daily_divergences = []
@@ -2172,6 +2224,7 @@ class DailyMonitor:
                 )
 
                 if buy_signal_obj is not None and buy_signal_obj.triggered:
+                    div_yield_rate = self.get_dividend_yield_rate(symbol, current_cross_down_date.strftime('%Y-%m-%d'))
                     signal_info = SignalInfo(
                         signal_date=current_cross_down_date.strftime('%Y-%m-%d'),
                         signal_type='buy',
@@ -2181,10 +2234,15 @@ class DailyMonitor:
                         weekly_rsi=weekly_rsi_at_signal,
                         index_daily_rsi_cyb=index_rsi_cyb,
                         index_daily_rsi_sh=index_rsi_sh,
-                        sar_cross_down_info=cross_down_info
+                        sar_cross_down_info=cross_down_info,
+                        monthly_rsi=buy_signal_obj.monthly_rsi,
+                        dividend_yield_rate=div_yield_rate
                     )
                     signals.append(signal_info)
+                    monthly_rsi_str = f"{buy_signal_obj.monthly_rsi:.2f}" if not np.isnan(buy_signal_obj.monthly_rsi) else "N/A"
+                    div_yield_str = f"{div_yield_rate:.2f}%" if not np.isnan(div_yield_rate) else "N/A"
                     self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
+                    self.logger.info(f"        日RSI={daily_rsi_at_signal:.2f} | 周RSI={weekly_rsi_at_signal:.2f} | 月RSI={monthly_rsi_str} | 股息率={div_yield_str}")
 
         # ==================== MACD死叉卖出信号检测（sell_id=2,3,4,5,6）====================
         # 对于配置了sell_id=2,3,4,5,6的情况，触发条件都是个股MACD死叉
@@ -2809,6 +2867,7 @@ class DailyMonitor:
                     )
 
                     if buy_signal_obj is not None and buy_signal_obj.triggered:
+                        div_yield_rate = self.get_dividend_yield_rate(symbol, last_date_str)
                         signal_info = SignalInfo(
                             signal_date=last_date_str,
                             signal_type='buy',
@@ -2818,11 +2877,15 @@ class DailyMonitor:
                             weekly_rsi=latest_weekly_rsi,
                             index_daily_rsi_cyb=latest_index_rsi_cyb,
                             index_daily_rsi_sh=latest_index_rsi_sh,
-                            sar_cross_down_info=None  # 无SAR事件
+                            sar_cross_down_info=None,
+                            monthly_rsi=buy_signal_obj.monthly_rsi,
+                            dividend_yield_rate=div_yield_rate
                         )
                         signals.append(signal_info)
+                        monthly_rsi_str = f"{buy_signal_obj.monthly_rsi:.2f}" if not np.isnan(buy_signal_obj.monthly_rsi) else "N/A"
+                        div_yield_str = f"{div_yield_rate:.2f}%" if not np.isnan(div_yield_rate) else "N/A"
                         self.logger.info(f"  [独立买入检测] {last_date_str}: "
-                                       f"日RSI={latest_daily_rsi:.2f}, 周RSI={latest_weekly_rsi:.2f}")
+                                       f"日RSI={latest_daily_rsi:.2f} | 周RSI={latest_weekly_rsi:.2f} | 月RSI={monthly_rsi_str} | 股息率={div_yield_str}")
                         self.logger.info(f"    >>> 买入信号: {buy_signal_obj.reason}")
 
         # 获取最新数据用于监控结果展示
@@ -2846,7 +2909,11 @@ class DailyMonitor:
         # ==================== 待触发卖出信号告警 ====================
         # 只显示最近一次买入机会（红转绿）之后的告警
         # 如果已经发生卖出（绿转红），之前的告警就消失
+        # 当 judge_sell_ids 为空时跳过所有卖点判断
         pending_warnings = []
+
+        if not has_sell_ids:
+            self.logger.info("  judge_sell_ids为空，跳过待触发卖出告警")
 
         # 获取最近一次SAR买入信号日期（红转绿）和卖出信号日期（绿转红）
         # SAR买入（红转绿）= SAR从价格上方转到下方：SAR(t) < Close(t) 且 SAR(t-1) >= Close(t-1)
@@ -3539,6 +3606,9 @@ class DailyMonitor:
                     self.logger.info(f"  [{sig.signal_date}] {signal_type_str}")
                     self.logger.info(f"    价格: {sig.current_price:.3f} | 日RSI: {daily_rsi_str} | 周RSI: {weekly_rsi_str}")
                     if sig.signal_type == 'buy':
+                        monthly_rsi_str = f"{sig.monthly_rsi:.2f}" if not np.isnan(sig.monthly_rsi) else "N/A"
+                        div_yield_str = f"{sig.dividend_yield_rate:.2f}%" if not np.isnan(sig.dividend_yield_rate) else "N/A"
+                        self.logger.info(f"    月RSI: {monthly_rsi_str} | 股息率: {div_yield_str}")
                         self.logger.info(f"    创业板RSI: {cyb_rsi_str} | 上证RSI: {sh_rsi_str}")
                     self.logger.info(f"    详情: {sig.signal_detail}")
 
@@ -3664,11 +3734,13 @@ class DailyMonitor:
                 for r, sig in signals_list:
                     daily_rsi_str = f"{sig.daily_rsi:.2f}" if not np.isnan(sig.daily_rsi) else "N/A"
                     weekly_rsi_str = f"{sig.weekly_rsi:.2f}" if not np.isnan(sig.weekly_rsi) else "N/A"
+                    monthly_rsi_str = f"{sig.monthly_rsi:.2f}" if not np.isnan(sig.monthly_rsi) else "N/A"
+                    div_yield_str = f"{sig.dividend_yield_rate:.2f}%" if not np.isnan(sig.dividend_yield_rate) else "N/A"
                     cyb_rsi_str = f"{sig.index_daily_rsi_cyb:.2f}" if not np.isnan(sig.index_daily_rsi_cyb) else "N/A"
                     sh_rsi_str = f"{sig.index_daily_rsi_sh:.2f}" if not np.isnan(sig.index_daily_rsi_sh) else "N/A"
                     content_lines.append(f"- **{r.stock_name}** ({r.symbol})\n")
                     content_lines.append(f"  - 价格: {sig.current_price:.3f}\n")
-                    content_lines.append(f"  - 日RSI: {daily_rsi_str} | 周RSI: {weekly_rsi_str}\n")
+                    content_lines.append(f"  - 日RSI: {daily_rsi_str} | 周RSI: {weekly_rsi_str} | 月RSI: {monthly_rsi_str} | 股息率: {div_yield_str}\n")
                     content_lines.append(f"  - 创业板RSI: {cyb_rsi_str} | 上证RSI: {sh_rsi_str}\n")
                     content_lines.append(f"  - {sig.signal_detail}\n\n")
 

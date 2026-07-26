@@ -38,6 +38,20 @@ buy_id 条件:
 - buy_id=7: 上证指数日RSI<25 (上证指数保护型)
 - buy_id=8: 科创综指日RSI<20 (科创板买入)
 - buy_id=9: 日线底背离形成 (个股底背离买入)
+- buy_id=10: 上证指数日RSI<20 且 个股月RSI<30 (红利股买点)
+- buy_id=11: 日RSI<20 且 周RSI<20 且 月RSI<30 (底背离加强)
+- buy_id=15: 日RSI<20 且 月RSI<22 (极度保守型)
+- buy_id=16: 日RSI<20 且 月RSI<23 (极度保守型)
+- buy_id=17: 日RSI<20 且 月RSI<20 (极度保守型)
+- buy_id=18: 日RSI<20 且 周RSI<20 且 月RSI<40 (月线宽松+日周超卖)
+- buy_id=19: 日RSI<20 且 周RSI<20 且 月RSI<15 (三周期共振超卖)
+- buy_id=20: 日RSI<20 且 周RSI<20 且 月RSI<25 (日周超卖+月线适中)
+- buy_id=21: 日RSI<20 且 周RSI<20 且 月RSI<20 (三周期共振超卖)
+- buy_id=22: 日RSI<30 (日线宽松超卖)
+- buy_id=23: 周RSI<20 (周线超卖)
+- buy_id=24: 日RSI<20 且 月RSI<15 (日线+月线超卖)
+- buy_id=25: 日RSI<20 且 月RSI<40 (日线超卖+月线宽松)
+- buy_id=26: 日RSI<20 且 月RSI<25 (日线超卖+月线适中)
 
 【买入资金逻辑】
 - judge_buy_ids触发: 买入所有可用资金（新资金 + 卖出后待买回资金），无条件限制
@@ -192,6 +206,7 @@ class BuySignal:
     reason: str                                     # 原因说明
     daily_rsi: float                                # 当日RSI
     weekly_rsi: float                               # 当日周线RSI
+    monthly_rsi: float = np.nan                     # 当日月线RSI
 
 
 # ==================== 交易策略类 ====================
@@ -232,11 +247,11 @@ class TradingStrategy:
 
         # 验证ID范围
         for buy_id in buy_ids:
-            if buy_id not in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]:
-                raise ValueError(f"buy_id 必须为 1-18，当前值: {buy_id}")
+            if buy_id not in range(1, 27):
+                raise ValueError(f"buy_id 必须为 1-26，当前值: {buy_id}")
         for t_id in t_ids:
-            if t_id not in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]:
-                raise ValueError(f"t_id 必须为 1-18，当前值: {t_id}")
+            if t_id not in range(1, 27):
+                raise ValueError(f"t_id 必须为 1-26，当前值: {t_id}")
 
         logger.info(f"策略初始化: buy_ids={buy_ids}, t_ids={t_ids}, sell_ids={sell_ids}")
 
@@ -951,7 +966,7 @@ class TradingStrategy:
             date: 当前日期
             daily_rsi: 当日RSI值
             weekly_rsi: 当日周线RSI值
-            monthly_rsi: 当日月线RSI值（用于buy_id=10和buy_id=11）
+            monthly_rsi: 当日月线RSI值（用于buy_id=10,11,15-21,24-26）
             state: 当前策略状态
             has_new_cash: 是否有新资金（未进入市场的资金）
             has_sold_cash: 是否有卖出后待买回的资金
@@ -961,7 +976,7 @@ class TradingStrategy:
             bj_index_daily_rsi: 北证板块日线RSI值（用于buy_id=12）
             hsTech_index_daily_rsi: 恒生科技ETF日线RSI值（用于buy_id=13）
             hsIndex_index_daily_rsi: 恒生指数ETF日线RSI值（用于buy_id=14）
-            monthly_rsi: 当日月线RSI值（用于buy_id=10和buy_id=11）
+            monthly_rsi: 当日月线RSI值（用于buy_id=10,11,15-21,24-26）
             state: 当前策略状态
             has_new_cash: 是否有新资金（未进入市场的资金）
             has_sold_cash: 是否有卖出后待买回的资金
@@ -998,7 +1013,8 @@ class TradingStrategy:
                     is_new_cash=True,  # 标记为包含新资金，会买入所有可用资金
                     reason=f"买入信号 [{condition_desc}], 买入所有可用资金",
                     daily_rsi=daily_rsi,
-                    weekly_rsi=weekly_rsi
+                    weekly_rsi=weekly_rsi,
+                    monthly_rsi=monthly_rsi
                 )
 
         # 然后检查 judge_t_ids（只买回卖出资金，不买入新资金）
@@ -1014,7 +1030,8 @@ class TradingStrategy:
                         is_new_cash=False,  # 不包含新资金，只买回卖出资金
                         reason=f"做T买回信号 [{condition_desc}], 只买回卖出资金",
                         daily_rsi=daily_rsi,
-                        weekly_rsi=weekly_rsi
+                        weekly_rsi=weekly_rsi,
+                        monthly_rsi=monthly_rsi
                     )
 
         return None
@@ -1027,7 +1044,7 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
-            monthly_rsi: 月线RSI值（用于buy_id=10和buy_id=11）
+            monthly_rsi: 月线RSI值（用于buy_id=10,11,15-21,24-26）
             state: 当前策略状态（用于buy_id=9底背离判断）
             index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和buy_id=5）
             sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）
@@ -1187,12 +1204,78 @@ class TradingStrategy:
             return False, ""
 
         elif buy_id == 18:
-            # 极度保守型：日RSI<20 且 月RSI<20
+            # 月线宽松+日周极度超卖：月RSI<40 且 日RSI<20 且 周RSI<20
             if np.isnan(monthly_rsi):
                 logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
                 return False, ""
-            if daily_rsi < 20 and monthly_rsi < 20:
-                return True, f"buy_id=18(极度保守型): 日RSI={daily_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<20"
+            if daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 40:
+                return True, f"buy_id=18(月线宽松+日周超卖): 日RSI={daily_rsi:.2f}<20 且 周RSI={weekly_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<40"
+            return False, ""
+
+        elif buy_id == 19:
+            # 三周期共振极度超卖：日RSI<20 且 周RSI<20 且 月RSI<15
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 15:
+                return True, f"buy_id=19(三周期共振超卖): 日RSI={daily_rsi:.2f}<20 且 周RSI={weekly_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<15"
+            return False, ""
+
+        elif buy_id == 20:
+            # 日周超卖+月线适中：日RSI<20 且 周RSI<20 且 月RSI<25
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 25:
+                return True, f"buy_id=20(日周超卖+月线适中): 日RSI={daily_rsi:.2f}<20 且 周RSI={weekly_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<25"
+            return False, ""
+
+        elif buy_id == 21:
+            # 三周期共振超卖：日RSI<20 且 周RSI<20 且 月RSI<20
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 20:
+                return True, f"buy_id=21(三周期共振超卖): 日RSI={daily_rsi:.2f}<20 且 周RSI={weekly_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 22:
+            # 日线宽松超卖：日RSI<30
+            if daily_rsi < 30:
+                return True, f"buy_id=22(日线宽松超卖): 日RSI={daily_rsi:.2f}<30"
+            return False, ""
+
+        elif buy_id == 23:
+            # 周线超卖：周RSI<20
+            if weekly_rsi < 20:
+                return True, f"buy_id=23(周线超卖): 周RSI={weekly_rsi:.2f}<20"
+            return False, ""
+
+        elif buy_id == 24:
+            # 日线+月线超卖：日RSI<20 且 月RSI<15
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and monthly_rsi < 15:
+                return True, f"buy_id=24(日线+月线超卖): 日RSI={daily_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<15"
+            return False, ""
+
+        elif buy_id == 25:
+            # 日线超卖+月线宽松：日RSI<20 且 月RSI<40
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and monthly_rsi < 40:
+                return True, f"buy_id=25(日线超卖+月线宽松): 日RSI={daily_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<40"
+            return False, ""
+
+        elif buy_id == 26:
+            # 日线超卖+月线适中：日RSI<20 且 月RSI<25
+            if np.isnan(monthly_rsi):
+                logger.warning(f"buy_id={buy_id} 缺少月线RSI数据")
+                return False, ""
+            if daily_rsi < 20 and monthly_rsi < 25:
+                return True, f"buy_id=26(日线超卖+月线适中): 日RSI={daily_rsi:.2f}<20 且 月RSI={monthly_rsi:.2f}<25"
             return False, ""
 
         return False, ""
@@ -1205,7 +1288,7 @@ class TradingStrategy:
             buy_id: 买入策略ID
             daily_rsi: 日线RSI值
             weekly_rsi: 周线RSI值
-            monthly_rsi: 月线RSI值（用于buy_id=10和buy_id=11）
+            monthly_rsi: 月线RSI值（用于buy_id=10,11,15-21,24-26）
             state: 当前策略状态（用于buy_id=9底背离判断）
             index_daily_rsi: 创业板指数日线RSI值（用于buy_id=3和5）
             sh_index_daily_rsi: 上证指数日线RSI值（用于buy_id=6、7、10）

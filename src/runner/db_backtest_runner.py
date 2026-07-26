@@ -73,6 +73,8 @@ class TradeRecord:
     reason: str                         # 交易原因
     daily_rsi: float = 0.0
     weekly_rsi: float = 0.0
+    monthly_rsi: float = float('nan')
+    dividend_yield_rate: float = float('nan')
 
 
 # ==================== 数据库回测执行器 ====================
@@ -154,7 +156,7 @@ class DBBacktestRunner:
         # 数据存储
         self._df: Optional[pd.DataFrame] = None
         self._metrics_df: Optional[pd.DataFrame] = None
-        self._monthly_rsi_series: Optional[pd.Series] = None  # 月线RSI序列（用于buy_id=15-18）
+        self._monthly_rsi_series: Optional[pd.Series] = None  # 月线RSI序列（用于buy_id=15-26）
 
         # 指数数据（用于大盘参照）
         self._index_metrics_df: Optional[pd.DataFrame] = None  # 创业板指 (399006)
@@ -348,7 +350,7 @@ class DBBacktestRunner:
             self.logger.info(f"日线顶背离数: {df['is_daily_top_divergence'].sum()}")
             self.logger.info(f"周线顶背离数: {df['is_weekly_top_divergence'].sum()}")
 
-            # 计算月线RSI(6)（用于buy_id=15-18）
+            # 计算月线RSI(6)（用于buy_id=15-26）
             close_series = pd.Series(df['close_price'].values, index=df.index, name='Close')
             rsi_monthly = RSI(period=6, freq='monthly')
             monthly_rsi_series = rsi_monthly.calculate(close_series)
@@ -761,6 +763,39 @@ class DBBacktestRunner:
         except Exception:
             return {}
 
+    def _get_dividend_yield_rate(self, date: pd.Timestamp) -> float:
+        """
+        从数据库获取个股在指定日期的股息率
+
+        Args:
+            date: 查询日期
+
+        Returns:
+            float: 股息率(%)，查询失败返回 nan
+        """
+        if not self._connection:
+            if not self._connect_db():
+                return np.nan
+
+        try:
+            sql = """
+                SELECT dividend_yield
+                FROM stock_dividend
+                WHERE stock_id = %s
+                  AND dividend_date <= %s
+                ORDER BY dividend_year DESC
+                LIMIT 1
+            """
+            with self._connection.cursor() as cursor:
+                cursor.execute(sql, (self.stock_id, date.strftime('%Y-%m-%d')))
+                row = cursor.fetchone()
+
+            if row and row.get('dividend_yield') is not None:
+                return float(row['dividend_yield'])
+        except Exception:
+            pass
+        return np.nan
+
     def _get_index_divergence_info(
         self,
         date: pd.Timestamp,
@@ -1135,6 +1170,9 @@ class DBBacktestRunner:
         # 更新持仓
         self._shares += buy_shares
 
+        # 获取股息率
+        dividend_yield_rate = self._get_dividend_yield_rate(date)
+
         # 记录交易
         trade = TradeRecord(
             date=date,
@@ -1143,14 +1181,19 @@ class DBBacktestRunner:
             price=price,
             reason=signal.reason,
             daily_rsi=signal.daily_rsi,
-            weekly_rsi=signal.weekly_rsi
+            weekly_rsi=signal.weekly_rsi,
+            monthly_rsi=signal.monthly_rsi,
+            dividend_yield_rate=dividend_yield_rate
         )
         self._trade_records.append(trade)
 
         # 日志输出
         buy_type = "新资金+买回" if signal.is_new_cash else "做T买回"
+        monthly_rsi_str = f"{signal.monthly_rsi:.2f}" if not np.isnan(signal.monthly_rsi) else "N/A"
+        div_yield_str = f"{dividend_yield_rate:.2f}%" if not np.isnan(dividend_yield_rate) else "N/A"
         self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入({buy_type}): {int(buy_shares)}股 @ {price:.3f} | "
-                        f"金额:{buy_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | {signal.reason}")
+                        f"金额:{buy_amount:.2f} | 日RSI:{signal.daily_rsi:.2f} | 周RSI:{signal.weekly_rsi:.2f} | "
+                        f"月RSI:{monthly_rsi_str} | 股息率:{div_yield_str} | {signal.reason}")
 
     def run_backtest(self) -> Dict:
         """
@@ -1847,7 +1890,7 @@ class DBBacktestRunner:
                     self.logger.info(f"[{date.strftime('%Y-%m-%d')}] 买入条件检测: {index_name}RSI={index_rsi_to_check:.2f}, 日RSI={daily_rsi:.2f}, 周RSI={weekly_rsi:.2f}, 新资金={self._cash:.2f}, 待买回={self._sold_cash:.2f}")
                     break  # 只打印第一个匹配的指数
 
-            # 获取当前日期的月线RSI（用于buy_id=15-18）
+            # 获取当前日期的月线RSI（用于buy_id=15-26）
             monthly_rsi = np.nan
             if self._monthly_rsi_series is not None and len(self._monthly_rsi_series) > 0:
                 date_str = date.strftime('%Y-%m-%d')
@@ -1935,10 +1978,46 @@ class DBBacktestRunner:
                         elif buy_id == 18:
                             if np.isnan(monthly_rsi):
                                 reasons.append(f"buy_id=18不满足(月线RSI数据缺失)")
-                            elif not (daily_rsi < 20 and monthly_rsi < 20):
-                                reasons.append(f"buy_id=18不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                            elif not (daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 40):
+                                reasons.append(f"buy_id=18不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 19:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=19不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 15):
+                                reasons.append(f"buy_id=19不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 20:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=20不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 25):
+                                reasons.append(f"buy_id=20不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 21:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=21不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and weekly_rsi < 20 and monthly_rsi < 20):
+                                reasons.append(f"buy_id=21不满足(日RSI={daily_rsi:.2f},周RSI={weekly_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 22:
+                            if not (daily_rsi < 30):
+                                reasons.append(f"buy_id=22不满足(日RSI={daily_rsi:.2f})")
+                        elif buy_id == 23:
+                            if not (weekly_rsi < 20):
+                                reasons.append(f"buy_id=23不满足(周RSI={weekly_rsi:.2f})")
+                        elif buy_id == 24:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=24不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 15):
+                                reasons.append(f"buy_id=24不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 25:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=25不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 40):
+                                reasons.append(f"buy_id=25不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
+                        elif buy_id == 26:
+                            if np.isnan(monthly_rsi):
+                                reasons.append(f"buy_id=26不满足(月线RSI数据缺失)")
+                            elif not (daily_rsi < 20 and monthly_rsi < 25):
+                                reasons.append(f"buy_id=26不满足(日RSI={daily_rsi:.2f},月RSI={monthly_rsi:.2f})")
 
-                    # 只有在有资金且指数RSI较低时才打印调试日志
+                    # 只有在有资金且指标接近阈值时才打印调试日志
                     should_log = False
                     for buy_id in self.strategy.buy_ids:
                         if buy_id in [3, 5] and not np.isnan(index_daily_rsi) and index_daily_rsi < 30:
@@ -1947,7 +2026,13 @@ class DBBacktestRunner:
                             should_log = True
                         elif buy_id == 8 and not np.isnan(kc_index_daily_rsi) and kc_index_daily_rsi < 30:
                             should_log = True
-                        elif buy_id in [15, 16, 17, 18] and not np.isnan(monthly_rsi) and monthly_rsi < 30:
+                        elif buy_id in [15, 16, 17, 19, 20, 21, 24, 26] and not np.isnan(monthly_rsi) and monthly_rsi < 30:
+                            should_log = True
+                        elif buy_id in [18, 25] and not np.isnan(monthly_rsi) and monthly_rsi < 50:
+                            should_log = True
+                        elif buy_id == 22 and not np.isnan(daily_rsi) and daily_rsi < 35:
+                            should_log = True
+                        elif buy_id == 23 and not np.isnan(weekly_rsi) and weekly_rsi < 30:
                             should_log = True
 
                     if len(reasons) > 0 and should_log:
